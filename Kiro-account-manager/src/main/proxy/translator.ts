@@ -290,8 +290,6 @@ export function openaiToKiro(
   let currentCachePoint: KiroCachePoint | undefined
   const images: KiroImage[] = []
   const documents: KiroDocument[] = []
-  let systemPromptMerged = false // 标记 system prompt 是否已合并
-
   for (let i = 0; i < nonSystemMessages.length; i++) {
     const msg = nonSystemMessages[i]
     const isLast = i === nonSystemMessages.length - 1
@@ -299,14 +297,8 @@ export function openaiToKiro(
     if (msg.role === 'user') {
       const { content: userContent, images: userImages, documents: userDocuments, cachePoint } = extractOpenAIContent(msg)
       
-      // 第一条 user 消息合并 system prompt（参考 Proxycast）
-      let mergedContent = userContent || 'Continue'
-      let messageCachePoint = cachePoint
-      if (!systemPromptMerged && systemPrompt) {
-        mergedContent = `${systemPrompt}\n\n${mergedContent}`
-        messageCachePoint = mergeCachePoint(systemCachePoint, messageCachePoint)
-        systemPromptMerged = true
-      }
+      const mergedContent = userContent || 'Continue'
+      const messageCachePoint = cachePoint
       
       if (isLast) {
         currentContent = mergedContent
@@ -401,25 +393,36 @@ export function openaiToKiro(
     currentContent = 'Tool results provided.'
   }
 
-  // 如果 system prompt 还未合并（没有 user 消息），直接作为 currentContent
-  let finalContent = currentContent || 'Continue.'
-  if (!systemPromptMerged && systemPrompt) {
-    finalContent = `${systemPrompt}\n\n${finalContent}`
-    currentCachePoint = mergeCachePoint(systemCachePoint, currentCachePoint)
+  // System prompt 以 Kiro 官方方式注入：作为 Human/AI pair 插入到 history 头部
+  if (systemPrompt) {
+    const systemMessages: KiroHistoryMessage[] = [
+      {
+        userInputMessage: {
+          content: systemPrompt,
+          userInputMessageContext: {},
+          origin,
+          ...(systemCachePoint ? { cachePoint: systemCachePoint } : {})
+        }
+      },
+      {
+        assistantResponseMessage: {
+          content: 'I will follow these instructions.'
+        }
+      }
+    ]
+    history.unshift(...systemMessages)
   }
+  const finalContent = currentContent || 'Continue.'
 
   // 转换工具定义
   const kiroTools = convertOpenAITools(request.tools, toolNameRegistry)
 
-  // OpenAI 兼容请求的 thinking/effort 映射到 Kiro additionalModelRequestFields
-  const additionalFields: Record<string, unknown> = {}
+  // OpenAI 兼容请求的 thinking 映射到 Kiro additionalModelRequestFields
+  // Kiro schema 只允许 thinking 字段；reasoning_effort 等 OpenAI 参数被丢弃
+  let additionalModelRequestFields: Record<string, unknown> | undefined
   if (request.thinking && request.thinking.type !== 'disabled') {
-    additionalFields.thinking = { type: 'adaptive' }
+    additionalModelRequestFields = { thinking: { type: 'adaptive' } }
   }
-  if (request.reasoning_effort) {
-    additionalFields.effort = request.reasoning_effort
-  }
-  const additionalModelRequestFields = Object.keys(additionalFields).length > 0 ? additionalFields : undefined
 
   return buildKiroPayload(
     finalContent,
@@ -862,35 +865,38 @@ export function claudeToKiro(
   }
 
   // 构建最终内容
-  let finalContent = ''
+  // System prompt 以 Kiro 官方方式注入：作为 Human/AI pair 插入到 history 头部
+  // 官方 Kiro IDE: [Human(systemPrompt, forcedRole), AI("I will follow these instructions.", forcedRole)]
   if (systemPrompt) {
-    finalContent = `--- SYSTEM PROMPT ---\n${systemPrompt}\n--- END SYSTEM PROMPT ---\n\n`
-    currentCachePoint = mergeCachePoint(systemCachePoint, currentCachePoint)
+    const systemMessages: KiroHistoryMessage[] = [
+      {
+        userInputMessage: {
+          content: systemPrompt,
+          userInputMessageContext: {},
+          origin,
+          ...(systemCachePoint ? { cachePoint: systemCachePoint } : {})
+        }
+      },
+      {
+        assistantResponseMessage: {
+          content: 'I will follow these instructions.'
+        }
+      }
+    ]
+    history.unshift(...systemMessages)
   }
-  finalContent += currentContent || (currentToolResults.length > 0 ? 'Tool results provided.' : 'Continue')
+  const finalContent = currentContent || (currentToolResults.length > 0 ? 'Tool results provided.' : 'Continue')
 
   // 转换工具定义
   const kiroTools = convertClaudeTools(request.tools, toolNameRegistry)
 
-  // 将 Claude 模型参数映射为 Kiro additionalModelRequestFields
-  // Kiro schema 枚举为 ["adaptive", "disabled"]，统一映射为 adaptive 不带 budget_tokens
-  const additionalFields: Record<string, unknown> = {}
+  // 将 Claude thinking 参数映射为 Kiro additionalModelRequestFields
+  // Kiro additionalModelRequestFields schema 只允许 thinking 字段，不接受额外属性
+  // effort / context_management / anthropic_beta 等 Claude Code 参数被丢弃（Kiro 不支持）
+  let additionalModelRequestFields: Record<string, unknown> | undefined
   if (request.thinking && request.thinking.type !== 'disabled') {
-    additionalFields.thinking = { type: 'adaptive' }
+    additionalModelRequestFields = { thinking: { type: 'adaptive' } }
   }
-  // effort 参数透传（Claude Code 4.6+ 支持，low/medium/high/max）
-  if (request.output_config?.effort) {
-    additionalFields.effort = request.output_config.effort
-  }
-  // context_management beta 透传（API 侧自动上下文管理）
-  if (request.context_management) {
-    additionalFields.context_management = request.context_management
-  }
-  // anthropic_beta header 透传
-  if (request.anthropic_beta && request.anthropic_beta.length > 0) {
-    additionalFields.anthropic_beta = request.anthropic_beta
-  }
-  const additionalModelRequestFields = Object.keys(additionalFields).length > 0 ? additionalFields : undefined
 
   return buildKiroPayload(
     finalContent,

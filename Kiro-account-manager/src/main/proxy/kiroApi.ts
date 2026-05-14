@@ -820,7 +820,9 @@ export function buildKiroPayload(
     ...(tools.length > 0 ? { tools } : {})
   }
 
-  const conversationId = messageOptions?.conversationId || uuidv4()
+  // conversationId 稳定化：同一会话的多轮请求复用同一个 conversationId
+  // 优先级：客户端显式 conversation_id → sessionHint（header 提取）→ history fingerprint → 新 UUID
+  const conversationId = resolveConversationId(history, messageOptions?.conversationId)
   const payload: KiroPayload = {
     conversationState: {
       agentContinuationId: uuidv4(),
@@ -900,6 +902,56 @@ export function buildKiroPayload(
   })
 
   return payload
+}
+
+// conversationId 稳定化：同一会话的多轮请求复用同一个 conversationId
+// 策略：sessionHint（由 proxyServer 从 header/body 提取）→ 稳定映射到固定 conversationId
+// 无 sessionHint 时用 history fingerprint 兜底
+const conversationCache = new Map<string, { id: string; timestamp: number }>()
+const CONVERSATION_CACHE_TTL = 2 * 60 * 60 * 1000 // 2 小时
+const CONVERSATION_CACHE_MAX = 1000
+
+function resolveConversationId(history: KiroHistoryMessage[], sessionHint?: string): string {
+  // sessionHint 已包含 API Key hash 前缀（由 proxyServer 注入），天然隔离不同用户
+  const key = sessionHint || fingerprintFromHistory(history)
+  if (!key) return uuidv4()
+
+  const now = Date.now()
+  const cached = conversationCache.get(key)
+  if (cached) {
+    cached.timestamp = now
+    return cached.id
+  }
+
+  // 清理过期缓存
+  if (conversationCache.size > CONVERSATION_CACHE_MAX) {
+    const cutoff = now - CONVERSATION_CACHE_TTL
+    for (const [k, v] of conversationCache) {
+      if (v.timestamp < cutoff) conversationCache.delete(k)
+    }
+  }
+
+  const id = uuidv4()
+  conversationCache.set(key, { id, timestamp: now })
+  return id
+}
+
+function fingerprintFromHistory(history: KiroHistoryMessage[]): string | undefined {
+  if (history.length === 0) return undefined
+  const fp = history.slice(0, 2).map(msg =>
+    `${msg.userInputMessage?.content || ''}|${msg.assistantResponseMessage?.content || ''}`
+  ).join('::')
+  const crypto = require('crypto')
+  return crypto.createHash('sha256').update(fp).digest('hex').slice(0, 32)
+}
+
+// 清除所有内存缓存
+export function clearAllCaches(): { conversation: number; model: number } {
+  const conversationCount = conversationCache.size
+  const modelCount = codeWhispererModelCache.size
+  conversationCache.clear()
+  codeWhispererModelCache.clear()
+  return { conversation: conversationCount, model: modelCount }
 }
 
 // machineId 稳定生成缓存（用于无绑定 machineId 且 K-Proxy 不可用时的兆底）
@@ -1123,6 +1175,22 @@ interface ToolUseState {
   inputBuffer: string
 }
 
+// Token 估算（仅作兜底，Kiro 后端返回真实值时不使用）
+// 英文约 1 字符 = 0.3 token，中文约 1 字符 = 0.6 token
+function estimateTokens(text: string): number {
+  let cjkChars = 0
+  let otherChars = 0
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if ((code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF) || (code >= 0xF900 && code <= 0xFAFF)) {
+      cjkChars++
+    } else {
+      otherChars++
+    }
+  }
+  return Math.round(cjkChars * 0.6 + otherChars * 0.3)
+}
+
 // 解析 AWS Event Stream 二进制格式
 async function parseEventStream(
   body: ReadableStream<Uint8Array>,
@@ -1149,10 +1217,11 @@ async function parseEventStream(
   // 累积输出文本长度，用于估算 tokens
   let totalOutputChars = 0
   
-  // 估算 input tokens（基于输入字符长度）
-  // 约 3 个字符 = 1 token（混合中英文场景的保守估计）
+  // 估算 input tokens（基于输入字符长度，仅 Kiro 后端不返回 tokenUsage 时使用）
+  // 英文约 1 字符 = 0.3 token，中文约 1 字符 = 0.6 token
+  // payload 是 JSON 以英文为主，使用 0.3 系数
   if (inputChars > 0) {
-    usage.inputTokens = Math.max(1, Math.round(inputChars / 3))
+    usage.inputTokens = Math.max(1, Math.round(inputChars * 0.3))
   }
   
   // Tool use 状态跟踪 - 用于累积输入片段
@@ -1431,7 +1500,7 @@ async function parseEventStream(
                 proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
                 onChunk(reasoning.text, undefined, true, reasoning.signature, undefined)
                 totalOutputChars += reasoning.text.length
-                usage.reasoningTokens += Math.max(1, Math.round(reasoning.text.length / 3))
+                usage.reasoningTokens += Math.max(1, Math.round(reasoning.text.length * 0.4))
               } else if (reasoning.signature && !reasoning.redactedContent) {
                 onChunk('', undefined, true, reasoning.signature, undefined)
               }
@@ -1559,10 +1628,9 @@ async function parseEventStream(
     }
     
     // 如果 API 没有返回 token 信息，基于输出字符长度估算
-    // Token 估算规则：约 4 个字符 = 1 token（对于英文），中文约 2 字符 = 1 token
-    // 这里使用保守估计：平均 3 个字符 = 1 token
+    // 输出是自然语言，中英混合平均约 0.4 token/字符
     if (usage.outputTokens === 0 && totalOutputChars > 0) {
-      usage.outputTokens = Math.max(1, Math.round(totalOutputChars / 3))
+      usage.outputTokens = Math.max(1, Math.round(totalOutputChars * 0.4))
       proxyLogger.info('Kiro', `Estimated output tokens: ${totalOutputChars} chars -> ${usage.outputTokens} tokens`)
     }
     

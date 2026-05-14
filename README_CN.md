@@ -272,21 +272,27 @@ npx electron-builder --linux --arm64
 ## 📋 更新日志
 
 
-### v1.6.3 (2026-5-14)
+### v1.6.4 (2026-5-14)
 
 #### API 反代
-- **修复**: Claude Code 发送的 `thinking` 参数带数字 `budget_tokens` 时不再触发 `400 REQUEST_BODY_INVALID` — Kiro API 仅接受 `"adaptive"` 或 `"disabled"`，现统一映射为 `{ type: "enabled", budget_tokens: "adaptive" }`
+- **修复**: Claude Code 的 `thinking` 参数不再触发 `400 REQUEST_BODY_INVALID` — 所有 thinking 请求统一映射为 Kiro 枚举 `{ type: "adaptive" }`（Kiro schema 仅接受 `["adaptive", "disabled"]`）
+- **修复**: `context_management`、`effort`、`anthropic_beta` 不再注入 `additionalModelRequestFields` — Kiro schema 不允许额外属性，仅 `thinking` 可用
+- **修复**: System prompt 不再以 `--- SYSTEM PROMPT ---` 文本标记嵌入用户消息（被 Claude 模型识别为 prompt injection）— 改用 Kiro 官方 Human/AI pair 注入方式，与官方 IDE 行为一致
 - **修复**: CodeWhisperer 模型 ID 解析不再把 `claude-opus-4.7` 错误映射到 Sonnet 模型 — 匹配逻辑新增模型家族互斥（opus/sonnet/haiku 不可交叉匹配）
 - **修复**: 模型匹配不再搜索 description 文本，降低新模型未在 `ListAvailableModels` 中时的误匹配
+- **修复**: Token 估算修正 — 输入（JSON payload）使用 0.3 token/字符，输出（自然语言）使用 0.4 token/字符，并提供 CJK 感知的 `estimateTokens()` 辅助函数
+- **变更**: AmazonQ CLI 端点 origin 更新为 `AI_EDITOR`
 
-#### Claude Code 兼容性增强
-- **修复**: Thinking 参数映射为 Kiro schema 枚举格式 `{ type: "adaptive" }`（之前为 `{ type: "enabled", budget_tokens: "adaptive" }`）— 完全匹配 Kiro 后端 `["adaptive", "disabled"]` 枚举约束
-- **新增**: `redacted_thinking` 加密思考块支持 — Kiro `ReasoningContentEvent.redactedContent` 字段现在被解码并转换为 Anthropic `redacted_thinking` 内容块（请求输入和响应输出双向支持）
-- **新增**: `effort` 参数透传 — Claude Code 4.6+ 的 `output_config.effort`（low/medium/high/max）现在转发到 Kiro `additionalModelRequestFields.effort`
-- **新增**: `context_management` beta 透传 — API 侧自动上下文管理参数转发给 Kiro
-- **新增**: `anthropic_beta` header 透传到 `additionalModelRequestFields.anthropic_beta`
-- **新增**: OpenAI 兼容的 `reasoning_effort` 和 `thinking` 参数也映射到 Kiro `additionalModelRequestFields`
+#### 会话稳定性与防封
+- **新增**: `conversationId` 稳定化 — 同一客户端会话的多轮请求复用同一个 `conversationId`（与官方 Kiro IDE 行为一致）
+- **新增**: 三级会话检测：HTTP Header（`X-Claude-Code-Session-Id`、`x-opencode-session`、`x-session-affinity`）→ Body 字段（`conversation_id`、`thread_id`、`session_id`）→ History 指纹兜底
+- **新增**: API Key 隔离 — 不同 API Key 自动获得独立的会话命名空间
+- **新增**: `/admin/cache/clear` 端点 — 手动清除 conversationId 映射和模型缓存
+
+#### Claude Code 兼容性
+- **新增**: `redacted_thinking` 加密思考块支持 — Kiro `ReasoningContentEvent.redactedContent` 解码并转换为 Anthropic `redacted_thinking` 内容块（请求输入和响应输出双向支持）
 - **新增**: Payload 大小限制器 — 当 payload 超过 380KB 时，从最旧的大型工具结果开始截断为 2000 字符（保留截断标记），防止 Kiro API 拒绝长会话
+- **新增**: OpenAI 兼容的 `thinking` 参数也映射到 Kiro `additionalModelRequestFields`
 
 ### v1.6.2 (2026-5-13)
 

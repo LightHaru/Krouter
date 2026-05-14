@@ -243,6 +243,48 @@ export class ProxyServer {
   private activeRequests: Set<AbortController> = new Set()
   private sockets: Set<Socket> = new Set()
 
+  /**
+   * 从请求中提取 session hint，用于稳定 conversationId
+   * 优先级 1：显式稳定 ID（header）
+   * 优先级 2：请求体中的会话相关字段（body）
+   * 优先级 3：返回 undefined（由 kiroApi 用 history fingerprint 兜底）
+   */
+  static extractSessionHint(req: http.IncomingMessage, body: unknown): string | undefined {
+    const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
+    const h = req.headers
+    // 优先级 1：显式稳定 header
+    const headerHint =
+      (h['x-claude-code-session-id'] as string) ||
+      (h['x-opencode-session'] as string) ||
+      (h['x-session-affinity'] as string) ||
+      (h['x-conversation-id'] as string)
+    if (headerHint) return headerHint
+
+    // 优先级 2：body 中可靠的会话字段
+    const bodyHint =
+      (b.prompt_cache_key as string) ||
+      (b.promptCacheKey as string) ||
+      (b.conversation_id as string) ||
+      (b.conversationId as string) ||
+      (b.thread_id as string) ||
+      (b.threadId as string) ||
+      (b.session_id as string) ||
+      (b.sessionId as string)
+    if (bodyHint) return bodyHint
+
+    // 优先级 2.5：metadata 中的 session/conversation
+    const metadata = b.metadata as Record<string, unknown> | undefined
+    if (metadata) {
+      const metaHint =
+        (metadata.session_id as string) ||
+        (metadata.conversation_id as string)
+      if (metaHint) return metaHint
+    }
+
+    // 优先级 3：无显式 ID，返回 undefined（kiroApi 用 history fingerprint 兜底）
+    return undefined
+  }
+
   constructor(config: Partial<ProxyConfig> = {}, events: ProxyServerEvents = {}) {
     this.config = {
       enabled: false,
@@ -1323,6 +1365,12 @@ export class ProxyServer {
     } else if (path === '/admin/logs' && method === 'GET') {
       // 获取最近日志
       this.handleAdminLogs(res)
+    } else if (path === '/admin/cache/clear' && method === 'POST') {
+      // 清除内存缓存（conversationId 映射、模型缓存等）
+      const { clearAllCaches } = require('./kiroApi')
+      const cleared = clearAllCaches()
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true, cleared }))
     } else {
       this.sendError(res, 404, 'Admin endpoint not found')
     }
@@ -1741,6 +1789,15 @@ export class ProxyServer {
     this.throwIfAborted(signal)
     const request: OpenAIChatRequest = JSON.parse(body)
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
+
+    // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
+    if (!request.conversation_id) {
+      const hint = ProxyServer.extractSessionHint(req, request)
+      if (hint) {
+        const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
+        request.conversation_id = `${keyPrefix}:${hint}`
+      }
+    }
 
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
@@ -2209,6 +2266,15 @@ export class ProxyServer {
     this.throwIfAborted(signal)
     const request: ClaudeRequest = JSON.parse(body)
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
+
+    // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
+    if (!request.conversation_id) {
+      const hint = ProxyServer.extractSessionHint(req, request)
+      if (hint) {
+        const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
+        request.conversation_id = `${keyPrefix}:${hint}`
+      }
+    }
 
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
