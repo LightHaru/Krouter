@@ -495,6 +495,10 @@ export interface ProxyConfig {
   payloadSizeLimitKB?: number
   // 单账号模式下额度耗尽自动切换到下一个账号
   autoSwitchOnQuotaExhausted?: boolean
+  // 多账号选择策略 (仅 enableMultiAccount=true 时生效)
+  // - round-robin: 每次请求成功后切到下一个账号 (默认, 负载均衡)
+  // - sticky: 一个账号成功就粘住, 直到失败才切换 (保留 prompt cache, 牺牲均衡)
+  accountSelectionStrategy?: 'round-robin' | 'sticky'
   // 模型映射规则
   modelMappings?: ModelMappingRule[]
 }

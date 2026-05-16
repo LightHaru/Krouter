@@ -333,8 +333,10 @@ export function openaiToKiro(
       }
     } else if (msg.role === 'assistant') {
       // Kiro API 要求 content 非空
+      // 注意: 故意不读取 msg.reasoning_content (history 中不传给 Kiro)
+      // Kiro 后端 schema 仅在响应输出中支持 assistantResponseMessage.reasoningContent，
+      // 在请求 history 中传入此字段会触发 400 "Improperly formed request"
       let assistantContent = typeof msg.content === 'string' ? msg.content : ''
-      const reasoningContent = msg.reasoning_content?.trim()
       if (!assistantContent.trim() && msg.tool_calls && msg.tool_calls.length > 0) {
         assistantContent = ' '
       } else if (!assistantContent.trim()) {
@@ -361,7 +363,6 @@ export function openaiToKiro(
       history.push({
         assistantResponseMessage: {
           content: assistantContent,
-          ...(reasoningContent ? { reasoningContent: { reasoningText: { text: reasoningContent } } } : {}),
           toolUses: toolUses.length > 0 ? toolUses : undefined
         }
       })
@@ -824,7 +825,11 @@ export function claudeToKiro(
         }
       }
     } else if (msg.role === 'assistant') {
-      const { content: assistantContent, toolUses, reasoningContent } = extractClaudeAssistantContent(msg, toolNameRegistry)
+      // 注意: 故意丢弃 reasoningContent (history 中不传给 Kiro)
+      // Kiro 后端 schema 仅在响应输出中支持 assistantResponseMessage.reasoningContent，
+      // 在请求 history 中传入此字段会触发 400 "Improperly formed request"
+      // 当前消息的 thinking 开关由 additionalModelRequestFields.thinking 控制
+      const { content: assistantContent, toolUses } = extractClaudeAssistantContent(msg, toolNameRegistry)
 
       // 如果有 pending 的 user 内容但还没添加到 history，先添加
       if (pendingUserContent.trim() || pendingUserImages.length > 0 || pendingUserDocuments.length > 0 || pendingToolResults.length > 0) {
@@ -851,7 +856,6 @@ export function claudeToKiro(
 
       const assistantResponseMessage = {
         content: assistantContent,
-        ...(reasoningContent ? { reasoningContent } : {}),
         ...(toolUses.length > 0 ? { toolUses } : {})
       }
       history.push({ assistantResponseMessage })

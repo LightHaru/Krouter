@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { X, RefreshCw, Loader2, Cpu, FileText, Image, Hash, Sparkles, Zap, Shuffle, Brain, Database } from 'lucide-react'
+import { X, RefreshCw, Loader2, Cpu, FileText, Image, Hash, Sparkles, Zap, Shuffle, Brain, Database, AlertTriangle, Globe } from 'lucide-react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Badge } from '../ui'
 import { cn } from '@/lib/utils'
 
@@ -37,6 +37,15 @@ export function ModelsDialog({
   const [loading, setLoading] = useState(false)
   const [fromCache, setFromCache] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // IP 限制提示是否显示 (用户点击关闭后持久化)
+  const [showIpTip, setShowIpTip] = useState(() => {
+    return localStorage.getItem('models_dialog_ip_tip_dismissed') !== '1'
+  })
+
+  const dismissIpTip = () => {
+    localStorage.setItem('models_dialog_ip_tip_dismissed', '1')
+    setShowIpTip(false)
+  }
 
   const fetchModels = async () => {
     setLoading(true)
@@ -134,6 +143,43 @@ export function ModelsDialog({
           </div>
         </CardHeader>
         <CardContent className="p-4">
+          {/* IP 限制提示横幅 (Pro+ 订阅但缺失高级模型) */}
+          {showIpTip && (
+            <div className="mb-3 rounded-xl border border-amber-500/30 bg-gradient-to-r from-amber-500/10 to-orange-500/10 p-3.5 relative">
+              <div className="flex items-start gap-3">
+                <div className="shrink-0 p-1.5 rounded-lg bg-amber-500/20">
+                  <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+                </div>
+                <div className="flex-1 min-w-0 pr-6">
+                  <p className="text-sm font-semibold text-amber-700 dark:text-amber-300 mb-1.5 flex items-center gap-1.5">
+                    <Globe className="h-3.5 w-3.5" />
+                    {isEn
+                      ? 'Pro/Pro Max subscription but missing advanced models?'
+                      : '订阅 Pro/Pro Max 但看不到高级模型？'}
+                  </p>
+                  <p className="text-xs text-amber-700/90 dark:text-amber-200/90 leading-relaxed mb-1">
+                    {isEn
+                      ? 'This is likely caused by regional restrictions on China-mainland IPs. Try the following:'
+                      : '这通常是国内 IP 被限制导致的。请尝试以下方案：'}
+                  </p>
+                  <ul className="text-xs text-amber-700/90 dark:text-amber-200/90 space-y-0.5 list-disc list-inside">
+                    <li>{isEn ? 'Enable VPN/proxy (system-level or app-level)' : '开启 VPN / 代理（系统级或应用级均可）'}</li>
+                    <li>{isEn ? 'Switch to high-quality outbound IP (US/EU residential preferred)' : '切换到优质外网 IP（推荐美国 / 欧洲住宅 IP）'}</li>
+                    <li>{isEn ? 'Click Refresh after IP change to reload models' : 'IP 切换后点击右上角「刷新」重新加载模型'}</li>
+                  </ul>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="absolute top-2 right-2 h-7 w-7 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400"
+                  onClick={dismissIpTip}
+                  title={isEn ? "Don't show again" : '不再显示'}
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          )}
           <div className="max-h-[calc(85vh-140px)] overflow-y-auto pr-2">
             {loading && models.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">

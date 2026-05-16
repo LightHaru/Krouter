@@ -86,7 +86,7 @@ const KIRO_ENDPOINTS = [
   },
   {
     url: 'https://q.us-east-1.amazonaws.com/SendMessageStreaming',
-    origin: 'AI_EDITOR',
+    origin: 'AmazonQ',
     amzTarget: 'AmazonQDeveloperStreamingService.SendMessage',
     name: 'AmazonQCLI'
   }
@@ -191,7 +191,14 @@ export function mapModelId(model: string): string {
   if (!modelId) return MODEL_ID_MAP.default
   if (isCodeWhispererModelId(modelId)) return modelId
   const lower = modelId.toLowerCase()
-  return MODEL_ID_MAP[lower] || modelId
+  // 1) 显式 alias 映射优先
+  if (MODEL_ID_MAP[lower]) return MODEL_ID_MAP[lower]
+  // 2) 看似 Kiro 支持的 Claude 模型格式 (claude-{sonnet|haiku|opus}-{ver})，原样透传
+  //    用于向前兼容尚未加入 MODEL_ID_MAP 的新发布模型
+  if (/^claude-(sonnet|haiku|opus)-/.test(lower)) return modelId
+  // 3) 完全未知的 model（用户拼错/不存在），兜底到 default 避免直接 400
+  console.warn(`[Kiro API] Unknown model "${modelId}" → fallback to "${MODEL_ID_MAP.default}"`)
+  return MODEL_ID_MAP.default
 }
 
 function clonePayload(payload: KiroPayload): KiroPayload {

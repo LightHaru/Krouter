@@ -43,14 +43,31 @@ const DEFAULT_CONFIG: AccountPoolConfig = {
   probabilisticRetryChance: 0.1 // 10% 概率重试
 }
 
+export type AccountSelectionStrategy = 'round-robin' | 'sticky'
+
 export class AccountPool {
   private accounts: Map<string, ProxyAccount> = new Map()
   private accountStats: Map<string, AccountStats> = new Map()
   private currentIndex: number = 0
   private config: AccountPoolConfig
+  // 默认 round-robin: 每次成功后指针前进 (满足负载均衡期望)
+  // sticky: 一个账号成功就粘住 (保留 prompt cache 命中)
+  private strategy: AccountSelectionStrategy = 'round-robin'
 
   constructor(config: Partial<AccountPoolConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config }
+  }
+
+  // 切换账号选择策略
+  setStrategy(strategy: AccountSelectionStrategy): void {
+    if (this.strategy !== strategy) {
+      console.log(`[AccountPool] Strategy changed: ${this.strategy} → ${strategy}`)
+      this.strategy = strategy
+    }
+  }
+
+  getStrategy(): AccountSelectionStrategy {
+    return this.strategy
   }
 
   // 添加账号
@@ -251,11 +268,16 @@ export class AccountPool {
         isAvailable: true
       })
 
-      // 粘滞行为：成功后将全局索引固定在这个账号
       const accountList = Array.from(this.accounts.keys())
       const successIndex = accountList.indexOf(accountId)
-      if (successIndex >= 0 && this.currentIndex !== successIndex) {
-        this.currentIndex = successIndex
+      if (successIndex >= 0 && accountList.length > 0) {
+        if (this.strategy === 'sticky') {
+          // 粘滞: 成功后将全局索引固定在这个账号 (保留 prompt cache 命中)
+          this.currentIndex = successIndex
+        } else {
+          // round-robin: 成功后指向下一个账号 (满足负载均衡)
+          this.currentIndex = (successIndex + 1) % accountList.length
+        }
       }
     }
 

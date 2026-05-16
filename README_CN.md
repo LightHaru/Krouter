@@ -272,6 +272,51 @@ npx electron-builder --linux --arm64
 ## 📋 更新日志
 
 
+### v1.6.6 (2026-5-17)
+
+#### E2E 测试套件
+- **新增**: 完整 E2E 兼容性测试套件 `test/e2e-fullsuite/` (**30 个用例, 29/30 通过**) — 覆盖 Claude Code / OpenCode 真实抓包请求 + 边界/错误路径
+- **新增**: 基础协议覆盖 (CASE 01-16): probe、流式/非流式、system array、工具 (snake/Pascal/MCP-schema)、多轮 tool_result+text 回归、thinking signature、Claude Code Skill 复刻、12KB 大 description、OpenAI 流式/工具调用、opencode reasoning/multi-turn/promptCacheKey
+- **新增**: 错误路径覆盖 (CASE 17-21): 无 token / 错 token (401)、非法 JSON (400)、未知模型兜底、客户端 abort 清理
+- **新增**: 特殊端点 (CASE 22-24): `/v1/messages/count_tokens`、`/v1/models`、`/v1/responses` (OpenAI Responses API)
+- **新增**: 多模态/字段 (CASE 25-28): image base64、`tool_choice=any/none`、`stop_sequences`
+- **新增**: Admin/路由 (CASE 29-30): admin/stats 请求计数追踪、admin/config apiKeys 可读
+- **新增**: 零依赖 runner (`node test/e2e-fullsuite/run.mjs`)，支持 `--only <id|tag>` 过滤、JSON 报告 (`last-report.json`)
+- **新增**: `npm run test:e2e` 和 `npm run test:e2e:only` 脚本；完整文档见 `docs/E2E-TESTING.md`
+- **说明**: 默认模型 `claude-sonnet-4.5` (可改为 `claude-opus-4.7` 等)；CASE 01 probe 断言已放宽 (Kiro 反代无 probe-intercept)
+
+#### 日志优化
+- **优化**: 所有 API 日志（CBOR/REST）显示账号邮箱，方便识别来源
+- **优化**: API 响应日志拆分为一行摘要 + 可展开 JSON 详情（点击 ⓘ 查看）
+- **优化**: 日志中移除 token 明文（安全），改为 `token=N字符` 长度指示
+- **优化**: 冗余多行日志合并 — `[IPC]`、`[Kiro API]`、`[Kiro REST API]` 每次请求/响应各 1 行
+- **优化**: `[KiroPayload]` 和 `[KiroAPI] Request to` 结构化数据放入可展开详情
+- **移除**: `[REST->Unified] Converting response` 重复日志、`Using K-Proxy agent` 噪音日志
+
+#### 账号池策略
+- **新增**: 账号选择策略可配置 — `round-robin`（轮询，默认，负载均衡）或 `sticky`（粘滞，保留 prompt cache）；多账号轮询开关旁有 UI 切换
+- **修复**: 🔥 多账号"轮询"实际没轮询 — `recordSuccess` 总是把 `currentIndex` 固定在成功账号，导致连续成功请求一直粘在同一账号，直到失败才切换。默认改为真正的 round-robin（`currentIndex = (success + 1) % len`）。原 sticky 行为保留为可选项，适合需要 prompt cache 复用的场景。
+
+#### UI 提示
+- **新增**: 可用模型对话框新增可关闭的 IP 限制提示 — 订阅 Pro/Pro Max 但看不到高级模型？很可能是国内 IP 被限制；提示开启 VPN/代理或切换到美国/欧洲住宅 IP。通过 `localStorage('models_dialog_ip_tip_dismissed')` 持久化关闭状态。
+
+#### 日志查看器增强
+- **优化**: 反代详细日志弹窗 — 分页改为虚拟滚动 + 智能自动跟随 + 「回到底部」浮动按钮
+- **优化**: 系统日志页面 — 新增时间范围筛选（1h/6h/1d/7d）、分类下拉、显示条数选择器（5K–100K）
+- **优化**: 系统日志拉取数量跟随用户选择的显示条数，不再固定 3000
+- **优化**: 两个日志页面统一交互体验：向上滚动暂停跟随、底部状态指示、新日志数 badge
+
+#### 高级配置
+- **新增**: Payload 大小限制可在高级设置中配置（256KB–10240KB，默认 1536KB/1.5MB）
+- **变更**: Payload 截断阈值从 380KB 提升到 1.5MB — 支持 200K+ token 大上下文模型，避免误截断
+- **变更**: 工具结果截断长度从 2000 提升到 4000 字符
+
+#### Bug 修复
+- **修复**: 🔥 **多轮 thinking / Claude Code Skill 502** — `history.assistantResponseMessage.reasoningContent` 被 Kiro 后端 schema 拒绝触发 `400 Improperly formed request`。现在 history 中丢弃 thinking blocks（当前消息的 thinking 仍通过 `additionalModelRequestFields.thinking={type:'adaptive'}` 控制）。Anthropic 和 OpenAI 转换器双路径都修复。E2E CASE-08/09 暴露并验证。
+- **修复**: 缓存 token 双重计费 — `input_tokens` 现在扣除 `cache_read` + `cache_creation`，符合 Anthropic 官方规范（之前会让客户端账单显示虚高）
+- **修复**: 未知模型兜底 — `mapModelId` 完全未识别的模型名现在兜底到 `MODEL_ID_MAP.default` (claude-sonnet-4.5)，保留 `claude-{sonnet|haiku|opus}-{ver}` 格式的向前兼容透传。之前用户拼错 model 名会触发上游 `400 Improperly formed request`。E2E CASE-20 暴露并验证。
+- **修复**: 非流式路径统计字段缺失 — `/v1/responses`（流式 + 非流式）、`/v1/chat/completions` 非流式、`/v1/messages` 非流式 4 处的 `recordRequest` 和 `onResponse` 事件都漏传 `credits` / `responseTime` / `cacheReadTokens` / `reasoningTokens`，导致前端日志表「Credits」「耗时」列对非流式请求显示 `-`。4 处全部补齐完整事件载荷与持久化字段。
+
 ### v1.6.5 (2026-5-15)
 
 #### Prompt Cache 模拟器
@@ -293,25 +338,6 @@ npx electron-builder --linux --arm64
 - **新增**: 级别筛选按钮组（ALL/DEBUG/INFO/WARN/ERROR），每个级别显示彩色计数
 - **新增**: Grid 对齐列、分类颜色编码（Kiro=蓝、ProxyServer=紫、KiroAPI=青）
 - **新增**: 点击展开数据详情（JSON 格式化），流式事件聚合为单条摘要
-
-#### 日志优化
-- **优化**: 所有 API 日志（CBOR/REST）显示账号邮箱，方便识别来源
-- **优化**: API 响应日志拆分为一行摘要 + 可展开 JSON 详情（点击 ⓘ 查看）
-- **优化**: 日志中移除 token 明文（安全），改为 `token=N字符` 长度指示
-- **优化**: 冗余多行日志合并 — `[IPC]`、`[Kiro API]`、`[Kiro REST API]` 每次请求/响应各 1 行
-- **优化**: `[KiroPayload]` 和 `[KiroAPI] Request to` 结构化数据放入可展开详情
-- **移除**: `[REST->Unified] Converting response` 重复日志、`Using K-Proxy agent` 噪音日志
-
-#### 日志查看器增强
-- **优化**: 反代详细日志弹窗 — 分页改为虚拟滚动 + 智能自动跟随 + 「回到底部」浮动按钮
-- **优化**: 系统日志页面 — 新增时间范围筛选（1h/6h/1d/7d）、分类下拉、显示条数选择器（5K–100K）
-- **优化**: 系统日志拉取数量跟随用户选择的显示条数，不再固定 3000
-- **优化**: 两个日志页面统一交互体验：向上滚动暂停跟随、底部状态指示、新日志数 badge
-
-#### 高级配置
-- **新增**: Payload 大小限制可在高级设置中配置（256KB–10240KB，默认 1536KB/1.5MB）
-- **变更**: Payload 截断阈值从 380KB 提升到 1.5MB — 支持 200K+ token 大上下文模型，避免误截断
-- **变更**: 工具结果截断长度从 2000 提升到 4000 字符
 
 #### Bug 修复
 - **修复**: `tool_result content block N requires text` — 空/null 工具结果规范化为 `"(no output)"`，不再抛 400

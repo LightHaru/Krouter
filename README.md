@@ -272,6 +272,49 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.6.6 (2026-5-17)
+
+#### E2E Test Suite
+- **New**: Full E2E compatibility test suite under `test/e2e-fullsuite/` (**30 cases, 29/30 pass**) — covers Claude Code / OpenCode real captured requests + boundary/error paths
+- **New**: Base protocol coverage (CASE 01-16): probe, streaming, system array, tools (snake/Pascal/MCP-schema), multi-turn tool_result+text regression, thinking signature, Claude Code Skill replay, 12KB tool description, OpenAI streaming/tool-call, opencode reasoning/multi-turn/promptCacheKey
+- **New**: Error path coverage (CASE 17-21): missing/wrong token (401), invalid JSON (400), unknown model fallback, client-side abort cleanup
+- **New**: Special endpoints (CASE 22-24): `/v1/messages/count_tokens`, `/v1/models`, `/v1/responses` (OpenAI Responses API)
+- **New**: Multimodal/fields (CASE 25-28): image base64, `tool_choice=any/none`, `stop_sequences`
+- **New**: Admin/routing (CASE 29-30): admin/stats request count tracking, admin/config apiKeys readable
+- **New**: Zero-dependency runner (`node test/e2e-fullsuite/run.mjs`), supports `--only <id|tag>` filter, JSON report (`last-report.json`)
+- **New**: `npm run test:e2e` and `npm run test:e2e:only` scripts; full docs at `docs/E2E-TESTING.md`
+- **Note**: Default model `claude-sonnet-4.5` (overridable to `claude-opus-4.7` etc); CASE 01 probe assertion relaxed (Kiro proxy has no probe-intercept)
+
+#### Log Optimization
+- **Improved**: All API logs (CBOR/REST) now show account email for easy identification
+- **Improved**: API response logs split into one-line summary + expandable JSON data (click ⓘ to view)
+- **Improved**: Removed token plaintext from logs (security), replaced with `token=Nchars` length indicator
+- **Improved**: Redundant multi-line logs consolidated — `[IPC]`, `[Kiro API]`, `[Kiro REST API]` each reduced to 1 line per request/response
+- **Improved**: `[KiroPayload]` and `[KiroAPI] Request to` keep structured data in expandable details
+- **Removed**: `[REST->Unified] Converting response` duplicate log, `Using K-Proxy agent` noise logs
+
+#### Account Pool Strategy
+- **New**: Account selection strategy configurable — `round-robin` (default, load balanced) or `sticky` (preserves prompt cache); UI toggle next to Multi-Account switch
+- **Fixed**: 🔥 Multi-account "rotation" actually didn't rotate — `recordSuccess` always pinned `currentIndex` to the success account, so successful requests stuck on the same account until failure. Default behavior changed to true round-robin (`currentIndex = (success + 1) % len`). Existing sticky behavior preserved as opt-in for prompt-cache-sensitive workloads.
+
+#### UI Enhancements
+- **New**: Models dialog now shows a dismissible IP-restriction tip — Pro/Pro Max subscriber but missing advanced models? Likely China-mainland IP restriction; suggest VPN/proxy or switching to US/EU residential IP. Persisted via `localStorage('models_dialog_ip_tip_dismissed')`.
+- **Improved**: Proxy Detailed Logs dialog — replaced pagination with virtual scrolling + smart auto-follow + "Back to bottom" floating button
+- **Improved**: System Logs page — added time range filter (1h/6h/1d/7d), category dropdown, display limit selector (5K–100K)
+- **Improved**: System Logs fetch count now follows user-selected display limit instead of hardcoded 3000
+- **Improved**: Both log pages share consistent UX: scroll-up pauses follow, bottom indicator, new log count badge
+
+#### Advanced Configuration
+- **New**: Payload size limit configurable in Advanced Settings (256KB–10240KB, default 1536KB/1.5MB)
+- **Changed**: Payload truncation threshold raised from 380KB to 1.5MB — supports 200K+ token context models without premature truncation
+- **Changed**: Tool result truncation length increased from 2000 to 4000 chars when limit is reached
+
+#### Bug Fixes
+- **Fixed**: 🔥 **Multi-turn thinking / Claude Code Skill 502** — `history.assistantResponseMessage.reasoningContent` was rejected by Kiro backend with `400 Improperly formed request`. Now history drops thinking blocks (current-turn thinking still works via `additionalModelRequestFields.thinking={type:'adaptive'}`). Affects both Anthropic and OpenAI converter paths. Caught by E2E CASE-08/09.
+- **Fixed**: Cache token double-counting — `input_tokens` now subtracts `cache_read` + `cache_creation` to match Anthropic spec (was inflating client billing display)
+- **Fixed**: Unknown model fallback — `mapModelId` now falls back to `MODEL_ID_MAP.default` (claude-sonnet-4.5) when model is completely unrecognized; preserves forward-compat for `claude-{sonnet|haiku|opus}-{ver}` patterns. Previously typo'd model names returned upstream `400 Improperly formed request`. Caught by E2E CASE-20.
+- **Fixed**: Non-streaming paths missing `credits` / `responseTime` / `cacheReadTokens` / `reasoningTokens` in stats — affected `/v1/responses` (both stream and non-stream), `/v1/chat/completions` non-stream, `/v1/messages` non-stream. Frontend log table showed `-` for Credits and Time columns on non-streaming requests. All 4 paths now emit the full event payload + persist to `recordRequest`.
+
 ### v1.6.5 (2026-5-15)
 
 #### Prompt Cache Simulator
@@ -293,25 +336,6 @@ The project is configured with GitHub Actions workflow for auto building all pla
 - **New**: Level filter pills (ALL/DEBUG/INFO/WARN/ERROR) with colored counts
 - **New**: Grid-aligned columns, category color coding (Kiro=blue, ProxyServer=violet, KiroAPI=cyan)
 - **New**: Click to expand data details (JSON formatted), stream events aggregated into summary
-
-#### Log Optimization
-- **Improved**: All API logs (CBOR/REST) now show account email for easy identification
-- **Improved**: API response logs split into one-line summary + expandable JSON data (click ⓘ to view)
-- **Improved**: Removed token plaintext from logs (security), replaced with `token=Nchars` length indicator
-- **Improved**: Redundant multi-line logs consolidated — `[IPC]`, `[Kiro API]`, `[Kiro REST API]` each reduced to 1 line per request/response
-- **Improved**: `[KiroPayload]` and `[KiroAPI] Request to` keep structured data in expandable details
-- **Removed**: `[REST->Unified] Converting response` duplicate log, `Using K-Proxy agent` noise logs
-
-#### Log Viewer Enhancements
-- **Improved**: Proxy Detailed Logs dialog — replaced pagination with virtual scrolling + smart auto-follow + "Back to bottom" floating button
-- **Improved**: System Logs page — added time range filter (1h/6h/1d/7d), category dropdown, display limit selector (5K–100K)
-- **Improved**: System Logs fetch count now follows user-selected display limit instead of hardcoded 3000
-- **Improved**: Both log pages share consistent UX: scroll-up pauses follow, bottom indicator, new log count badge
-
-#### Advanced Configuration
-- **New**: Payload size limit configurable in Advanced Settings (256KB–10240KB, default 1536KB/1.5MB)
-- **Changed**: Payload truncation threshold raised from 380KB to 1.5MB — supports 200K+ token context models without premature truncation
-- **Changed**: Tool result truncation length increased from 2000 to 4000 chars when limit is reached
 
 #### Bug Fixes
 - **Fixed**: `tool_result content block N requires text` — empty/null tool results now normalized to `"(no output)"` instead of throwing 400

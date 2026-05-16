@@ -78,6 +78,7 @@ interface ProxyConfig {
   disableTools?: boolean
   payloadSizeLimitKB?: number
   autoSwitchOnQuotaExhausted?: boolean
+  accountSelectionStrategy?: 'round-robin' | 'sticky'
   modelMappings?: ModelMappingRule[]
 }
 
@@ -654,6 +655,44 @@ export function ProxyPanel() {
               />
               <Label htmlFor="multiAccount">{isEn ? 'Multi-Account' : '多账号轮询'}</Label>
             </div>
+            {/* 开启多账号轮询时显示策略选择 */}
+            {config.enableMultiAccount && (
+              <div className="col-span-2 flex items-center gap-2">
+                <Label className="text-sm shrink-0">
+                  {isEn ? 'Strategy' : '选择策略'}:
+                </Label>
+                <div className="flex gap-1 bg-muted/30 rounded-lg p-0.5">
+                  {(['round-robin', 'sticky'] as const).map(strategy => {
+                    const active = (config.accountSelectionStrategy || 'round-robin') === strategy
+                    const labelEn = strategy === 'round-robin' ? 'Round-Robin' : 'Sticky'
+                    const labelZh = strategy === 'round-robin' ? '轮询' : '粘滞'
+                    return (
+                      <button
+                        key={strategy}
+                        type="button"
+                        disabled={isRunning}
+                        className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                          active
+                            ? 'bg-primary text-primary-foreground shadow-sm'
+                            : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                        } disabled:opacity-50 disabled:cursor-not-allowed`}
+                        onClick={() => {
+                          setConfig(prev => ({ ...prev, accountSelectionStrategy: strategy }))
+                          window.api.proxyUpdateConfig({ accountSelectionStrategy: strategy })
+                        }}
+                      >
+                        {isEn ? labelEn : labelZh}
+                      </button>
+                    )
+                  })}
+                </div>
+                <span className="text-xs text-muted-foreground">
+                  {(config.accountSelectionStrategy || 'round-robin') === 'round-robin'
+                    ? (isEn ? 'Each request rotates to next account (load balanced)' : '每次请求轮询到下一个账号（负载均衡）')
+                    : (isEn ? 'Stay on success account until failure (preserves prompt cache)' : '成功后粘住该账号直到失败（保留 prompt cache）')}
+                </span>
+              </div>
+            )}
             {/* 关闭多账号轮询时显示账号选择按钮和自动切换开关 */}
             {!config.enableMultiAccount && (
               <>
