@@ -9,5 +9,5 @@ export function getRuntimeUserDataPath(): string {
     // Running as the VPS web backend without Electron installed.
   }
 
-  return path.resolve(process.env.KIRO_RUNTIME_DATA_DIR || process.env.KIRO_WEB_DATA_DIR || '.web-data')
+  return path.resolve(process.env.KROUTER_DATA_DIR || process.env.KAM_DATA_DIR || process.env.KIRO_RUNTIME_DATA_DIR || process.env.KIRO_WEB_DATA_DIR || '.web-data')
 }

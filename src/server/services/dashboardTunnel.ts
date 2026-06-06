@@ -27,6 +27,8 @@ const PID_FILE = 'dashboard-tunnel-cloudflared.pid'
 
 function dataDir(): string {
   return (
+    process.env.KROUTER_DATA_DIR ||
+    process.env.KAM_DATA_DIR ||
     process.env.KIRO_RUNTIME_DATA_DIR ||
     process.env.KIRO_WEB_DATA_DIR ||
     path.join(process.cwd(), '.web-data')

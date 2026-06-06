@@ -97,6 +97,10 @@ const sseClients = new Set<SseClient>()
 const dashboardTunnelRuntime = getDashboardTunnelRuntime()
 const SESSION_COOKIE_NAME = 'krouter_session'
 const LEGACY_SESSION_COOKIE_NAME = 'kam_session'
+const TOKEN_REFRESH_BEFORE_EXPIRY_MS = 5 * 60 * 1000
+const BACKEND_AUTO_REFRESH_MIN_INTERVAL_MS = 60 * 1000
+const backendAutoRefreshTimers = new Map<string, ReturnType<typeof setInterval>>()
+const backendAutoRefreshRunning = new Set<string>()
 
 function envFlag(name: string): boolean | undefined {
   const raw = process.env[name]
@@ -366,8 +370,55 @@ type BackgroundAccount = AccountLike & {
   needsTokenRefresh?: boolean
 }
 
+type StoredAccount = AccountLike & {
+  id?: string
+  email?: string
+  userId?: string
+  status?: string
+  lastError?: string
+  lastCheckedAt?: number
+  usage?: Record<string, unknown>
+  subscription?: Record<string, unknown>
+}
+
+type StoredAccountData = Record<string, unknown> & {
+  accounts?: Record<string, StoredAccount>
+  autoRefreshEnabled?: boolean
+  autoRefreshInterval?: number
+  autoRefreshConcurrency?: number
+  autoRefreshSyncInfo?: boolean
+  autoSwitchEnabled?: boolean
+}
+
 function errorMessageFromResult(result: any): string {
   return result?.error?.message || result?.error || 'Unknown error'
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
+function isBannedAccountError(error?: string): boolean {
+  if (!error) return false
+  const lowerError = error.toLowerCase()
+  return (
+    lowerError.includes('accountsuspendedexception') ||
+    lowerError.includes('account suspended') ||
+    lowerError.includes('temporarily_suspended') ||
+    lowerError.includes('temporarily suspended') ||
+    (lowerError.includes('user id is') && lowerError.includes('suspended')) ||
+    lowerError.includes('account is locked') ||
+    lowerError.includes('security precaution') ||
+    lowerError.includes('账户已封禁') ||
+    lowerError.includes('已封禁') ||
+    /\b423\b/.test(lowerError)
+  )
+}
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.max(min, Math.min(parsed, max))
 }
 
 function normalizeBackgroundStatusData(data: any): Record<string, unknown> {
@@ -404,6 +455,216 @@ function accountForStatusCheck(account: BackgroundAccount, allowRefresh: boolean
       ...account.credentials,
       expiresAt: account.credentials.expiresAt || Date.now() + 3600000
     }
+  }
+}
+
+function accountNeedsBackendRefresh(account: StoredAccount, now: number): boolean {
+  const credentials = account.credentials || {}
+  const expiresAt = Number(credentials.expiresAt || 0)
+  return !credentials.accessToken || !expiresAt || expiresAt - now <= TOKEN_REFRESH_BEFORE_EXPIRY_MS
+}
+
+function getStoredAccounts(accountData: StoredAccountData): Record<string, StoredAccount> {
+  return isPlainRecord(accountData.accounts) ? accountData.accounts as Record<string, StoredAccount> : {}
+}
+
+function applyRefreshDataToStoredAccount(
+  id: string,
+  account: StoredAccount,
+  data: Record<string, any> | undefined,
+  now: number
+): StoredAccount {
+  const credentials = account.credentials || {}
+  const nextCredentials = { ...credentials }
+  if (typeof data?.accessToken === 'string' && data.accessToken) {
+    nextCredentials.accessToken = data.accessToken
+  }
+  if (typeof data?.refreshToken === 'string' && data.refreshToken) {
+    nextCredentials.refreshToken = data.refreshToken
+  }
+  const expiresIn = Number(data?.expiresIn)
+  if (Number.isFinite(expiresIn) && expiresIn > 0 && nextCredentials.accessToken) {
+    nextCredentials.expiresAt = now + expiresIn * 1000
+  }
+
+  let usage = account.usage
+  if (isPlainRecord(data?.usage)) {
+    const currentUsage = isPlainRecord(account.usage) ? account.usage : {}
+    usage = { ...currentUsage, ...data.usage, lastUpdated: now }
+  }
+
+  let subscription = account.subscription
+  if (isPlainRecord(data?.subscription)) {
+    const currentSubscription = isPlainRecord(account.subscription) ? account.subscription : {}
+    subscription = { ...currentSubscription, ...data.subscription }
+    const managementTarget = data.subscription.subscriptionManagementTarget ?? data.subscription.managementTarget ?? currentSubscription.managementTarget
+    if (managementTarget !== undefined) subscription.managementTarget = managementTarget
+  }
+
+  const userInfo = isPlainRecord(data?.userInfo) ? data.userInfo : {}
+  const status = data?.status === 'error' ? 'error' : 'active'
+  const errorMessage = typeof data?.errorMessage === 'string' && data.errorMessage ? data.errorMessage : undefined
+
+  return {
+    ...account,
+    id: account.id || id,
+    email: typeof userInfo.email === 'string' && userInfo.email ? userInfo.email : account.email,
+    userId: typeof userInfo.userId === 'string' && userInfo.userId ? userInfo.userId : account.userId,
+    profileArn: typeof data?.profileArn === 'string' && data.profileArn ? data.profileArn : account.profileArn,
+    credentials: nextCredentials,
+    usage,
+    subscription,
+    status,
+    lastError: errorMessage,
+    lastCheckedAt: now
+  }
+}
+
+function applyBackendRefreshFailure(id: string, account: StoredAccount, error: string, now: number): StoredAccount {
+  return {
+    ...account,
+    id: account.id || id,
+    status: 'error',
+    lastError: error,
+    lastCheckedAt: now
+  }
+}
+
+function backendAutoRefreshEnabled(): boolean {
+  return envFlag('KROUTER_BACKEND_AUTO_REFRESH') ?? envFlag('KAM_BACKEND_AUTO_REFRESH') ?? true
+}
+
+async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): Promise<void> {
+  if (!backendAutoRefreshEnabled()) return
+  if (backendAutoRefreshRunning.has(user.id)) return
+  backendAutoRefreshRunning.add(user.id)
+  try {
+    const accountData = (store.getAccountData(user.id) || defaultAccountData()) as StoredAccountData
+    if (accountData.autoRefreshEnabled === false) return
+
+    const accounts = getStoredAccounts(accountData)
+    const entries = Object.entries(accounts)
+    const now = Date.now()
+    const syncInfo = accountData.autoRefreshSyncInfo !== false
+    const autoSwitch = Boolean(accountData.autoSwitchEnabled)
+    const pending = entries
+      .map(([id, account]) => ({
+        id,
+        account,
+        needsTokenRefresh: accountNeedsBackendRefresh(account, now)
+      }))
+      .filter(({ account, needsTokenRefresh }) => {
+        if (isBannedAccountError(account.lastError)) return false
+        if (!account.credentials?.refreshToken) return false
+        return needsTokenRefresh || syncInfo || autoSwitch
+      })
+
+    if (pending.length === 0) return
+
+    const concurrency = clampNumber(accountData.autoRefreshConcurrency, 5, 1, 100)
+    let completed = 0
+    let successCount = 0
+    let failedCount = 0
+    let changed = false
+    console.log(`[BackendAutoRefresh] ${user.email}: processing ${pending.length} account(s), reason=${reason}, syncInfo=${syncInfo}`)
+
+    for (let index = 0; index < pending.length; index += concurrency) {
+      const batch = pending.slice(index, index + concurrency)
+      await Promise.all(batch.map(async ({ id, account, needsTokenRefresh }) => {
+        const backgroundAccount: BackgroundAccount = {
+          ...account,
+          id,
+          needsTokenRefresh
+        }
+        let payload: { id: string; success: boolean; data?: unknown; error?: string }
+        try {
+          if (!syncInfo && !autoSwitch) {
+            const refresh = await refreshAccountToken(backgroundAccount)
+            payload = refresh.success && refresh.data
+              ? { id, success: true, data: refresh.data }
+              : { id, success: false, error: errorMessageFromResult(refresh) }
+          } else {
+            const status = await checkAccountStatus(accountForStatusCheck(backgroundAccount, needsTokenRefresh)) as any
+            payload = status?.success && status.data
+              ? { id, success: true, data: normalizeBackgroundStatusData(status.data) }
+              : { id, success: false, error: errorMessageFromResult(status) }
+          }
+        } catch (error) {
+          payload = { id, success: false, error: error instanceof Error ? error.message : String(error) }
+        }
+
+        const finishedAt = Date.now()
+        if (payload.success) {
+          successCount++
+          accounts[id] = applyRefreshDataToStoredAccount(id, accounts[id] || account, payload.data as Record<string, any> | undefined, finishedAt)
+        } else {
+          failedCount++
+          accounts[id] = applyBackendRefreshFailure(id, accounts[id] || account, payload.error || 'Unknown error', finishedAt)
+        }
+        changed = true
+        emit('background-refresh-result', payload)
+      }))
+
+      completed += batch.length
+      emit('background-refresh-progress', { completed, total: pending.length, success: successCount, failed: failedCount })
+      if (index + concurrency < pending.length) await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+
+    if (changed) {
+      accountData.accounts = accounts
+      await store.setAccountData(user.id, accountData)
+      await store.audit(user.id, 'backend-token-refresh', {
+        reason,
+        completed,
+        successCount,
+        failedCount
+      })
+    }
+  } catch (error) {
+    console.error(`[BackendAutoRefresh] ${user.email}: failed`, error)
+  } finally {
+    backendAutoRefreshRunning.delete(user.id)
+  }
+}
+
+function clearBackendAutoRefreshForUser(userId: string): void {
+  const timer = backendAutoRefreshTimers.get(userId)
+  if (timer) clearInterval(timer)
+  backendAutoRefreshTimers.delete(userId)
+}
+
+function scheduleBackendAutoRefreshForUser(user: UserRecord, runNow: boolean): void {
+  clearBackendAutoRefreshForUser(user.id)
+  if (!backendAutoRefreshEnabled()) return
+  const accountData = (store.getAccountData(user.id) || defaultAccountData()) as StoredAccountData
+  if (accountData.autoRefreshEnabled === false) {
+    console.log(`[BackendAutoRefresh] ${user.email}: disabled by account settings`)
+    return
+  }
+
+  const intervalMinutes = clampNumber(accountData.autoRefreshInterval, 5, 1, 1440)
+  const intervalMs = Math.max(BACKEND_AUTO_REFRESH_MIN_INTERVAL_MS, intervalMinutes * 60 * 1000)
+  const timer = setInterval(() => {
+    void runBackendAutoRefreshForUser(user, 'interval')
+  }, intervalMs)
+  timer.unref?.()
+  backendAutoRefreshTimers.set(user.id, timer)
+
+  if (runNow) {
+    const initialTimer = setTimeout(() => {
+      void runBackendAutoRefreshForUser(user, 'server-boot')
+    }, 2000)
+    initialTimer.unref?.()
+  }
+}
+
+async function startBackendAutoRefreshRuntimes(): Promise<void> {
+  if (!backendAutoRefreshEnabled()) {
+    console.log('[BackendAutoRefresh] Disabled by environment')
+    return
+  }
+  for (const user of store.getUsers()) {
+    scheduleBackendAutoRefreshForUser(user, true)
   }
 }
 
@@ -476,6 +737,7 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
         const merged = mergeAccountData(store.getAccountData(user.id), args[0])
         const hydrated = await hydrateAccountDataProfileArns(merged)
         await store.setAccountData(user.id, hydrated.data)
+        scheduleBackendAutoRefreshForUser(user, false)
       }
       return null
     case 'getLocalActiveAccount':
@@ -809,6 +1071,7 @@ async function handleAuth(request: IncomingMessage, response: ServerResponse, pa
         password
       })
       const session = await store.createSession(user.id)
+      scheduleBackendAutoRefreshForUser(user, false)
       response.setHeader('Set-Cookie', sessionCookie(session.id, session.expiresAt))
       sendJson(response, 200, {
         authenticated: true,
@@ -1157,6 +1420,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
 async function main(): Promise<void> {
   await store.load()
   void startAutoProxyRuntimes()
+  void startBackendAutoRefreshRuntimes()
   const port = Number(process.env.PORT || 4010)
   const host = process.env.HOST || '127.0.0.1'
   const server = http.createServer((request, response) => {

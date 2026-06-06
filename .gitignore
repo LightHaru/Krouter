@@ -9,6 +9,7 @@ out-server
 .eslintcache
 *.log*
 *.tar.gz
+*.tgz
 .deploy-*
 krouter-*.png
 test-openclaw-import.cjs

@@ -33,7 +33,7 @@ const SENSITIVE_KEY_RE = /^(accessToken|refreshToken|csrfToken|clientSecret|pass
 const ENCRYPTED_MARKER = '__kiroWebEncrypted'
 
 function dataDir(): string {
-  return path.resolve(process.env.KIRO_WEB_DATA_DIR || '.web-data')
+  return path.resolve(process.env.KROUTER_DATA_DIR || process.env.KAM_DATA_DIR || process.env.KIRO_WEB_DATA_DIR || '.web-data')
 }
 
 function storePath(): string {

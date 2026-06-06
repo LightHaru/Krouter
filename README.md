@@ -106,6 +106,28 @@ You choose one of two setup modes:
 
 ## Quick Start
 
+Install or update with one command:
+
+```bash
+npm install -g @lightharu/krouter
+```
+
+Run Krouter:
+
+```bash
+krouter
+```
+
+The CLI starts the local backend, opens the dashboard, and stores runtime data in `~/.krouter`.
+
+To update later:
+
+```bash
+npm update -g @lightharu/krouter
+```
+
+Source/development mode:
+
 ```bash
 npm install
 npm run build:fullstack

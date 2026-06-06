@@ -340,8 +340,12 @@ export class Registrar {
     }
 
     // 2. 从打包资源复制（安装包自带）
-    const resourcePath = path.join(process.resourcesPath || '', filename)
-    if (fs.existsSync(resourcePath)) {
+    const resourceCandidates = [
+      path.join(process.resourcesPath || '', filename),
+      path.join(__dirname, '..', '..', '..', 'resources', filename)
+    ]
+    const resourcePath = resourceCandidates.find((candidate) => fs.existsSync(candidate))
+    if (resourcePath) {
       this.log('[TLS] Copying library from resources to userData (one-time): ' + resourcePath + ' -> ' + finalPath)
       try {
         fs.copyFileSync(resourcePath, finalPath)

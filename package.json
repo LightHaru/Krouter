@@ -1,14 +1,40 @@
 {
-  "name": "krouter",
+  "name": "@lightharu/krouter",
   "version": "1.8.0",
   "description": "Krouter - Web dashboard and CLI router for Kiro accounts, quota balancing, and API proxy",
-  "main": "./out/main/index.js",
+  "main": "./out-server/server/index.js",
   "bin": {
     "krouter": "scripts/krouter-cli.cjs"
   },
   "author": "LightHaru",
   "license": "AGPL-3.0",
   "homepage": "https://github.com/LightHaru/Krouter",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LightHaru/Krouter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LightHaru/Krouter/issues"
+  },
+  "keywords": [
+    "krouter",
+    "kiro",
+    "openclaw",
+    "api-proxy",
+    "openai-compatible",
+    "cli"
+  ],
+  "files": [
+    "dist-web/",
+    "out-server/",
+    "scripts/krouter-cli.cjs",
+    "scripts/kiro-manager-cli.cjs",
+    "resources/tls-client-xgo-1.14.0-windows-amd64.dll",
+    "src/renderer/src/assets/krouter-logo.svg",
+    "src/renderer/src/assets/krouter-mark.svg",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "format": "prettier --write .",
     "lint": "eslint --cache .",
@@ -23,11 +49,13 @@
     "dev:api": "tsc -w -p tsconfig.server.json",
     "build:web": "vite build --config vite.web.config.ts",
     "build:api": "tsc -p tsconfig.server.json",
-    "build:fullstack": "npm run typecheck:web && npm run typecheck:server && npm run build:web && npm run build:api",
+    "clean:fullstack": "node -e \"const fs=require('fs'); for (const p of ['dist-web','out-server']) fs.rmSync(p,{recursive:true,force:true})\"",
+    "build:fullstack": "npm run clean:fullstack && npm run typecheck:web && npm run typecheck:server && npm run build:web && npm run build:api",
     "start:api": "node out-server/server/index.js --api-only",
     "start:backend": "node out-server/server/index.js --api-only",
+    "start:fullstack": "node out-server/server/index.js",
     "cli": "node scripts/krouter-cli.cjs",
-    "postinstall": "electron-builder install-app-deps",
+    "prepack": "npm run build:fullstack",
     "build:unpack": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
     "build:mac": "electron-vite build && electron-builder --mac",
