@@ -1,22 +1,28 @@
 import { useEffect, useState } from 'react'
 import {
   AlertCircle,
+  ArrowRight,
+  Bot,
   CheckCircle,
   Code,
   Download,
   ExternalLink,
   Github,
-  Info,
   KeyRound,
+  MonitorUp,
   Network,
   RefreshCw,
   Route,
+  ServerCog,
   Shield,
+  Sparkles,
+  TerminalSquare,
   Zap,
   type LucideIcon
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle, Button } from '../ui'
 import krouterLogo from '@/assets/krouter-logo.svg'
+import krouterMark from '@/assets/krouter-mark.svg'
 import { APP_GITHUB_URL, APP_NAME, APP_OWNER, APP_TAGLINE, APP_TAGLINE_VI } from '@/brand'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
@@ -41,6 +47,12 @@ interface FeatureItem {
   icon: LucideIcon
   title: string
   body: string
+}
+
+interface FlowItem {
+  icon: LucideIcon
+  label: string
+  detail: string
 }
 
 export function AboutPage() {
@@ -86,76 +98,136 @@ export function AboutPage() {
   const features: FeatureItem[] = [
     {
       icon: Route,
-      title: isEn ? 'Account Router' : 'Xoay tua tài khoản',
+      title: isEn ? 'Account router' : 'Router tai khoan',
       body: isEn
-        ? 'Routes requests across the available Kiro accounts by model and account health.'
-        : 'Phân phối request theo model, trạng thái tài khoản và quota khả dụng.'
+        ? 'Rotates requests across healthy Kiro accounts by model, quota, and runtime state.'
+        : 'Xoay request qua cac tai khoan Kiro con khoe theo model, quota va trang thai runtime.'
     },
     {
       icon: KeyRound,
-      title: isEn ? 'Client Keys' : 'Key cho client',
+      title: isEn ? 'Client API keys' : 'Key cho client',
       body: isEn
-        ? 'Creates compatible API keys for OpenClaw and OpenAI-style clients.'
-        : 'Tạo key tương thích cho OpenClaw và các client dùng chuẩn OpenAI.'
+        ? 'Creates OpenAI-compatible keys for OpenClaw, Aira, Codex, and other dev tools.'
+        : 'Tao key tuong thich OpenAI cho OpenClaw, Aira, Codex va cac cong cu dev.'
+    },
+    {
+      icon: ServerCog,
+      title: isEn ? 'Backend runtime' : 'Backend runtime',
+      body: isEn
+        ? 'Keeps the proxy service alive from the backend/CLI instead of relying on a browser tab.'
+        : 'Giu API proxy chay bang backend/CLI thay vi phu thuoc vao tab trinh duyet.'
     },
     {
       icon: Network,
-      title: isEn ? 'Tunnel Dashboard' : 'Dashboard qua tunnel',
+      title: isEn ? 'Localhost or tunnel' : 'Localhost hoac tunnel',
       body: isEn
-        ? 'Keeps the web dashboard local-first while exposing a tunnel only when needed.'
-        : 'Ưu tiên chạy localhost, bật tunnel public khi cần truy cập từ xa.'
+        ? 'Runs local-first and exposes the dashboard publicly only when a tunnel is enabled.'
+        : 'Uu tien localhost va chi public dashboard khi bat tunnel.'
+    }
+  ]
+
+  const flows: FlowItem[] = [
+    {
+      icon: Bot,
+      label: isEn ? 'OpenClaw / Aira' : 'OpenClaw / Aira',
+      detail: isEn ? 'One client endpoint' : 'Mot endpoint client'
+    },
+    {
+      icon: Zap,
+      label: APP_NAME,
+      detail: isEn ? 'Key, model, quota router' : 'Key, model, quota router'
     },
     {
       icon: Shield,
-      title: isEn ? 'Operational Guardrails' : 'Giám sát vận hành',
-      body: isEn
-        ? 'Tracks liveness, quota, request logs, rate limits, and suspended accounts.'
-        : 'Theo dõi liveness, quota, log request, rate limit và tài khoản bị khóa.'
+      label: isEn ? 'Kiro accounts' : 'Tai khoan Kiro',
+      detail: isEn ? 'Health, quota, profile ARN' : 'Health, quota, profile ARN'
     }
   ]
 
   return (
-    <div className="flex-1 p-6 space-y-6 overflow-auto">
-      <div className="page-hero p-8">
-        <div className="relative flex flex-col gap-5 md:flex-row md:items-center md:justify-between">
-          <div className="flex items-center gap-4">
-            <img src={krouterLogo} alt={APP_NAME} className="h-20 w-auto shrink-0" />
-            <div className="min-w-0">
-              <h1 className="text-2xl font-bold text-primary">{APP_NAME}</h1>
-              <p className="text-sm text-muted-foreground">{isEn ? APP_TAGLINE : APP_TAGLINE_VI}</p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {isEn ? 'Version' : 'Phiên bản'} {version} · {APP_OWNER}
-              </p>
+    <div className="flex-1 overflow-auto p-4 space-y-4 md:p-6 md:space-y-6">
+      <div className="page-hero overflow-hidden p-5 md:p-8">
+        <div className="relative grid gap-6 lg:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)] lg:items-center">
+          <div className="min-w-0 space-y-5">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+              <img src={krouterLogo} alt={APP_NAME} className="h-16 w-auto max-w-full shrink-0 md:h-20" />
+              <div className="min-w-0">
+                <h1 className="text-2xl font-bold text-primary md:text-3xl">{APP_NAME}</h1>
+                <p className="mt-1 max-w-2xl text-sm text-muted-foreground md:text-base">
+                  {isEn ? APP_TAGLINE : APP_TAGLINE_VI}
+                </p>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  {isEn ? 'Version' : 'Phien ban'} {version} · {APP_OWNER}
+                </p>
+              </div>
+            </div>
+
+            <div className="grid gap-2 text-sm text-muted-foreground sm:grid-cols-3">
+              <div className="rounded-xl border border-primary/10 bg-white/45 p-3 dark:bg-white/5">
+                <p className="font-semibold text-foreground">{isEn ? 'Web dashboard' : 'Dashboard web'}</p>
+                <p className="mt-1 text-xs">{isEn ? 'Account control surface' : 'Noi quan ly tai khoan'}</p>
+              </div>
+              <div className="rounded-xl border border-primary/10 bg-white/45 p-3 dark:bg-white/5">
+                <p className="font-semibold text-foreground">{isEn ? 'CLI runtime' : 'CLI runtime'}</p>
+                <p className="mt-1 text-xs">{isEn ? 'Setup and tunnel control' : 'Setup va tunnel'}</p>
+              </div>
+              <div className="rounded-xl border border-primary/10 bg-white/45 p-3 dark:bg-white/5">
+                <p className="font-semibold text-foreground">OpenClaw</p>
+                <p className="mt-1 text-xs">provider: krouter</p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-2"
+                onClick={checkForUpdates}
+                disabled={isCheckingUpdate}
+              >
+                <RefreshCw className={cn('h-4 w-4', isCheckingUpdate && 'animate-spin')} />
+                {isCheckingUpdate ? (isEn ? 'Checking...' : 'Dang kiem tra...') : (isEn ? 'Check updates' : 'Kiem tra cap nhat')}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-2"
+                onClick={() => openExternal(APP_GITHUB_URL)}
+              >
+                <Github className="h-4 w-4" />
+                GitHub
+                <ExternalLink className="h-3 w-3" />
+              </Button>
             </div>
           </div>
 
-          <div className="flex flex-wrap gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-2"
-              onClick={checkForUpdates}
-              disabled={isCheckingUpdate}
-            >
-              <RefreshCw className={cn('h-4 w-4', isCheckingUpdate && 'animate-spin')} />
-              {isCheckingUpdate ? (isEn ? 'Checking...' : 'Đang kiểm tra...') : (isEn ? 'Check Updates' : 'Kiểm tra cập nhật')}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-2"
-              onClick={() => openExternal(APP_GITHUB_URL)}
-            >
-              <Github className="h-4 w-4" />
-              GitHub
-              <ExternalLink className="h-3 w-3" />
-            </Button>
+          <div className="relative min-h-[260px] rounded-2xl border border-primary/10 bg-white/55 p-5 shadow-inner dark:bg-white/5">
+            <div className="absolute right-5 top-5 rounded-full bg-primary/10 p-3">
+              <img src={krouterMark} alt={APP_NAME} className="h-12 w-12" />
+            </div>
+            <div className="flex h-full flex-col justify-end gap-4 pt-20">
+              {flows.map((flow, index) => {
+                const Icon = flow.icon
+                return (
+                  <div key={flow.label} className="flex items-center gap-3">
+                    <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-sm">
+                      <Icon className="h-5 w-5" />
+                    </div>
+                    <div className="min-w-0 flex-1 rounded-xl border border-primary/10 bg-background/70 px-3 py-2">
+                      <p className="truncate text-sm font-semibold">{flow.label}</p>
+                      <p className="truncate text-xs text-muted-foreground">{flow.detail}</p>
+                    </div>
+                    {index < flows.length - 1 && <ArrowRight className="hidden h-4 w-4 text-primary md:block" />}
+                  </div>
+                )
+              })}
+            </div>
           </div>
         </div>
       </div>
 
       {showUpdateModal && updateInfo && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/50" onClick={() => setShowUpdateModal(false)} />
           <div className="relative z-10 max-h-[80vh] w-full max-w-md overflow-y-auto rounded-xl bg-card p-6 shadow-xl">
             {updateInfo.hasUpdate ? (
@@ -165,9 +237,9 @@ export function AboutPage() {
                     <Download className="h-6 w-6 text-success" />
                   </div>
                   <div>
-                    <h3 className="text-lg font-semibold">{isEn ? 'New Version Available' : 'Có bản mới'}</h3>
+                    <h3 className="text-lg font-semibold">{isEn ? 'New version available' : 'Co ban moi'}</h3>
                     <p className="text-sm text-muted-foreground">
-                      {updateInfo.currentVersion} → {updateInfo.latestVersion}
+                      {updateInfo.currentVersion} -&gt; {updateInfo.latestVersion}
                     </p>
                   </div>
                 </div>
@@ -202,7 +274,7 @@ export function AboutPage() {
 
                 <Button className="w-full gap-2" onClick={() => openExternal(updateInfo.releaseUrl)}>
                   <ExternalLink className="h-4 w-4" />
-                  {isEn ? 'Open Release Page' : 'Mở trang phát hành'}
+                  {isEn ? 'Open release page' : 'Mo trang phat hanh'}
                 </Button>
               </div>
             ) : updateInfo.error ? (
@@ -212,12 +284,12 @@ export function AboutPage() {
                     <AlertCircle className="h-6 w-6 text-red-500" />
                   </div>
                   <div>
-                    <h3 className="text-lg font-semibold">{isEn ? 'Check Failed' : 'Kiểm tra lỗi'}</h3>
+                    <h3 className="text-lg font-semibold">{isEn ? 'Check failed' : 'Kiem tra loi'}</h3>
                     <p className="text-sm text-muted-foreground">{updateInfo.error}</p>
                   </div>
                 </div>
                 <Button variant="outline" className="w-full" onClick={checkForUpdates}>
-                  {isEn ? 'Retry' : 'Thử lại'}
+                  {isEn ? 'Retry' : 'Thu lai'}
                 </Button>
               </div>
             ) : (
@@ -227,9 +299,9 @@ export function AboutPage() {
                     <CheckCircle className="h-6 w-6 text-success" />
                   </div>
                   <div>
-                    <h3 className="text-lg font-semibold">{isEn ? 'Up to Date' : 'Đang là bản mới nhất'}</h3>
+                    <h3 className="text-lg font-semibold">{isEn ? 'Up to date' : 'Dang la ban moi nhat'}</h3>
                     <p className="text-sm text-muted-foreground">
-                      {isEn ? `Version ${updateInfo.currentVersion}` : `Phiên bản ${updateInfo.currentVersion}`}
+                      {isEn ? `Version ${updateInfo.currentVersion}` : `Phien ban ${updateInfo.currentVersion}`}
                     </p>
                   </div>
                 </div>
@@ -238,29 +310,6 @@ export function AboutPage() {
           </div>
         </div>
       )}
-
-      <Card className="hover-lift">
-        <CardHeader className="pb-2">
-          <CardTitle className="flex items-center gap-3 text-base">
-            <div className="rounded-lg bg-primary/10 p-2">
-              <Info className="h-4 w-4 text-primary" />
-            </div>
-            {isEn ? 'About Krouter' : 'Giới thiệu Krouter'}
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3 text-sm text-muted-foreground">
-          <p>
-            {isEn
-              ? 'Krouter is the web-first control surface for managing Kiro accounts and serving a compatible API proxy for developer tools.'
-              : 'Krouter là bảng điều khiển web để quản lý tài khoản Kiro và cung cấp API proxy tương thích cho công cụ developer.'}
-          </p>
-          <p>
-            {isEn
-              ? 'The dashboard handles account state, quota checks, client key setup, tunnel links, and operational logs while the backend keeps the proxy runtime local and service-based.'
-              : 'Dashboard xử lý trạng thái tài khoản, kiểm tra quota, cấu hình key client, tunnel và log vận hành; backend giữ proxy chạy ở tầng service/CLI.'}
-          </p>
-        </CardContent>
-      </Card>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
         {features.map((feature) => {
@@ -272,9 +321,9 @@ export function AboutPage() {
                   <div className="rounded-lg bg-primary/10 p-2">
                     <Icon className="h-5 w-5 text-primary" />
                   </div>
-                  <div>
+                  <div className="min-w-0">
                     <p className="text-sm font-semibold">{feature.title}</p>
-                    <p className="mt-1 text-xs text-muted-foreground">{feature.body}</p>
+                    <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{feature.body}</p>
                   </div>
                 </div>
               </CardContent>
@@ -283,22 +332,75 @@ export function AboutPage() {
         })}
       </div>
 
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[1.05fr_0.95fr]">
+        <Card className="hover-lift">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-3 text-base">
+              <div className="rounded-lg bg-primary/10 p-2">
+                <Sparkles className="h-4 w-4 text-primary" />
+              </div>
+              {isEn ? 'What Krouter is for' : 'Krouter dung de lam gi'}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm leading-relaxed text-muted-foreground">
+            <p>
+              {isEn
+                ? 'Krouter is the control plane for a Kiro-based AI coding setup: it keeps account state visible, exposes one compatible API endpoint, and routes each request to a usable account.'
+                : 'Krouter la control plane cho workflow AI coding dung Kiro: hien thi trang thai tai khoan, mo mot API endpoint tuong thich va dieu huong moi request den tai khoan dang dung duoc.'}
+            </p>
+            <p>
+              {isEn
+                ? 'The web dashboard handles operations. The backend service and CLI keep proxy, tunnel, API keys, and client imports running outside the browser.'
+                : 'Dashboard web xu ly thao tac quan ly. Backend service va CLI giu API proxy, tunnel, API key va import client chay doc lap voi trinh duyet.'}
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card className="hover-lift">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-3 text-base">
+              <div className="rounded-lg bg-primary/10 p-2">
+                <TerminalSquare className="h-4 w-4 text-primary" />
+              </div>
+              {isEn ? 'Runtime commands' : 'Lenh runtime'}
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid gap-2 text-xs">
+              {['krouter setup', 'krouter status', 'krouter tunnel start', 'krouter openclaw import'].map((command) => (
+                <div key={command} className="flex items-center gap-2 rounded-lg bg-muted/40 px-3 py-2 font-mono">
+                  <Code className="h-3.5 w-3.5 text-primary" />
+                  <span>{command}</span>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
       <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="flex items-center gap-3 text-base">
             <div className="rounded-lg bg-primary/10 p-2">
-              <Code className="h-4 w-4 text-primary" />
+              <MonitorUp className="h-4 w-4 text-primary" />
             </div>
-            {isEn ? 'Stack' : 'Công nghệ'}
+            {isEn ? 'Client integration' : 'Ket noi client'}
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="flex flex-wrap gap-2">
-            {['React', 'TypeScript', 'Vite', 'Node.js', 'Kiro API Proxy', 'OpenClaw'].map((tech) => (
-              <span key={tech} className="rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground">
-                {tech}
-              </span>
-            ))}
+          <div className="grid gap-3 text-sm md:grid-cols-3">
+            <div className="rounded-xl bg-muted/30 p-3">
+              <p className="font-semibold">Endpoint</p>
+              <p className="mt-1 break-all font-mono text-xs text-muted-foreground">http://localhost:5580/v1</p>
+            </div>
+            <div className="rounded-xl bg-muted/30 p-3">
+              <p className="font-semibold">API key</p>
+              <p className="mt-1 font-mono text-xs text-muted-foreground">sk-...</p>
+            </div>
+            <div className="rounded-xl bg-muted/30 p-3">
+              <p className="font-semibold">OpenClaw</p>
+              <p className="mt-1 font-mono text-xs text-muted-foreground">provider: krouter</p>
+            </div>
           </div>
         </CardContent>
       </Card>
@@ -307,16 +409,16 @@ export function AboutPage() {
         <CardHeader className="pb-2">
           <CardTitle className="flex items-center gap-3 text-base">
             <div className="rounded-lg bg-primary/10 p-2">
-              <Zap className="h-4 w-4 text-primary" />
+              <Github className="h-4 w-4 text-primary" />
             </div>
-            {isEn ? 'Maintainer' : 'Người duy trì'}
+            {isEn ? 'Project' : 'Du an'}
           </CardTitle>
         </CardHeader>
         <CardContent>
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
+            <div className="min-w-0">
               <p className="font-medium">{APP_OWNER}</p>
-              <p className="text-sm text-muted-foreground">{APP_GITHUB_URL}</p>
+              <p className="break-all text-sm text-muted-foreground">{APP_GITHUB_URL}</p>
             </div>
             <Button variant="outline" size="sm" className="gap-2" onClick={() => openExternal(APP_GITHUB_URL)}>
               <Github className="h-4 w-4" />
