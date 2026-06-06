@@ -366,13 +366,13 @@ export class ProxyServer {
       tokenRefreshBeforeExpiry: 300, // 5分钟提前刷新
       autoStart: false, // 是否自动启动
       clientDrivenToolExecution: true,
-      accountSelectionStrategy: 'round-robin',
+      accountSelectionStrategy: 'smart',
       sessionAffinityEnabled: false,
       ...config
     }
     this.normalizeAccountBalancingConfig()
     this.accountPool = new AccountPool()
-    this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
+    this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'smart')
     this.stats = {
       totalRequests: 0,
       successRequests: 0,
@@ -667,11 +667,11 @@ export class ProxyServer {
     this.config = { ...this.config, ...config }
     this.normalizeAccountBalancingConfig()
     // 同步账号选择策略到 accountPool
-    this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
+    this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'smart')
   }
 
   private normalizeAccountBalancingConfig(): void {
-    const strategy = this.config.accountSelectionStrategy || 'round-robin'
+    const strategy = this.config.accountSelectionStrategy || 'smart'
     this.config.accountSelectionStrategy = strategy
 
     if (this.config.enableMultiAccount && strategy !== 'sticky') {
@@ -682,7 +682,7 @@ export class ProxyServer {
   private isSessionAffinityActive(): boolean {
     return Boolean(
       this.config.sessionAffinityEnabled &&
-      (this.config.accountSelectionStrategy || 'round-robin') === 'sticky'
+      (this.config.accountSelectionStrategy || 'smart') === 'sticky'
     )
   }
 

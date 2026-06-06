@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="620" viewBox="0 0 1120 620" role="img" aria-label="API key and client setup">
+  <rect width="1120" height="620" rx="28" fill="#f8fafc"/>
+  <text x="56" y="72" fill="#0f172a" font-family="Inter,Segoe UI,Arial" font-size="34" font-weight="800">Create Key And Connect Clients</text>
+  <text x="56" y="106" fill="#64748b" font-family="Inter,Segoe UI,Arial" font-size="17">Use one Krouter key for OpenClaw and OpenAI-compatible tools.</text>
+  <g font-family="Inter,Segoe UI,Arial">
+    <rect x="64" y="164" width="300" height="340" rx="22" fill="#ffffff" stroke="#cbd5e1"/>
+    <circle cx="108" cy="218" r="22" fill="#dbeafe"/>
+    <text x="96" y="226" fill="#2563eb" font-size="24" font-weight="800">1</text>
+    <text x="140" y="222" fill="#0f172a" font-size="21" font-weight="800">Create key</text>
+    <rect x="96" y="270" width="236" height="44" rx="12" fill="#0f172a"/>
+    <text x="116" y="298" fill="#dbeafe" font-size="15">sk-krouter-********</text>
+    <text x="96" y="356" fill="#475569" font-size="15">Dashboard -> API Proxy</text>
+    <text x="96" y="384" fill="#475569" font-size="15">Configure Clients</text>
+    <text x="96" y="412" fill="#475569" font-size="15">Create API Key</text>
+  </g>
+  <g font-family="Inter,Segoe UI,Arial">
+    <rect x="410" y="164" width="300" height="340" rx="22" fill="#ffffff" stroke="#cbd5e1"/>
+    <circle cx="454" cy="218" r="22" fill="#dcfce7"/>
+    <text x="442" y="226" fill="#16a34a" font-size="24" font-weight="800">2</text>
+    <text x="486" y="222" fill="#0f172a" font-size="21" font-weight="800">Set base URL</text>
+    <rect x="442" y="270" width="236" height="44" rx="12" fill="#ecfeff" stroke="#99f6e4"/>
+    <text x="462" y="298" fill="#0f766e" font-size="15">http://127.0.0.1:5580/v1</text>
+    <text x="442" y="356" fill="#475569" font-size="15">Provider: OpenAI compatible</text>
+    <text x="442" y="384" fill="#475569" font-size="15">Model: claude-sonnet-4.5</text>
+    <text x="442" y="412" fill="#475569" font-size="15">Header: Authorization Bearer</text>
+  </g>
+  <g font-family="Inter,Segoe UI,Arial">
+    <rect x="756" y="164" width="300" height="340" rx="22" fill="#ffffff" stroke="#cbd5e1"/>
+    <circle cx="800" cy="218" r="22" fill="#fef3c7"/>
+    <text x="788" y="226" fill="#d97706" font-size="24" font-weight="800">3</text>
+    <text x="832" y="222" fill="#0f172a" font-size="21" font-weight="800">Verify</text>
+    <rect x="788" y="270" width="224" height="44" rx="12" fill="#f0fdf4" stroke="#bbf7d0"/>
+    <text x="812" y="298" fill="#166534" font-size="15">GET /v1/models</text>
+    <text x="788" y="356" fill="#475569" font-size="15">Run /models in OpenClaw</text>
+    <text x="788" y="384" fill="#475569" font-size="15">Send a small chat test</text>
+    <text x="788" y="412" fill="#475569" font-size="15">Watch request logs</text>
+  </g>
+  <path d="M374 334 H398" stroke="#94a3b8" stroke-width="5" stroke-linecap="round"/>
+  <path d="M398 334 L388 324 M398 334 L388 344" stroke="#94a3b8" stroke-width="5" stroke-linecap="round"/>
+  <path d="M720 334 H744" stroke="#94a3b8" stroke-width="5" stroke-linecap="round"/>
+  <path d="M744 334 L734 324 M744 334 L734 344" stroke="#94a3b8" stroke-width="5" stroke-linecap="round"/>
+</svg>

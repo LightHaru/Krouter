@@ -623,7 +623,7 @@ const api = {
   // ============ Kiro API 反代服务器 ============
 
   // 启动反代服务器
-  proxyStart: (config?: { port?: number; host?: string; apiKey?: string; enabled?: boolean; autoStart?: boolean; enableMultiAccount?: boolean; accountSelectionStrategy?: 'round-robin' | 'sticky' | 'least-used'; sessionAffinityEnabled?: boolean; logRequests?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think' }): Promise<{ success: boolean; port?: number; error?: string }> => {
+  proxyStart: (config?: { port?: number; host?: string; apiKey?: string; enabled?: boolean; autoStart?: boolean; enableMultiAccount?: boolean; accountSelectionStrategy?: 'smart' | 'round-robin' | 'sticky' | 'least-used'; sessionAffinityEnabled?: boolean; logRequests?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think' }): Promise<{ success: boolean; port?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-start', config)
   },
 

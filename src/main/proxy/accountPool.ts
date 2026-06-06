@@ -59,7 +59,7 @@ const DEFAULT_CONFIG: AccountPoolConfig = {
   probabilisticRetryChance: 0.1 // 10% 概率重试
 }
 
-export type AccountSelectionStrategy = 'round-robin' | 'sticky' | 'least-used'
+export type AccountSelectionStrategy = 'smart' | 'round-robin' | 'sticky' | 'least-used'
 
 export class AccountPool {
   private accounts: Map<string, ProxyAccount> = new Map()
@@ -68,7 +68,7 @@ export class AccountPool {
   private config: AccountPoolConfig
   // 默认 round-robin: 选中账号时立即前进，避免并发请求集中到同一账号
   // sticky: 一个账号成功就粘住 (保留 prompt cache 命中)
-  private strategy: AccountSelectionStrategy = 'round-robin'
+  private strategy: AccountSelectionStrategy = 'smart'
 
   constructor(config: Partial<AccountPoolConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config }
@@ -144,6 +144,9 @@ export class AccountPool {
     }
 
     const now = Date.now()
+    if (this.strategy === 'smart') {
+      return this.getSmartBalancedAccount(accountList, now, excludeIds)
+    }
     if (this.strategy === 'least-used') {
       return this.getLeastUsedAccount(accountList, now, excludeIds)
     }
@@ -190,6 +193,9 @@ export class AccountPool {
     if (accountList.length === 0) return null
 
     const now = Date.now()
+    if (this.strategy === 'smart') {
+      return this.getSmartBalancedAccount(accountList, now, excludeSet)
+    }
     if (this.strategy === 'least-used') {
       return this.getLeastUsedAccount(accountList, now, excludeSet)
     }
@@ -355,6 +361,81 @@ export class AccountPool {
     }
 
     return best
+  }
+
+  private getSmartBalancedAccount(accountList: ProxyAccount[], now: number, excludeIds?: Set<string>): ProxyAccount | null {
+    let best: { account: ProxyAccount; score: number } | null = null
+
+    for (const account of accountList) {
+      if (excludeIds?.has(account.id)) continue
+      if (!this.isAccountAvailable(account, now)) continue
+
+      const score = this.scoreAccountForSmartBalance(account, now)
+      if (
+        !best ||
+        score > best.score ||
+        (score === best.score && (account.lastUsed || 0) < (best.account.lastUsed || 0))
+      ) {
+        best = { account, score }
+      }
+    }
+
+    if (best) {
+      this.accounts.set(best.account.id, { ...best.account, lastUsed: now })
+    }
+
+    return best?.account || null
+  }
+
+  private scoreAccountForSmartBalance(account: ProxyAccount, now: number): number {
+    const stats = this.accountStats.get(account.id)
+    let score = 1000
+
+    const quotaLimit = account.quotaLimit || 0
+    if (quotaLimit > 0) {
+      const used = Math.max(0, account.quotaUsed || 0)
+      const remainingRatio = Math.max(0, Math.min(1, (quotaLimit - used) / quotaLimit))
+      score += remainingRatio * 500
+      if (remainingRatio < 0.1) score -= 300
+      else if (remainingRatio < 0.2) score -= 150
+    } else {
+      score += 100
+    }
+
+    score -= Math.min(500, (account.errorCount || 0) * 140)
+    score -= Math.min(200, (stats?.errors || 0) * 25)
+    score -= Math.min(180, (account.requestCount || 0) * 3)
+    score -= Math.min(120, (stats?.requests || 0) * 2)
+
+    if (stats?.avgResponseTime) {
+      score -= Math.min(120, stats.avgResponseTime / 100)
+    }
+
+    const lastUsed = account.lastUsed || stats?.lastUsed || 0
+    if (lastUsed > 0) {
+      const idleMs = now - lastUsed
+      score += Math.min(120, Math.max(0, idleMs) / 1000 / 2)
+    } else {
+      score += 120
+    }
+
+    if (account.expiresAt) {
+      const minutesLeft = (account.expiresAt - now) / 60000
+      if (minutesLeft < 5) score -= 250
+      else if (minutesLeft < 15) score -= 80
+    }
+
+    // Tiny deterministic jitter prevents permanent ties without defeating balance.
+    score += this.stableAccountJitter(account.id)
+    return score
+  }
+
+  private stableAccountJitter(accountId: string): number {
+    let hash = 0
+    for (let i = 0; i < accountId.length; i++) {
+      hash = ((hash << 5) - hash + accountId.charCodeAt(i)) | 0
+    }
+    return Math.abs(hash % 17) / 10
   }
 
   // 记录请求成功（重置断路器 + 粘滞到当前账号）

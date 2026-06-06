@@ -513,7 +513,7 @@ export interface ProxyConfig {
   // 多账号选择策略 (仅 enableMultiAccount=true 时生效)
   // - round-robin: 每次请求成功后切到下一个账号 (默认, 负载均衡)
   // - sticky: 一个账号成功就粘住, 直到失败才切换 (保留 prompt cache, 牺牲均衡)
-  accountSelectionStrategy?: 'round-robin' | 'sticky' | 'least-used'
+  accountSelectionStrategy?: 'smart' | 'round-robin' | 'sticky' | 'least-used'
   // 多账号轮询范围 (仅 enableMultiAccount=true 时生效)
   // - 'all': 使用所有 active 账号（默认）
   // - 'groups': 仅使用 multiAccountGroupIds 选中分组的账号；可包含特殊值 '__ungrouped__' 表示未分组账号

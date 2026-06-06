@@ -8,7 +8,7 @@ interface ProxyConfigSecurity {
   apiKey?: string
   apiKeys?: Array<{ key: string; enabled: boolean }>
   enableMultiAccount?: boolean
-  accountSelectionStrategy?: 'round-robin' | 'sticky' | 'least-used'
+  accountSelectionStrategy?: 'smart' | 'round-robin' | 'sticky' | 'least-used'
   maxRequestBodyBytes?: number
   allowedIPs?: string[]
   deniedIPs?: string[]
@@ -60,7 +60,7 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
   const [regenerating, setRegenerating] = useState(false)
   const isRoundRobinBalancing = Boolean(
     config.enableMultiAccount &&
-    (config.accountSelectionStrategy || 'round-robin') !== 'sticky'
+    (config.accountSelectionStrategy || 'smart') !== 'sticky'
   )
   // 输入框本地状态（确保编辑时不被 config 同步打断）
   const [allowedIPsText, setAllowedIPsText] = useState((config.allowedIPs || []).join('\n'))

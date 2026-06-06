@@ -50,14 +50,14 @@ function defaultProxyConfig(saved?: Partial<ProxyConfig>): ProxyConfig {
     retryDelayMs: 1000,
     tokenRefreshBeforeExpiry: 300,
     clientDrivenToolExecution: true,
-    accountSelectionStrategy: 'round-robin',
+    accountSelectionStrategy: 'smart',
     sessionAffinityEnabled: false,
     ...saved
   })
 }
 
 function normalizeProxyConfig(config: ProxyConfig): ProxyConfig {
-  const strategy = config.accountSelectionStrategy || 'round-robin'
+  const strategy = config.accountSelectionStrategy || 'smart'
   const normalized: ProxyConfig = {
     ...config,
     accountSelectionStrategy: strategy

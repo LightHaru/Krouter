@@ -2,6 +2,19 @@
 
 All notable Krouter changes are tracked here.
 
+## 1.8.2 - 2026-06-06
+
+### Added
+
+- Added the `Smart` API proxy account rotation strategy. It scores accounts by quota headroom, recent errors, request count, latency, idle time, and token freshness before selecting an account.
+- Added a complete API Proxy setup guide in Vietnamese and English.
+- Added API Proxy guide images for the request flow, dashboard settings, and client API key setup.
+
+### Changed
+
+- New proxy defaults now prefer `Smart` multi-account rotation instead of plain round-robin.
+- Included `docs/` in the npm package so installed users can read the API Proxy guide.
+
 ## 1.8.1 - 2026-06-06
 
 ### Fixed
