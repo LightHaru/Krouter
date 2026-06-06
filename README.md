@@ -7,12 +7,12 @@
 
   **Run the dashboard on localhost, publish it through a tunnel when needed, and let the backend/CLI keep the proxy service alive.**
 
-  [![Version](https://img.shields.io/badge/version-1.8.0-blue)](./package.json)
+  [![Version](https://img.shields.io/badge/version-1.8.1-blue)](./package.json)
   [![License](https://img.shields.io/badge/license-AGPL--3.0-green)](./LICENSE)
   [![OpenClaw](https://img.shields.io/badge/OpenClaw-provider%3A%20krouter-purple)](#openclaw-and-client-tools)
   [![Runtime](https://img.shields.io/badge/runtime-web%20%2B%20CLI-black)](#quick-start)
 
-  [Quick Start](#quick-start) - [How It Works](#how-it-works) - [Features](#key-features) - [OpenClaw](#openclaw-and-client-tools) - [Deploy](#server-deployment)
+  [Quick Start](#quick-start) - [How It Works](#how-it-works) - [Features](#key-features) - [OpenClaw](#openclaw-and-client-tools) - [Deploy](#server-deployment) - [Changelog](./CHANGELOG.md)
 </div>
 
 ---

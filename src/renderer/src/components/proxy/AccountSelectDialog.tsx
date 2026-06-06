@@ -48,7 +48,7 @@ export function AccountSelectDialog({
     if (usage.limit > 0) {
       return Math.min(100, (usage.current / usage.limit) * 100)
     }
-    return usage.percentUsed || 0
+    return Math.min(100, Math.max(0, (usage.percentUsed || 0) * 100))
   }
 
   const getUsageText = (acc: Account): string => {

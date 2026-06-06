@@ -1,6 +1,6 @@
 {
   "name": "@lightharu/krouter",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "Krouter - Web dashboard and CLI router for Kiro accounts, quota balancing, and API proxy",
   "main": "./out-server/server/index.js",
   "bin": {
@@ -32,6 +32,7 @@
     "resources/tls-client-xgo-1.14.0-windows-amd64.dll",
     "src/renderer/src/assets/krouter-logo.svg",
     "src/renderer/src/assets/krouter-mark.svg",
+    "CHANGELOG.md",
     "README.md",
     "LICENSE"
   ],

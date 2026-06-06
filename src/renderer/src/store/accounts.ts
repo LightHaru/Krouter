@@ -237,6 +237,29 @@ function isBannedAccountError(error?: string): boolean {
 }
 
 // 自动换号定时器
+function normalizeUsagePercent(usage: { current?: number; limit?: number; percentUsed?: number }): number {
+  const current = Number(usage.current)
+  const limit = Number(usage.limit)
+  if (Number.isFinite(current) && Number.isFinite(limit) && limit > 0) {
+    return current / limit
+  }
+  const persisted = Number(usage.percentUsed)
+  if (!Number.isFinite(persisted)) return 0
+  return persisted > 1 && persisted <= 100 ? persisted / 100 : persisted
+}
+
+function normalizeAccountUsage(account: Account): Account {
+  const percentUsed = normalizeUsagePercent(account.usage)
+  if (account.usage.percentUsed === percentUsed) return account
+  return {
+    ...account,
+    usage: {
+      ...account.usage,
+      percentUsed
+    }
+  }
+}
+
 let autoSwitchTimer: ReturnType<typeof setInterval> | null = null
 
 // 定时自动保存定时器（防止数据丢失）
@@ -608,7 +631,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     // 如果没有提供 machineId，自动生成一个随机的 64 位十六进制设备 ID
     const machineId = accountData.machineId || generateRandomMachineId()
 
-    const account: Account = {
+    const account: Account = normalizeAccountUsage({
       ...accountData,
       id,
       machineId,
@@ -616,7 +639,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       lastUsedAt: now,
       isActive: false,
       tags: accountData.tags || []
-    }
+    } as Account)
 
     set((state) => {
       const accounts = new Map(state.accounts)
@@ -633,7 +656,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const accounts = new Map(state.accounts)
       const account = accounts.get(id)
       if (account) {
-        accounts.set(id, { ...account, ...updates })
+        accounts.set(id, normalizeAccountUsage({ ...account, ...updates }))
       }
       return { accounts }
     })
@@ -1678,11 +1701,16 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         // 为没有 machineId 的现有账户生成一个
         let needsSave = false
         for (const [id, account] of accounts) {
-          if (!account.machineId) {
-            account.machineId = generateRandomMachineId()
-            accounts.set(id, account)
+          let nextAccount = normalizeAccountUsage(account)
+          if (!nextAccount.machineId) {
+            const generatedMachineId = generateRandomMachineId()
+            nextAccount = { ...nextAccount, machineId: generatedMachineId }
             needsSave = true
-            console.log(`[Store] Generated machineId for account ${account.email}: ${account.machineId.substring(0, 16)}...`)
+            console.log(`[Store] Generated machineId for account ${nextAccount.email}: ${generatedMachineId.substring(0, 16)}...`)
+          }
+          if (nextAccount !== account) {
+            accounts.set(id, nextAccount)
+            needsSave = true
           }
         }
 

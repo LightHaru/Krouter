@@ -464,6 +464,19 @@ function accountNeedsBackendRefresh(account: StoredAccount, now: number): boolea
   return !credentials.accessToken || !expiresAt || expiresAt - now <= TOKEN_REFRESH_BEFORE_EXPIRY_MS
 }
 
+function normalizeStoredUsagePercent(usage: Record<string, unknown>): Record<string, unknown> {
+  const current = Number(usage.current)
+  const limit = Number(usage.limit)
+  if (Number.isFinite(current) && Number.isFinite(limit) && limit > 0) {
+    return { ...usage, percentUsed: current / limit }
+  }
+  const persisted = Number(usage.percentUsed)
+  if (Number.isFinite(persisted) && persisted > 1 && persisted <= 100) {
+    return { ...usage, percentUsed: persisted / 100 }
+  }
+  return usage
+}
+
 function getStoredAccounts(accountData: StoredAccountData): Record<string, StoredAccount> {
   return isPlainRecord(accountData.accounts) ? accountData.accounts as Record<string, StoredAccount> : {}
 }
@@ -490,7 +503,7 @@ function applyRefreshDataToStoredAccount(
   let usage = account.usage
   if (isPlainRecord(data?.usage)) {
     const currentUsage = isPlainRecord(account.usage) ? account.usage : {}
-    usage = { ...currentUsage, ...data.usage, lastUpdated: now }
+    usage = normalizeStoredUsagePercent({ ...currentUsage, ...data.usage, lastUpdated: now })
   }
 
   let subscription = account.subscription

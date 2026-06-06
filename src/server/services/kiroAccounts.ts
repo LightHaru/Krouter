@@ -561,7 +561,7 @@ export async function checkAccountStatus(account: AccountLike): Promise<unknown>
       profileArn: resolvedProfileArn,
       usage: {
         ...(normalized.usage as Record<string, unknown>),
-        percentUsed: normalized.usage.limit ? ((normalized.usage.current as number) / (normalized.usage.limit as number)) * 100 : 0,
+        percentUsed: normalized.usage.limit ? (normalized.usage.current as number) / (normalized.usage.limit as number) : 0,
         lastUpdated: Date.now()
       },
       newCredentials: refreshResult?.data ? {
