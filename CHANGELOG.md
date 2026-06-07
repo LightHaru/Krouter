@@ -2,6 +2,18 @@
 
 All notable Krouter changes are tracked here.
 
+## 1.8.6 - 2026-06-07
+
+### Added
+
+- Added `krouter update` and `krouter update check` so the terminal CLI can update the global npm package without requiring dashboard login.
+- Added a local-only CLI authorization token generated in `~/.krouter/.env`, allowing SSH/admin terminal commands to call the backend without the dashboard password.
+
+### Changed
+
+- `krouter` now opens the dashboard/menu without requiring `KROUTER_ADMIN_PASSWORD`; the dashboard password remains only for browser login.
+- The CLI restarts a local backend when it detects the running backend version is older than the installed package version.
+
 ## 1.8.5 - 2026-06-07
 
 ### Added

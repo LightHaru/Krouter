@@ -203,6 +203,27 @@ function getUser(request: IncomingMessage): UserRecord | undefined {
   return store.findUserBySession(cookies[SESSION_COOKIE_NAME] || cookies[LEGACY_SESSION_COOKIE_NAME])
 }
 
+function isLoopbackRequest(request: IncomingMessage): boolean {
+  const address = request.socket.remoteAddress || ''
+  return address === '127.0.0.1' ||
+    address === '::1' ||
+    address === '::ffff:127.0.0.1' ||
+    address === 'localhost'
+}
+
+function getCliUser(request: IncomingMessage): UserRecord | undefined {
+  if (!isLoopbackRequest(request)) return undefined
+  const expected = String(process.env.KROUTER_CLI_TOKEN || process.env.KAM_CLI_TOKEN || '').trim()
+  if (!expected) return undefined
+  const provided = String(request.headers['x-krouter-cli-token'] || request.headers['x-kam-cli-token'] || '').trim()
+  if (provided !== expected) return undefined
+  return store.getUsers().find(item => item.role === 'admin') || store.getUsers()[0]
+}
+
+function getApiUser(request: IncomingMessage): UserRecord | undefined {
+  return getUser(request) || getCliUser(request)
+}
+
 function publicUser(user: UserRecord): { id: string; email: string; name?: string; role: 'admin' | 'user' } {
   return { id: user.id, email: user.email, name: user.name, role: user.role }
 }
@@ -1580,7 +1601,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   }
 
   if (url.pathname === '/api/events') {
-    const user = getUser(request)
+    const user = getApiUser(request)
     if (!user) {
       sendJson(response, 401, { error: 'Unauthorized' })
       return
@@ -1597,7 +1618,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   }
 
   if (url.pathname === '/api/ipc' && request.method === 'POST') {
-    const user = getUser(request)
+    const user = getApiUser(request)
     if (!user) {
       sendJson(response, 401, { error: 'Unauthorized' })
       return
