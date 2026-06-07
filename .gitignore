@@ -13,3 +13,4 @@ out-server
 .deploy-*
 krouter-*.png
 test-openclaw-import.cjs
+docs/codex-thread-summary.md

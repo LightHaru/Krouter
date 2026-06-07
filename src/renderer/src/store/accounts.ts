@@ -11,6 +11,7 @@ import type {
   AccountExportData,
   AccountImportItem,
   BatchOperationResult,
+  AccountUsage,
   AccountSubscription,
   SubscriptionType,
   IdpType
@@ -52,6 +53,20 @@ let saveInFlight: Promise<void> | null = null
 let savePendingResolvers: Array<() => void> = []
 /** Web multi-session tombstones: prevent stale tabs from restoring explicitly deleted accounts. */
 const deletedAccountIds = new Set<string>()
+
+type ProxyAccountUpdate = {
+  id: string
+  accessToken?: string
+  refreshToken?: string
+  expiresAt?: number
+  profileArn?: string
+  quotaUsed?: number
+  quotaUsedDelta?: number
+  quotaLimit?: number
+  quotaResetAt?: number
+  requestCount?: number
+  lastUsed?: number
+}
 
 // ============ getFilteredAccounts / getStats 引用缓存 ============
 // 大账号量场景下这两个 selector 每次 re-render 都跑 O(n) 计算（filter + sort）
@@ -257,6 +272,28 @@ function normalizeAccountUsage(account: Account): Account {
       ...account.usage,
       percentUsed
     }
+  }
+}
+
+function usageResetAdvanced(currentUsage: AccountUsage, incomingUsage: Partial<AccountUsage>): boolean {
+  const currentReset = currentUsage.nextResetDate ? Date.parse(currentUsage.nextResetDate) : NaN
+  const incomingReset = incomingUsage.nextResetDate ? Date.parse(incomingUsage.nextResetDate) : NaN
+  return Number.isFinite(currentReset) && Number.isFinite(incomingReset) && incomingReset > currentReset
+}
+
+function mergeUsageSnapshot(currentUsage: AccountUsage, incomingUsage: Partial<AccountUsage>, now: number): AccountUsage {
+  const incomingCurrent = incomingUsage.current ?? currentUsage.current
+  const limit = incomingUsage.limit ?? currentUsage.limit
+  const current = incomingCurrent < currentUsage.current && !usageResetAdvanced(currentUsage, incomingUsage)
+    ? currentUsage.current
+    : incomingCurrent
+  return {
+    ...currentUsage,
+    ...incomingUsage,
+    current,
+    limit,
+    percentUsed: limit > 0 ? current / limit : 0,
+    lastUpdated: incomingUsage.lastUpdated ?? now
   }
 }
 
@@ -481,6 +518,7 @@ interface AccountsActions {
   handleBackgroundCheckResult: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void
   /** 批量处理后台刷新结果：一次 set 应用 N 条结果，消除 N 次 Map 全量复制 */
   applyBackgroundRefreshResults: (items: Array<{ id: string; success: boolean; data?: unknown; error?: string }>) => void
+  applyProxyAccountUpdate: (account: ProxyAccountUpdate) => void
   /** 批量处理后台检查结果：一次 set 应用 N 条结果 */
   applyBackgroundCheckResults: (items: Array<{ id: string; success: boolean; data?: unknown; error?: string }>) => void
 
@@ -658,6 +696,57 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       if (account) {
         accounts.set(id, normalizeAccountUsage({ ...account, ...updates }))
       }
+      return { accounts }
+    })
+    get().saveToStorage()
+  },
+
+  applyProxyAccountUpdate: (proxyAccount) => {
+    if (!proxyAccount.id) return
+    set((state) => {
+      const account = state.accounts.get(proxyAccount.id)
+      if (!account) return {}
+
+      const accounts = new Map(state.accounts)
+      const now = Date.now()
+      const incomingCurrent = typeof proxyAccount.quotaUsed === 'number'
+        ? proxyAccount.quotaUsed
+        : account.usage.current
+      const limit = typeof proxyAccount.quotaLimit === 'number'
+        ? proxyAccount.quotaLimit
+        : account.usage.limit
+      const nextResetDate = typeof proxyAccount.quotaResetAt === 'number'
+        ? new Date(proxyAccount.quotaResetAt).toISOString().slice(0, 10)
+        : account.usage.nextResetDate
+      const delta = typeof proxyAccount.quotaUsedDelta === 'number' && proxyAccount.quotaUsedDelta > 0
+        ? proxyAccount.quotaUsedDelta
+        : 0
+      const current = delta > 0 && account.usage.current > incomingCurrent
+        ? account.usage.current + delta
+        : Math.max(account.usage.current, incomingCurrent)
+
+      accounts.set(proxyAccount.id, normalizeAccountUsage({
+        ...account,
+        profileArn: proxyAccount.profileArn || account.profileArn,
+        credentials: {
+          ...account.credentials,
+          accessToken: proxyAccount.accessToken || account.credentials.accessToken,
+          refreshToken: proxyAccount.refreshToken || account.credentials.refreshToken,
+          expiresAt: proxyAccount.expiresAt || account.credentials.expiresAt
+        },
+        usage: {
+          ...account.usage,
+          current,
+          limit,
+          percentUsed: limit > 0 ? current / limit : 0,
+          lastUpdated: now,
+          nextResetDate
+        },
+        lastUsedAt: proxyAccount.lastUsed || now,
+        status: 'active',
+        lastError: undefined
+      }))
+
       return { accounts }
     })
     get().saveToStorage()
@@ -1489,11 +1578,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
             // 合并 usage 数据，确保包含所有必要字段
             const apiUsage = result.data!.usage
-            const mergedUsage = apiUsage ? {
-              current: apiUsage.current ?? acc.usage.current,
-              limit: apiUsage.limit ?? acc.usage.limit,
-              percentUsed: apiUsage.limit > 0 ? apiUsage.current / apiUsage.limit : 0,
-              lastUpdated: apiUsage.lastUpdated ?? Date.now(),
+            const mergedUsage = apiUsage ? mergeUsageSnapshot(acc.usage, {
+              current: apiUsage.current,
+              limit: apiUsage.limit,
+              lastUpdated: apiUsage.lastUpdated,
               baseLimit: apiUsage.baseLimit,
               baseCurrent: apiUsage.baseCurrent,
               freeTrialLimit: apiUsage.freeTrialLimit,
@@ -1502,7 +1590,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               bonuses: apiUsage.bonuses,
               nextResetDate: apiUsage.nextResetDate,
               resourceDetail: apiUsage.resourceDetail
-            } : acc.usage
+            }, Date.now()) : acc.usage
 
             // 合并订阅信息
             const apiSub = result.data!.subscription
@@ -2533,13 +2621,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           expiresAt: refreshData?.expiresIn ? now + refreshData.expiresIn * 1000 : account.credentials.expiresAt
         },
         usage: refreshData?.usage ? (() => {
-          const newCurrent = refreshData.usage.current ?? account.usage.current
-          const newLimit = refreshData.usage.limit ?? account.usage.limit
-          return {
-            ...account.usage,
-            current: newCurrent,
-            limit: newLimit,
-            percentUsed: newLimit > 0 ? newCurrent / newLimit : 0,
+          return mergeUsageSnapshot(account.usage, {
+            current: refreshData.usage.current,
+            limit: refreshData.usage.limit,
             baseCurrent: refreshData.usage.baseCurrent ?? account.usage.baseCurrent,
             baseLimit: refreshData.usage.baseLimit ?? account.usage.baseLimit,
             freeTrialCurrent: refreshData.usage.freeTrialCurrent ?? account.usage.freeTrialCurrent,
@@ -2549,7 +2633,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             nextResetDate: refreshData.usage.nextResetDate ?? account.usage.nextResetDate,
             resourceDetail: refreshData.usage.resourceDetail ?? account.usage.resourceDetail,
             lastUpdated: now
-          }
+          }, now)
         })() : account.usage,
         subscription: refreshData?.subscription ? {
           ...account.subscription,
@@ -2642,13 +2726,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       accounts.set(id, {
         ...account,
         usage: checkData?.usage ? (() => {
-          const newCurrent = checkData.usage.current ?? account.usage.current
-          const newLimit = checkData.usage.limit ?? account.usage.limit
-          return {
-            ...account.usage,
-            current: newCurrent,
-            limit: newLimit,
-            percentUsed: newLimit > 0 ? newCurrent / newLimit : 0,
+          return mergeUsageSnapshot(account.usage, {
+            current: checkData.usage.current,
+            limit: checkData.usage.limit,
             baseCurrent: checkData.usage.baseCurrent ?? account.usage.baseCurrent,
             baseLimit: checkData.usage.baseLimit ?? account.usage.baseLimit,
             freeTrialCurrent: checkData.usage.freeTrialCurrent ?? account.usage.freeTrialCurrent,
@@ -2658,7 +2738,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             nextResetDate: checkData.usage.nextResetDate ?? account.usage.nextResetDate,
             resourceDetail: checkData.usage.resourceDetail ?? account.usage.resourceDetail,
             lastUpdated: now
-          }
+          }, now)
         })() : account.usage,
         subscription: checkData?.subscription ? {
           ...account.subscription,

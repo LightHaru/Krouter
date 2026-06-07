@@ -727,6 +727,8 @@ interface KiroApi {
   // 监听反代状态变化事件
   onProxyStatusChange: (callback: (status: { running: boolean; port: number }) => void) => () => void
 
+  onProxyAccountUpdate: (callback: (account: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string; quotaUsed?: number; quotaUsedDelta?: number; quotaLimit?: number; quotaResetAt?: number; requestCount?: number; lastUsed?: number }) => void) => () => void
+
   // 监听反代账号被封禁事件（TEMPORARILY_SUSPENDED / AccountSuspendedException）
   onProxyAccountSuspended: (callback: (info: { id: string; email?: string; reason: string; message: string; suspendedAt: number }) => void) => () => void
 

@@ -425,7 +425,14 @@ function initProxyServer(): ProxyServer {
           id: account.id,
           accessToken: account.accessToken,
           refreshToken: account.refreshToken,
-          expiresAt: account.expiresAt
+          expiresAt: account.expiresAt,
+          profileArn: account.profileArn,
+          quotaUsed: account.quotaUsed,
+          quotaUsedDelta: account.quotaUsedDelta,
+          quotaLimit: account.quotaLimit,
+          quotaResetAt: account.quotaResetAt,
+          requestCount: account.requestCount,
+          lastUsed: account.lastUsed
         })
       },
       // 账号被 Kiro 后端长期封禁 - 通知渲染进程标记 lastError + 持久化到 store
@@ -7172,4 +7179,3 @@ app.on('will-quit', async (event) => {
 
 // In this file you can include the rest of your app's specific main process
 // code. You can also put them in separate files and require them here.
-

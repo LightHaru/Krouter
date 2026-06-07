@@ -280,6 +280,18 @@ class BodyTooLargeError extends Error {
   }
 }
 
+export type AccountTier = 'power' | 'free' | 'unknown'
+
+export type NoAccountReason = 'model_unsupported' | 'quota_exhausted' | 'throttled'
+
+export interface NoAccountDiagnosis {
+  reason: NoAccountReason
+  message: string
+  eligibleTotal: number
+  exhausted: number
+  cooldown: number
+}
+
 export class ProxyServer {
   private server: http.Server | https.Server | null = null
   private fallbackServer: http.Server | null = null  // HTTPS 启用时同时监听 HTTP（可选）
@@ -303,6 +315,7 @@ export class ProxyServer {
   private modelPaceReadyAt: Map<string, number> = new Map()
   private readonly MODEL_CAPABILITY_CACHE_TTL = 5 * 60 * 1000
   private readonly OPUS_MODEL_PACE_MS = 10 * 1000
+  private readonly MAX_COMPATIBLE_COOLDOWN_WAIT_MS = 65 * 1000
   /** P2-17 审计日志（最近 200 条） */
   private auditLog: Array<{ ts: number; type: string; data: Record<string, unknown> }> = []
   /** Webhook 触发回调（由外部注入，避免 main → renderer 循环依赖） */
@@ -1321,6 +1334,110 @@ export class ProxyServer {
     }
   }
 
+  private accountTier(account: ProxyAccount): AccountTier {
+    const cached = this.accountModelCapabilityCache.get(account.id)
+    if (!cached || Date.now() - cached.timestamp >= this.MODEL_CAPABILITY_CACHE_TTL) return 'unknown'
+    for (const id of cached.modelIds) {
+      if (id.startsWith('claude-opus-')) return 'power'
+    }
+    return 'free'
+  }
+
+  private isPowerAccount(account: ProxyAccount): boolean {
+    return this.accountTier(account) === 'power'
+  }
+
+  private async isEligibleForModel(
+    account: ProxyAccount, modelId: string | undefined, apiKeyId?: string, signal?: AbortSignal
+  ): Promise<boolean> {
+    if (!this.isAccountAllowedForRequest(account, apiKeyId)) return false
+    if (!modelId || !this.requiresModelCapabilitySelection(modelId)) return true
+    if (!await this.accountSupportsModel(account, modelId, signal)) return false
+    // strictTierRouting: với model Opus, chỉ chấp nhận Power_Account (tier suy ra
+    // từ capability cache đã được accountSupportsModel làm ấm ở trên).
+    if (this.config.strictTierRouting && normalizeKiroModelIdForCompare(modelId).startsWith('claude-opus-')) {
+      if (!this.isPowerAccount(account)) {
+        proxyLogger.info('ProxyServer', `strictTierRouting: skip ${account.email || account.id.slice(0, 8)} (not a power account) for ${modelId}`)
+        return false
+      }
+    }
+    return true
+  }
+
+  private async buildEligibleSet(
+    modelId: string | undefined, apiKeyId?: string, signal?: AbortSignal
+  ): Promise<ProxyAccount[]> {
+    const out: ProxyAccount[] = []
+    for (const account of this.accountPool.getAllAccounts()) {
+      if (await this.isEligibleForModel(account, modelId, apiKeyId, signal)) out.push(account)
+    }
+    return out
+  }
+
+  /**
+   * 当 getAvailableAccount 对某个 Requested_Model 返回 null 时调用，
+   * 按互斥优先级判定唯一原因 (R6.4)：
+   *   1. Eligible_Account_Set 为空 -> model_unsupported (R6.1)
+   *   2. 否则所有 eligible 账号都已配额耗尽 -> quota_exhausted (R6.2)
+   *   3. 否则 (尚有配额但都在 cooldown / 不可选) -> throttled (R6.3)
+   */
+  private async classifyNoAccountReason(
+    modelId: string | undefined, apiKeyId?: string, signal?: AbortSignal
+  ): Promise<NoAccountDiagnosis> {
+    this.throwIfAborted(signal)
+    const eligible = await this.buildEligibleSet(modelId, apiKeyId, signal)
+    const eligibleTotal = eligible.length
+
+    const now = Date.now()
+    let exhausted = 0
+    let cooldown = 0
+    for (const account of eligible) {
+      const isExhausted = this.accountPool.isQuotaExhausted(account, now)
+      if (isExhausted) {
+        exhausted++
+        continue
+      }
+      if (
+        !this.accountPool.isSuspended(account) &&
+        typeof account.cooldownUntil === 'number' &&
+        account.cooldownUntil > now
+      ) {
+        cooldown++
+      }
+    }
+
+    // 1. 没有任何账号支持该 model
+    if (eligibleTotal === 0) {
+      return {
+        reason: 'model_unsupported',
+        message: `Không có tài khoản nào hỗ trợ model "${modelId ?? ''}"`,
+        eligibleTotal,
+        exhausted,
+        cooldown
+      }
+    }
+
+    // 2. 所有 eligible 账号都已配额耗尽
+    if (exhausted === eligibleTotal) {
+      return {
+        reason: 'quota_exhausted',
+        message: `Tất cả tài khoản phù hợp đã hết quota (${exhausted}/${eligibleTotal})`,
+        eligibleTotal,
+        exhausted,
+        cooldown
+      }
+    }
+
+    // 3. 仍有账号有配额，但都在 cooldown / 超过等待阈值
+    return {
+      reason: 'throttled',
+      message: 'Tất cả tài khoản phù hợp đang bị giới hạn tốc độ, vui lòng thử lại sau',
+      eligibleTotal,
+      exhausted,
+      cooldown
+    }
+  }
+
   private async getNextAccountForModel(excludeIds: Set<string> = new Set(), apiKeyId?: string, modelId?: string, signal?: AbortSignal): Promise<ProxyAccount | null> {
     if (!modelId || !this.requiresModelCapabilitySelection(modelId)) {
       return this.getNextAccountForRequest(excludeIds, apiKeyId)
@@ -1331,9 +1448,9 @@ export class ProxyServer {
     for (let attempt = 0; attempt < total; attempt++) {
       this.throwIfAborted(signal)
       const account = this.getNextAccountForRequest(tried, apiKeyId)
-      if (!account || tried.has(account.id)) return null
+      if (!account || tried.has(account.id)) break
       tried.add(account.id)
-      if (await this.accountSupportsModel(account, modelId, signal)) {
+      if (await this.isEligibleForModel(account, modelId, apiKeyId, signal)) {
         const selectedAccount = this.accountPool.getAccount(account.id) || account
         proxyLogger.info('ProxyServer', `Selected ${selectedAccount.email || selectedAccount.id.slice(0, 8)} for model ${modelId}`)
         return selectedAccount
@@ -1341,7 +1458,32 @@ export class ProxyServer {
       proxyLogger.info('ProxyServer', `Skipping ${account.email || account.id.slice(0, 8)} because model ${modelId} is not available`)
     }
 
+    const cooldownWaitMs = await this.getCompatibleModelCooldownWaitMs(excludeIds, apiKeyId, modelId, signal)
+    if (cooldownWaitMs !== null && cooldownWaitMs <= this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS) {
+      const waitMs = Math.max(250, cooldownWaitMs + 100)
+      proxyLogger.info('ProxyServer', `Waiting ${waitMs}ms for a compatible ${modelId} account to leave cooldown`)
+      await this.waitForRetry(waitMs, signal)
+      return await this.getNextAccountForModel(excludeIds, apiKeyId, modelId, signal)
+    }
+
     return null
+  }
+
+  private async getCompatibleModelCooldownWaitMs(excludeIds: Set<string>, apiKeyId: string | undefined, modelId: string, signal?: AbortSignal): Promise<number | null> {
+    const now = Date.now()
+    let best: number | null = null
+    for (const account of this.accountPool.getAllAccounts()) {
+      this.throwIfAborted(signal)
+      if (excludeIds.has(account.id)) continue
+      if (!this.isAccountAllowedForRequest(account, apiKeyId)) continue
+      if (this.accountPool.isSuspended(account) || this.accountPool.isQuotaExhausted(account, now)) continue
+      if (!account.cooldownUntil || account.cooldownUntil <= now) continue
+      if (account.isAvailable === false) continue
+      if (!await this.accountSupportsModel(account, modelId, signal)) continue
+      const waitMs = account.cooldownUntil - now
+      best = best === null ? waitMs : Math.min(best, waitMs)
+    }
+    return best
   }
 
   private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string, modelId?: string): Promise<ProxyAccount | null> {
@@ -1558,6 +1700,17 @@ export class ProxyServer {
             triedIds.add(nextAccount.id)
             continue
           }
+          if (attempt < configuredRetries) {
+            const cooledAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+            const cooldownWaitMs = cooledAccount.cooldownUntil && cooledAccount.cooldownUntil > Date.now()
+              ? cooledAccount.cooldownUntil - Date.now()
+              : retryDelay * (attempt + 1)
+            const waitMs = Math.min(this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS, Math.max(1000, cooldownWaitMs + 100))
+            proxyLogger.info('ProxyServer', `No alternate ${modelId || 'model'} account after throttle; waiting ${waitMs}ms before retrying ${cooledAccount.email || cooledAccount.id.slice(0, 8)}`)
+            await this.waitForRetry(waitMs, signal)
+            currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+            continue
+          }
           break
         }
 
@@ -1651,6 +1804,19 @@ export class ProxyServer {
       statusCode && statusCode >= 500 ? ErrorType.RECOVERABLE : classifyError(statusCode || 500, message),
       statusCode
     )
+  }
+
+  private recordAccountSuccess(account: ProxyAccount, usage: KiroUsage): ProxyAccount {
+    const updated = this.accountPool.recordSuccess(
+      account.id,
+      usage.inputTokens + usage.outputTokens,
+      usage.credits || 0
+    )
+    if (updated) {
+      this.events.onAccountUpdate?.(updated)
+      return updated
+    }
+    return account
   }
 
   private isInvalidModelForAccountError(message: string): boolean {
@@ -1748,7 +1914,20 @@ export class ProxyServer {
       if (!retryable) break
 
       const nextAccount = await this.getNextAccountForModel(triedIds, apiKeyId, modelId, signal)
-      if (!nextAccount || triedIds.has(nextAccount.id)) break
+      if (!nextAccount || triedIds.has(nextAccount.id)) {
+        if (isThrottleError(message) && attempt < configuredRetries) {
+          const cooledAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+          const cooldownWaitMs = cooledAccount.cooldownUntil && cooledAccount.cooldownUntil > Date.now()
+            ? cooledAccount.cooldownUntil - Date.now()
+            : (this.config.retryDelayMs || 1000) * (attempt + 1)
+          const waitMs = Math.min(this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS, Math.max(1000, cooldownWaitMs + 100))
+          proxyLogger.info('ProxyServer', `No alternate streaming ${modelId || 'model'} account after throttle; waiting ${waitMs}ms before retrying ${cooledAccount.email || cooledAccount.id.slice(0, 8)}`)
+          await this.waitForRetry(waitMs, signal)
+          currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+          continue
+        }
+        break
+      }
       console.log(`[ProxyServer] Streaming failover ${path}: ${currentAccount.email || currentAccount.id.slice(0, 8)} -> ${nextAccount.email || nextAccount.id.slice(0, 8)}`)
       currentAccount = nextAccount
       triedIds.add(nextAccount.id)
@@ -2330,7 +2509,7 @@ export class ProxyServer {
       'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
-      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog'
+      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'strictTierRouting'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
     ]
@@ -2560,7 +2739,7 @@ export class ProxyServer {
               this.stats.inputTokens += usage.inputTokens
               this.stats.outputTokens += usage.outputTokens
               this.stats.totalCredits += usage.credits || 0
-              this.accountPool.recordSuccess(usedAccount.id, usage.inputTokens + usage.outputTokens)
+              this.recordAccountSuccess(usedAccount, usage)
               resolve()
             },
             (_usedAccount, error) => {
@@ -2602,7 +2781,7 @@ export class ProxyServer {
         this.stats.inputTokens += result.usage.inputTokens
         this.stats.outputTokens += result.usage.outputTokens
         this.stats.totalCredits += result.usage.credits || 0
-        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        this.recordAccountSuccess(usedAccount, result.usage)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({
           candidates: [{ content: { parts: [{ text: result.content }], role: 'model' }, finishReason: 'STOP' }],
@@ -2766,13 +2945,10 @@ export class ProxyServer {
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
-      const quotaStatus = this.accountPool.getQuotaStatus()
-      const errorMsg = quotaStatus.exhausted > 0 && quotaStatus.available === 0
-        ? `All accounts quota exhausted (${quotaStatus.exhausted}/${quotaStatus.total} exhausted, ${quotaStatus.cooldown} in cooldown)`
-        : 'No available accounts'
-      this.sendError(res, 503, errorMsg)
-      this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 503, error: errorMsg })
-      this.recordRequest({ path: '/v1/chat/completions', model: request.model, success: false, error: errorMsg })
+      const diag = await this.classifyNoAccountReason(request.model, matchedApiKey?.id, signal)
+      this.sendError(res, 503, diag.message)
+      this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 503, error: diag.reason })
+      this.recordRequest({ path: '/v1/chat/completions', model: request.model, success: false, error: diag.reason })
       return
     }
 
@@ -2826,7 +3002,7 @@ export class ProxyServer {
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
         this.stats.inputTokens += result.usage.inputTokens
         this.stats.outputTokens += result.usage.outputTokens
-        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        this.recordAccountSuccess(usedAccount, result.usage)
 
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
@@ -2882,13 +3058,10 @@ export class ProxyServer {
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
-      const quotaStatus = this.accountPool.getQuotaStatus()
-      const errorMsg = quotaStatus.exhausted > 0 && quotaStatus.available === 0
-        ? `All accounts quota exhausted (${quotaStatus.exhausted}/${quotaStatus.total} exhausted, ${quotaStatus.cooldown} in cooldown)`
-        : 'No available accounts'
-      this.sendError(res, 503, errorMsg)
-      this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 503, error: errorMsg })
-      this.recordRequest({ path: '/v1/responses', model: chatRequest.model, success: false, error: 'No available accounts' })
+      const diag = await this.classifyNoAccountReason(chatRequest.model, matchedApiKey?.id, signal)
+      this.sendError(res, 503, diag.message)
+      this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 503, error: diag.reason })
+      this.recordRequest({ path: '/v1/responses', model: chatRequest.model, success: false, error: diag.reason })
       return
     }
 
@@ -2948,7 +3121,7 @@ export class ProxyServer {
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
         this.stats.inputTokens += result.usage.inputTokens
         this.stats.outputTokens += result.usage.outputTokens
-        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        this.recordAccountSuccess(usedAccount, result.usage)
         const respTime = Date.now() - startTime
         this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
         this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
@@ -2977,7 +3150,7 @@ export class ProxyServer {
       this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
       this.stats.inputTokens += result.usage.inputTokens
       this.stats.outputTokens += result.usage.outputTokens
-      this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+      this.recordAccountSuccess(usedAccount, result.usage)
 
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(response))
@@ -3083,7 +3256,7 @@ export class ProxyServer {
           this.stats.totalCredits += usage.credits || 0
           this.events.onCreditsUpdate?.(this.stats.totalCredits)
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
-          this.accountPool.recordSuccess(usedAccount.id, usage.inputTokens + usage.outputTokens)
+          this.recordAccountSuccess(usedAccount, usage)
           const oaiRespTime = Date.now() - startTime
           this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: oaiRespTime })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: usedAccount.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
@@ -3193,13 +3366,10 @@ export class ProxyServer {
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
-      const quotaStatus = this.accountPool.getQuotaStatus()
-      const errorMsg = quotaStatus.exhausted > 0 && quotaStatus.available === 0
-        ? `All accounts quota exhausted (${quotaStatus.exhausted}/${quotaStatus.total} exhausted, ${quotaStatus.cooldown} in cooldown)`
-        : 'No available accounts'
-      this.sendError(res, 503, errorMsg, 'anthropic')
-      this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 503, error: errorMsg })
-      this.recordRequest({ path: '/v1/messages', model: request.model, success: false, error: errorMsg })
+      const diag = await this.classifyNoAccountReason(request.model, matchedApiKey?.id, signal)
+      this.sendError(res, 503, diag.message, 'anthropic')
+      this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 503, error: diag.reason })
+      this.recordRequest({ path: '/v1/messages', model: request.model, success: false, error: diag.reason })
       return
     }
 
@@ -3275,7 +3445,7 @@ export class ProxyServer {
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
         this.stats.inputTokens += result.usage.inputTokens
         this.stats.outputTokens += result.usage.outputTokens
-        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        this.recordAccountSuccess(usedAccount, result.usage)
 
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
@@ -3506,7 +3676,7 @@ export class ProxyServer {
           this.stats.totalCredits += usage.credits || 0
           this.events.onCreditsUpdate?.(this.stats.totalCredits)
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
-          this.accountPool.recordSuccess(usedAccount.id, usage.inputTokens + usage.outputTokens)
+          this.recordAccountSuccess(usedAccount, usage)
           this.stats.cacheReadTokens += usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens || 0
           this.stats.cacheWriteTokens += usage.cacheWriteTokens || simulatedCacheUsage?.cacheCreationInputTokens || 0
           this.stats.reasoningTokens += usage.reasoningTokens || 0

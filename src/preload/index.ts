@@ -855,6 +855,16 @@ const api = {
     }
   },
 
+  onProxyAccountUpdate: (callback: (account: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string; quotaUsed?: number; quotaUsedDelta?: number; quotaLimit?: number; quotaResetAt?: number; requestCount?: number; lastUsed?: number }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, account: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string; quotaUsed?: number; quotaUsedDelta?: number; quotaLimit?: number; quotaResetAt?: number; requestCount?: number; lastUsed?: number }): void => {
+      callback(account)
+    }
+    ipcRenderer.on('proxy-account-update', handler)
+    return () => {
+      ipcRenderer.removeListener('proxy-account-update', handler)
+    }
+  },
+
   // 监听反代账号被封禁事件（TEMPORARILY_SUSPENDED / AccountSuspendedException）
   onProxyAccountSuspended: (callback: (info: { id: string; email?: string; reason: string; message: string; suspendedAt: number }) => void): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent, info: { id: string; email?: string; reason: string; message: string; suspendedAt: number }): void => {

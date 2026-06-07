@@ -21,6 +21,19 @@ interface AccountDataShape {
     groupId?: string
     profileArn?: string
     machineId?: string
+    usage?: {
+      current?: number
+      limit?: number
+      percentUsed?: number
+      lastUpdated?: number
+      nextResetDate?: string
+      baseCurrent?: number
+      baseLimit?: number
+      freeTrialCurrent?: number
+      freeTrialLimit?: number
+      bonuses?: Array<{ current?: number; limit?: number; description?: string; expiresAt?: string }>
+      resourceDetail?: unknown
+    }
     credentials?: {
       accessToken?: string
       refreshToken?: string
@@ -87,6 +100,37 @@ function normalizeProxyAccount(account: ProxyAccount): ProxyAccount {
 }
 
 type StoredAccount = NonNullable<AccountDataShape['accounts']>[string]
+
+function parseQuotaResetAt(value?: string): number | undefined {
+  if (!value) return undefined
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function usagePercent(current: number, limit: number): number {
+  return limit > 0 ? current / limit : 0
+}
+
+function mergeUsageCurrent(existing: StoredAccount, account: ProxyAccount, nextResetDate?: string): number {
+  const existingCurrent = typeof existing.usage?.current === 'number' ? existing.usage.current : 0
+  const incomingCurrent = typeof account.quotaUsed === 'number' ? account.quotaUsed : existingCurrent
+  const delta = typeof account.quotaUsedDelta === 'number' && account.quotaUsedDelta > 0 ? account.quotaUsedDelta : 0
+  const existingReset = existing.usage?.nextResetDate
+
+  if (existingReset && nextResetDate) {
+    const existingResetTime = Date.parse(existingReset)
+    const incomingResetTime = Date.parse(nextResetDate)
+    if (Number.isFinite(existingResetTime) && Number.isFinite(incomingResetTime)) {
+      if (incomingResetTime > existingResetTime) return incomingCurrent
+      if (existingResetTime > incomingResetTime) return existingCurrent + delta
+    }
+  }
+
+  if (delta > 0 && existingCurrent > incomingCurrent) {
+    return existingCurrent + delta
+  }
+  return Math.max(existingCurrent, incomingCurrent)
+}
 
 function resolveProxyProfileArn(account: StoredAccount): string | undefined {
   const credentials = account.credentials || {}
@@ -241,6 +285,19 @@ export class ProxyRuntime {
       refreshToken: account.refreshToken || existing.credentials?.refreshToken,
       expiresAt: account.expiresAt
     }
+    const limit = typeof account.quotaLimit === 'number' ? account.quotaLimit : existing.usage?.limit ?? 0
+    const nextResetDate = typeof account.quotaResetAt === 'number'
+      ? new Date(account.quotaResetAt).toISOString().slice(0, 10)
+      : existing.usage?.nextResetDate
+    const current = mergeUsageCurrent(existing, account, nextResetDate)
+    existing.usage = {
+      ...(existing.usage || {}),
+      current,
+      limit,
+      percentUsed: usagePercent(current, limit),
+      lastUpdated: Date.now(),
+      nextResetDate
+    }
     await this.store.setAccountData(this.userId, accountData)
   }
 
@@ -277,6 +334,9 @@ export class ProxyRuntime {
         provider: account.credentials.provider || account.idp,
         machineId: account.machineId,
         groupId: account.groupId,
+        quotaUsed: typeof account.usage?.current === 'number' ? account.usage.current : undefined,
+        quotaLimit: typeof account.usage?.limit === 'number' ? account.usage.limit : undefined,
+        quotaResetAt: parseQuotaResetAt(account.usage?.nextResetDate),
         proxyUrl: boundProxy?.enabled && boundProxy.status !== 'dead' ? boundProxy.url : undefined
       }))
     }

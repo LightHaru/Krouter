@@ -2888,7 +2888,7 @@ export function RegisterPage(): React.JSX.Element {
                     type="password"
                     value={tingamefiMailAdminPassword}
                     onChange={(e) => setTingamefiMailAdminPassword(e.target.value)}
-                    placeholder="admin123456"
+                    placeholder="Enter admin password"
                     disabled={isRunning || batchRunning}
                     autoComplete="off"
                   />

@@ -448,19 +448,30 @@ export class AccountPool {
   }
 
   // 记录请求成功（重置断路器 + 粘滞到当前账号）
-  recordSuccess(accountId: string, tokens: number = 0): void {
+  recordSuccess(accountId: string, tokens: number = 0, credits: number = 0): ProxyAccount | undefined {
     const account = this.accounts.get(accountId)
+    let updatedAccount: ProxyAccount | undefined
     if (account) {
-      this.accounts.set(accountId, {
+      const now = Date.now()
+      const creditDelta = Number.isFinite(credits) && credits > 0 ? credits : 0
+      const quotaUsed = creditDelta > 0
+        ? Math.max(0, (account.quotaUsed || 0) + creditDelta)
+        : account.quotaUsed
+      const quotaLimit = account.quotaLimit
+      const quotaReached = typeof quotaLimit === 'number' && quotaLimit > 0 && typeof quotaUsed === 'number' && quotaUsed >= quotaLimit
+      updatedAccount = {
         ...account,
         requestCount: (account.requestCount || 0) + 1,
         errorCount: 0, // 重置断路器失败计数
         lastErrorStatus: undefined,
-        lastUsed: Date.now(),
+        lastUsed: now,
         isAvailable: true,
         cooldownUntil: undefined,
-        quotaExhaustedAt: undefined
-      })
+        quotaUsed,
+        quotaUsedDelta: creditDelta,
+        quotaExhaustedAt: quotaReached ? now : undefined
+      }
+      this.accounts.set(accountId, updatedAccount)
 
       const accountList = Array.from(this.accounts.keys())
       const successIndex = accountList.indexOf(accountId)
@@ -481,6 +492,7 @@ export class AccountPool {
         lastUsed: Date.now()
       })
     }
+    return updatedAccount
   }
 
   // 记录请求失败（区分错误类型）

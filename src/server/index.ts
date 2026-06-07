@@ -658,6 +658,27 @@ function normalizeStoredUsagePercent(usage: Record<string, unknown>): Record<str
   return usage
 }
 
+function usageResetAdvanced(currentUsage: Record<string, unknown>, incomingUsage: Record<string, unknown>): boolean {
+  const currentReset = typeof currentUsage.nextResetDate === 'string' ? Date.parse(currentUsage.nextResetDate) : NaN
+  const incomingReset = typeof incomingUsage.nextResetDate === 'string' ? Date.parse(incomingUsage.nextResetDate) : NaN
+  return Number.isFinite(currentReset) && Number.isFinite(incomingReset) && incomingReset > currentReset
+}
+
+function mergeStoredUsage(currentUsage: Record<string, unknown>, incomingUsage: Record<string, unknown>, now: number): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...currentUsage, ...incomingUsage, lastUpdated: now }
+  const current = Number(currentUsage.current)
+  const incoming = Number(incomingUsage.current)
+  if (
+    Number.isFinite(current) &&
+    Number.isFinite(incoming) &&
+    incoming < current &&
+    !usageResetAdvanced(currentUsage, incomingUsage)
+  ) {
+    merged.current = current
+  }
+  return normalizeStoredUsagePercent(merged)
+}
+
 function getStoredAccounts(accountData: StoredAccountData): Record<string, StoredAccount> {
   return isPlainRecord(accountData.accounts) ? accountData.accounts as Record<string, StoredAccount> : {}
 }
@@ -684,7 +705,7 @@ function applyRefreshDataToStoredAccount(
   let usage = account.usage
   if (isPlainRecord(data?.usage)) {
     const currentUsage = isPlainRecord(account.usage) ? account.usage : {}
-    usage = normalizeStoredUsagePercent({ ...currentUsage, ...data.usage, lastUpdated: now })
+    usage = mergeStoredUsage(currentUsage, data.usage, now)
   }
 
   let subscription = account.subscription

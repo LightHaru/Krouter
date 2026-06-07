@@ -395,6 +395,8 @@ export interface ProxyAccount {
   cooldownUntil?: number
   // 配额追踪
   quotaUsed?: number
+  /** Credits consumed by the most recent successful request. Used to merge stale pool state with fresher persisted usage. */
+  quotaUsedDelta?: number
   quotaLimit?: number
   quotaExhaustedAt?: number // 配额耗尽时间戳
   quotaResetAt?: number // 下次配额重置时间
@@ -555,6 +557,12 @@ export interface ProxyConfig {
   fallbackPort?: number
   /** 启用审计日志（管理 API 操作、config 变更） */
   enableAuditLog?: boolean
+  /**
+   * Khi true: với model cần chọn theo năng lực (requiresModelCapabilitySelection),
+   * chỉ xét tài khoản đúng tier (vd Opus → chỉ Power_Account). Mặc định không đặt:
+   * giữ hành vi hiện tại dựa trên accountSupportsModel.
+   */
+  strictTierRouting?: boolean
 }
 
 export interface TlsConfig {

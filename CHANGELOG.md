@@ -2,6 +2,24 @@
 
 All notable Krouter changes are tracked here.
 
+## 1.8.5 - 2026-06-07
+
+### Added
+
+- Added realtime API proxy quota updates from backend request handling to the web dashboard, so account usage can move immediately after successful proxy calls.
+- Added unit-test tooling with Vitest and property-based coverage support for future proxy/runtime regressions.
+
+### Changed
+
+- Improved Opus/power-model routing with model capability checks, per-model pacing, and cooldown-aware retries so temporary AmazonQ/Kiro throttling can wait and continue instead of failing the whole request too early.
+- Improved backend/frontend usage merging so background refreshes and reset-date format differences do not roll quota usage backward within the same billing window.
+- Updated API proxy account rotation defaults toward smart balancing and stricter model-tier routing for power-only models.
+
+### Fixed
+
+- Fixed streaming proxy success paths to persist account usage and emit account update events for both OpenAI-compatible and Claude-compatible streaming calls.
+- Fixed stale web sessions restoring deleted accounts by tracking delete tombstones during storage sync.
+
 ## 1.8.4 - 2026-06-07
 
 ### Changed

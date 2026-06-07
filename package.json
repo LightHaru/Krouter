@@ -1,6 +1,6 @@
 {
   "name": "@lightharu/krouter",
-  "version": "1.8.4",
+  "version": "1.8.5",
   "description": "Krouter - Web dashboard and CLI router for Kiro accounts, quota balancing, and API proxy",
   "main": "./out-server/server/index.js",
   "bin": {
@@ -26,7 +26,16 @@
   ],
   "files": [
     "dist-web/",
-    "docs/",
+    "docs/API-Proxy-Guide.md",
+    "docs/API-Proxy-Guide.en.md",
+    "docs/API-Proxy-Guide.vi.md",
+    "docs/CHANGELOG-v1.2.5.md",
+    "docs/CHANGELOG-v1.2.7.md",
+    "docs/CHANGELOG-v1.3.7.md",
+    "docs/CHANGELOG-v1.3.8.md",
+    "docs/K-Proxy-MITM-Plan.md",
+    "docs/images/",
+    "docs/web-port.md",
     "out-server/",
     "scripts/krouter-cli.cjs",
     "scripts/kiro-manager-cli.cjs",
@@ -64,7 +73,9 @@
     "build:linux": "electron-vite build && electron-builder --linux",
     "test:e2e": "node test/e2e-fullsuite/run.mjs",
     "test:e2e:only": "node test/e2e-fullsuite/run.mjs --only",
-    "test:e2e:install": "playwright install chromium"
+    "test:e2e:install": "playwright install chromium",
+    "test:unit": "vitest run",
+    "test:unit:watch": "vitest"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
@@ -105,11 +116,13 @@
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.20",
+    "fast-check": "^3.23.2",
     "playwright": "^1.60.0",
     "prettier": "^3.6.2",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "typescript": "^5.9.2",
-    "vite": "^7.1.6"
+    "vite": "^7.1.6",
+    "vitest": "^3.2.4"
   }
 }

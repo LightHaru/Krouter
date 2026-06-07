@@ -23,6 +23,7 @@ function App(): React.JSX.Element {
     stopAutoTokenRefresh,
     applyBackgroundRefreshResults,
     applyBackgroundCheckResults,
+    applyProxyAccountUpdate,
     flushSaveImmediately,
     accounts,
     activeAccountId,
@@ -244,6 +245,16 @@ function App(): React.JSX.Element {
       }
     }
   }, [applyBackgroundCheckResults])
+
+  useEffect(() => {
+    if (typeof window.api.onProxyAccountUpdate !== 'function') return
+    const unsubscribe = window.api.onProxyAccountUpdate((account) => {
+      applyProxyAccountUpdate(account)
+    })
+    return () => {
+      unsubscribe()
+    }
+  }, [applyProxyAccountUpdate])
 
   // 监听反代账号被封禁事件（TEMPORARILY_SUSPENDED / AccountSuspendedException）
   // 反代触发后，把封禁状态同步到 store 让 UI 显示
