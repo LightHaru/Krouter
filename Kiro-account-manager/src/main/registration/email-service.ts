@@ -2,7 +2,6 @@ import * as tls from 'tls'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
 import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
 import { randomEmailPrefix } from './names'
-import { waitProtonOtp } from './proton-mail-window'
 
 function getRegistrationProxyUrl(): string | undefined {
   return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || getSystemProxy() || undefined
@@ -37,7 +36,7 @@ export interface TempEmailService {
 
 /** 可被 AbortSignal 中断的 sleep：停止注册时立刻 reject，不再傻等 */
 function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(new Error('注册已取消'))
+  if (signal?.aborted) return Promise.reject(new Error('Đăng ký đã bị hủy'))
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       signal?.removeEventListener('abort', onAbort)
@@ -45,7 +44,7 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
     }, ms)
     const onAbort = (): void => {
       clearTimeout(timer)
-      reject(new Error('注册已取消'))
+      reject(new Error('Đăng ký đã bị hủy'))
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
@@ -73,16 +72,16 @@ export class MoEmailService implements TempEmailService {
    */
   private static normalizeBaseURL(raw: string): string {
     const trimmed = (raw || '').trim().replace(/\/+$/, '')
-    if (!trimmed) throw new Error('MoEmail BaseURL 未配置')
+    if (!trimmed) throw new Error('Chưa cấu hình MoEmail BaseURL')
     const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
     let u: URL
     try {
       u = new URL(withScheme)
     } catch {
-      throw new Error(`MoEmail BaseURL 格式无效: ${raw}`)
+      throw new Error(`Định dạng MoEmail BaseURL không hợp lệ: ${raw}`)
     }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-      throw new Error(`MoEmail BaseURL 协议不支持 (仅支持 http/https): ${u.protocol}`)
+      throw new Error(`MoEmail BaseURL không hỗ trợ giao thức này (chỉ hỗ trợ http/https): ${u.protocol}`)
     }
     return withScheme
   }
@@ -103,7 +102,7 @@ export class MoEmailService implements TempEmailService {
       ''
 
     if (!addr) {
-      console.log('[MoEmail] 创建邮箱失败:', JSON.stringify(data))
+      console.log('[MoEmail] Tạo email thất bại:', JSON.stringify(data))
       return ''
     }
     this.address = addr
@@ -111,21 +110,21 @@ export class MoEmailService implements TempEmailService {
   }
 
   async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
-    if (!this.address) throw new Error('邮箱地址为空')
+    if (!this.address) throw new Error('Địa chỉ email đang trống')
 
     const maxRetries = Math.floor(timeoutSec / intervalSec)
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      if (signal?.aborted) throw new Error('注册已取消')
+      if (signal?.aborted) throw new Error('Đăng ký đã bị hủy')
       await abortableSleep(intervalSec * 1000, signal)
       try {
         const code = await this.fetchCode()
         if (code) return code
       } catch (err) {
-        if (attempt % 5 === 0) console.log(`[MoEmail] [${attempt}/${maxRetries}] 查询失败:`, err)
+        if (attempt % 5 === 0) console.log(`[MoEmail] [${attempt}/${maxRetries}] Truy vấn thất bại:`, err)
       }
-      if (attempt % 5 === 0) console.log(`[MoEmail] [${attempt}/${maxRetries}] 暂无验证码...`)
+      if (attempt % 5 === 0) console.log(`[MoEmail] [${attempt}/${maxRetries}] Chưa có mã xác minh...`)
     }
-    throw new Error(`等待验证码超时 (${timeoutSec}s)`)
+    throw new Error(`Hết thời gian chờ mã xác minh (${timeoutSec} giây)`)
   }
 
   getAddress(): string {
@@ -181,7 +180,7 @@ export class TempMailPlusService implements TempEmailService {
       .map((d) => d.trim().replace(/^@/, ''))
       .filter(Boolean)
     if (this.domains.length === 0) {
-      throw new Error('TempMail.Plus 自建域名为空')
+      throw new Error('Tên miền riêng của TempMail.Plus đang trống')
     }
   }
 
@@ -201,9 +200,9 @@ export class TempMailPlusService implements TempEmailService {
     this.domain = this.domains[Math.floor(Math.random() * this.domains.length)]
     this.address = `${prefix}@${this.domain}`
     if (this.domains.length > 1) {
-      console.log(`[TempMailPlus] 生成邮箱: ${this.address}  (域名池 ${this.domains.length} 个)`)
+      console.log(`[TempMailPlus] Đã tạo email: ${this.address} (kho tên miền có ${this.domains.length} mục)`)
     } else {
-      console.log(`[TempMailPlus] 生成邮箱: ${this.address}`)
+      console.log(`[TempMailPlus] Đã tạo email: ${this.address}`)
     }
     return this.address
   }
@@ -213,17 +212,17 @@ export class TempMailPlusService implements TempEmailService {
   }
 
   async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
-    if (!this.address) throw new Error('邮箱地址为空')
+    if (!this.address) throw new Error('Địa chỉ email đang trống')
     const maxRetries = Math.floor(timeoutSec / intervalSec)
     const checkedIds = new Set<number>()
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      if (signal?.aborted) throw new Error('注册已取消')
+      if (signal?.aborted) throw new Error('Đăng ký đã bị hủy')
       await abortableSleep(intervalSec * 1000, signal)
       try {
         const mails = await this.fetchMailList()
         if (attempt === 1 || attempt % 5 === 0) {
-          console.log(`[TempMailPlus] [${attempt}/${maxRetries}] 邮件数: ${mails.length}`)
+          console.log(`[TempMailPlus] [${attempt}/${maxRetries}] Số email: ${mails.length}`)
         }
         for (const mail of mails) {
           const mailId = mail.mail_id as number
@@ -236,26 +235,26 @@ export class TempMailPlusService implements TempEmailService {
           // 验证收件人匹配
           const toField = String(detail.to || '').toLowerCase()
           if (!toField.includes(this.address.toLowerCase())) {
-            console.log(`[TempMailPlus] 收件人不匹配: ${toField} (期望包含: ${this.address})`)
+            console.log(`[TempMailPlus] Người nhận không khớp: ${toField} (cần chứa: ${this.address})`)
             continue
           }
 
           // 提取验证码
           const code = this.extractOTP(detail)
           if (code) {
-            console.log(`[TempMailPlus] 验证码: ${code}`)
+            console.log(`[TempMailPlus] Mã xác minh: ${code}`)
             await this.deleteMail(mailId)
             return code
           } else {
-            console.log(`[TempMailPlus] 邮件 ${mailId} 未提取到验证码`)
+            console.log(`[TempMailPlus] Không lấy được mã xác minh từ email ${mailId}`)
           }
         }
       } catch (err) {
-        console.log(`[TempMailPlus] [${attempt}/${maxRetries}] 查询失败:`, err)
+        console.log(`[TempMailPlus] [${attempt}/${maxRetries}] Truy vấn thất bại:`, err)
       }
-      if (attempt % 5 === 0) console.log(`[TempMailPlus] [${attempt}/${maxRetries}] 暂无验证码...`)
+      if (attempt % 5 === 0) console.log(`[TempMailPlus] [${attempt}/${maxRetries}] Chưa có mã xác minh...`)
     }
-    throw new Error(`等待验证码超时 (${timeoutSec}s)`)
+    throw new Error(`Hết thời gian chờ mã xác minh (${timeoutSec} giây)`)
   }
 
   private get fullEmail(): string {
@@ -283,9 +282,9 @@ export class TempMailPlusService implements TempEmailService {
     const body = `email=${encodeURIComponent(this.fullEmail)}&epin=${encodeURIComponent(this.epin)}`
     try {
       await proxyFetch(url, { method: 'DELETE', headers, body, signal: AbortSignal.timeout(10000) })
-      console.log(`[TempMailPlus] 已删除邮件: ${mailId}`)
+      console.log(`[TempMailPlus] Đã xóa email: ${mailId}`)
     } catch (err) {
-      console.log(`[TempMailPlus] 删除邮件失败:`, err)
+      console.log(`[TempMailPlus] Xóa email thất bại:`, err)
     }
   }
 
@@ -301,6 +300,148 @@ export class TempMailPlusService implements TempEmailService {
     // 从 HTML 提取
     const html = String(detail.html || '')
     return extractCode(html)
+  }
+}
+
+// ============ Tingamefi Temp Email / Cloudflare Email Worker ============
+
+export class TingamefiMailService implements TempEmailService {
+  private readonly apiUrl: string
+  private readonly adminPassword: string
+  private readonly configuredDomain: string
+  private address = ''
+
+  constructor(apiUrl: string, adminPassword: string, domain: string) {
+    this.apiUrl = TingamefiMailService.normalizeApiUrl(apiUrl || 'https://temp-email-worker.thienp1301.workers.dev')
+    this.adminPassword = (adminPassword || '').trim()
+    this.configuredDomain = (domain || 'mail.tingamefi.com').trim().replace(/^@/, '')
+    if (!this.adminPassword) throw new Error('Tingamefi mail admin password is empty')
+  }
+
+  private static normalizeApiUrl(raw: string): string {
+    const trimmed = raw.trim().replace(/\/+$/, '')
+    if (!trimmed) return 'https://temp-email-worker.thienp1301.workers.dev'
+    return /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+  }
+
+  private get headers(): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      'x-admin-auth': this.adminPassword,
+      'x-lang': 'en',
+      'x-fingerprint': 'kiro-account-manager-web'
+    }
+  }
+
+  async create(): Promise<string> {
+    const domain = await this.resolveDomain()
+    let lastError = ''
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      const name = randomEmailPrefix()
+      try {
+        const data = await this.fetchJson<Record<string, unknown>>('/admin/new_address', {
+          method: 'POST',
+          headers: this.headers,
+          body: JSON.stringify({
+            enablePrefix: true,
+            enableRandomSubdomain: false,
+            name,
+            domain
+          }),
+          signal: AbortSignal.timeout(30000)
+        })
+        const address = String(data.address || '')
+        if (address) {
+          this.address = address
+          console.log(`[TingamefiMail] created address: ${address}`)
+          return address
+        }
+        lastError = JSON.stringify(data).slice(0, 300)
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error)
+      }
+    }
+    throw new Error(`Tingamefi mail address creation failed: ${lastError || 'empty response'}`)
+  }
+
+  getAddress(): string {
+    return this.address
+  }
+
+  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
+    if (!this.address) throw new Error('Tingamefi mail address is empty')
+    const maxRetries = Math.max(1, Math.floor(timeoutSec / intervalSec))
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      if (signal?.aborted) throw new Error('Registration was cancelled')
+      await abortableSleep(intervalSec * 1000, signal)
+      try {
+        const messages = await this.fetchMessages()
+        if (attempt === 1 || attempt % 5 === 0) {
+          console.log(`[TingamefiMail] [${attempt}/${maxRetries}] messages: ${messages.length}`)
+        }
+        const preferred = messages.filter((message) => /no-reply@signin\.aws/i.test(String(message.source || message.raw || '')))
+        for (const message of [...preferred, ...messages.filter((message) => !preferred.includes(message))]) {
+          const text = [
+            message.subject,
+            message.text,
+            message.html,
+            message.message,
+            message.raw
+          ].map((value) => String(value || '')).join('\n')
+          const code = extractCode(text)
+          if (code) {
+            console.log(`[TingamefiMail] verification code: ${code}`)
+            await this.deleteMail(message.id).catch(() => undefined)
+            return code
+          }
+        }
+      } catch (error) {
+        if (attempt % 5 === 0) console.log(`[TingamefiMail] [${attempt}/${maxRetries}] query failed:`, error)
+      }
+      if (attempt % 5 === 0) console.log(`[TingamefiMail] [${attempt}/${maxRetries}] no verification code yet...`)
+    }
+
+    throw new Error(`Timed out waiting for verification code (${timeoutSec}s)`)
+  }
+
+  private async resolveDomain(): Promise<string> {
+    if (this.configuredDomain) return this.configuredDomain
+    const settings = await this.fetchJson<Record<string, unknown>>('/open_api/settings', {
+      headers: { 'x-lang': 'en', 'x-fingerprint': 'kiro-account-manager-web' },
+      signal: AbortSignal.timeout(15000)
+    })
+    const domains = Array.isArray(settings.defaultDomains) ? settings.defaultDomains : settings.domains
+    const first = Array.isArray(domains) ? String(domains[0] || '') : ''
+    if (!first) throw new Error('Tingamefi mail domain is empty')
+    return first.replace(/^@/, '')
+  }
+
+  private async fetchMessages(): Promise<Array<Record<string, unknown>>> {
+    const query = `/admin/mails?limit=10&offset=0&address=${encodeURIComponent(this.address)}`
+    const data = await this.fetchJson<Record<string, unknown>>(query, {
+      headers: this.headers,
+      signal: AbortSignal.timeout(15000)
+    })
+    return Array.isArray(data.results) ? data.results as Array<Record<string, unknown>> : []
+  }
+
+  private async deleteMail(id: unknown): Promise<void> {
+    if (id === undefined || id === null || id === '') return
+    await this.fetchJson(`/admin/mails/${encodeURIComponent(String(id))}`, {
+      method: 'DELETE',
+      headers: this.headers,
+      signal: AbortSignal.timeout(10000)
+    })
+  }
+
+  private async fetchJson<T>(pathname: string, init: RequestInit): Promise<T> {
+    const response = await proxyFetch(`${this.apiUrl}${pathname}`, init)
+    const text = await response.text()
+    if (!response.ok) {
+      throw new Error(`Tingamefi mail API ${response.status}: ${text.slice(0, 300)}`)
+    }
+    return (text ? JSON.parse(text) : {}) as T
   }
 }
 
@@ -368,9 +509,9 @@ export async function refreshOutlookToken(acc: OutlookAccount): Promise<string> 
     { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form.toString() }
   )
   const data = (await resp.json()) as Record<string, unknown>
-  if (resp.status !== 200) throw new Error(`刷新失败 ${resp.status}: ${JSON.stringify(data).slice(0, 300)}`)
+  if (resp.status !== 200) throw new Error(`Làm mới thất bại ${resp.status}: ${JSON.stringify(data).slice(0, 300)}`)
   const token = data.access_token as string
-  if (!token) throw new Error('响应中无 access_token')
+  if (!token) throw new Error('Phản hồi không có access_token')
   return token
 }
 
@@ -389,7 +530,7 @@ class IMAPClient {
       const socket = tls.connect(993, 'outlook.office365.com', { servername: 'outlook.office365.com' })
       const timer = setTimeout(() => {
         socket.destroy()
-        reject(new Error('连接超时'))
+        reject(new Error('Kết nối hết thời gian chờ'))
       }, 15000)
 
       socket.once('error', (err) => { clearTimeout(timer); reject(err) })
@@ -403,7 +544,7 @@ class IMAPClient {
 
   private readLine(timeoutMs = 30000): Promise<string> {
     return new Promise((resolve, reject) => {
-      if (!this.socket) return reject(new Error('未连接'))
+      if (!this.socket) return reject(new Error('Chưa kết nối'))
 
       let settled = false
       const timer = setTimeout(() => {
@@ -453,7 +594,7 @@ class IMAPClient {
   }
 
   private async sendCommand(cmd: string): Promise<string> {
-    if (!this.socket) throw new Error('未连接')
+    if (!this.socket) throw new Error('Chưa kết nối')
     this.tag++
     const tagStr = `A${String(this.tag).padStart(3, '0')}`
     this.socket.write(`${tagStr} ${cmd}\r\n`)
@@ -473,8 +614,8 @@ class IMAPClient {
     const xoauth2 = buildXOAuth2(email, accessToken)
     const tag = await this.sendCommand(`AUTHENTICATE XOAUTH2 ${xoauth2}`)
     const { result } = await this.readUntilTag(tag)
-    if (!result.includes('OK')) throw new Error(`认证失败: ${result}`)
-    console.log('[IMAP] 认证成功')
+    if (!result.includes('OK')) throw new Error(`Xác thực thất bại: ${result}`)
+    console.log('[IMAP] Xác thực thành công')
     await sleep(800)
   }
 
@@ -490,18 +631,18 @@ class IMAPClient {
         return 0
       }
       if (retry < 2) {
-        console.log(`[IMAP] SELECT INBOX 失败 (${result}), 重试 ${retry + 1}/3...`)
+        console.log(`[IMAP] SELECT INBOX thất bại (${result}), thử lại ${retry + 1}/3...`)
         await sleep((1 + retry) * 1000)
       }
     }
-    throw new Error('SELECT INBOX 重试耗尽')
+    throw new Error('SELECT INBOX vẫn thất bại sau tất cả lần thử')
   }
 
   async fetchLatestBody(seq: number): Promise<string> {
-    if (seq <= 0) throw new Error('无效的邮件序号')
+    if (seq <= 0) throw new Error('Số thứ tự email không hợp lệ')
     const tag = await this.sendCommand(`FETCH ${seq} (BODY.PEEK[TEXT])`)
     const { lines, result } = await this.readUntilTag(tag)
-    if (!result.includes('OK')) throw new Error(`FETCH TEXT 失败: ${result}`)
+    if (!result.includes('OK')) throw new Error(`FETCH TEXT thất bại: ${result}`)
 
     const rawLines: string[] = []
     let inBody = false
@@ -564,12 +705,12 @@ export async function waitForOTP(
   interval: number,
   signal?: AbortSignal
 ): Promise<string> {
-  console.log(`[Outlook IMAP] 等待验证码, 邮箱=${acc.email}, 发送前邮件数=${beforeCount}`)
+  console.log(`[Outlook IMAP] Đang chờ mã xác minh, email=${acc.email}, số email trước khi gửi=${beforeCount}`)
   let accessToken = await refreshOutlookToken(acc)
   const maxRetries = Math.floor(timeout / interval)
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    if (signal?.aborted) throw new Error('注册已取消')
+    if (signal?.aborted) throw new Error('Đăng ký đã bị hủy')
     let client: IMAPClient | null = null
     try {
       client = new IMAPClient()
@@ -578,7 +719,7 @@ export async function waitForOTP(
       const total = await client.selectInbox()
 
       if (total <= beforeCount) {
-        if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] 暂无新邮件 (当前${total}封)...`)
+        if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] Chưa có email mới (hiện có ${total})...`)
         await abortableSleep(interval * 1000, signal)
         continue
       }
@@ -588,22 +729,22 @@ export async function waitForOTP(
           const body = await client.fetchLatestBody(i)
           const code = extractCode(body)
           if (code) {
-            console.log(`[Outlook IMAP] 获取到验证码: ${code}`)
+            console.log(`[Outlook IMAP] Đã lấy mã xác minh: ${code}`)
             return code
           }
         } catch { /* continue */ }
       }
 
-      if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] 新邮件中未找到验证码...`)
+      if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] Không tìm thấy mã xác minh trong email mới...`)
     } catch (err) {
-      if (attempt % 5 === 0) console.log(`[Outlook IMAP] 连接失败:`, err)
+      if (attempt % 5 === 0) console.log(`[Outlook IMAP] Kết nối thất bại:`, err)
       try { accessToken = await refreshOutlookToken(acc) } catch { /* ignore */ }
     } finally {
       client?.close()
     }
     await abortableSleep(interval * 1000, signal)
   }
-  throw new Error(`等待验证码超时 (${timeout}s)`)
+  throw new Error(`Hết thời gian chờ mã xác minh (${timeout} giây)`)
 }
 
 // ============ Proton 邮箱（webview 借壳官方网页，轻量读 DOM 取码） ============
@@ -623,13 +764,13 @@ export class ProtonWebviewService implements TempEmailService {
   constructor(presetAddress: string, log?: (msg: string) => void) {
     this.address = (presetAddress || '').trim()
     if (!this.address) {
-      throw new Error('Proton 邮箱地址为空')
+      throw new Error('Địa chỉ email Proton đang trống')
     }
     this.log = log || ((m) => console.log(m))
   }
 
   async create(): Promise<string> {
-    this.log(`[Proton] 使用邮箱: ${this.address}`)
+    this.log(`[Proton] Sử dụng email: ${this.address}`)
     return this.address
   }
 
@@ -638,6 +779,10 @@ export class ProtonWebviewService implements TempEmailService {
   }
 
   async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
+    const runtime = process.versions.electron
+      ? await import('./proton-mail-window')
+      : await import('../../server/services/protonBrowserRuntime')
+    const { waitProtonOtp } = runtime
     return waitProtonOtp(this.address, {
       timeoutSec,
       intervalSec,

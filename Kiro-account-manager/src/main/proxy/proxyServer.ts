@@ -15,9 +15,12 @@ import type {
   ProxyConfig,
   ProxyStats,
   ProxyAccount,
+  KiroPayload,
+  KiroToolUse,
+  KiroUsage,
   TokenRefreshCallback
 } from './types'
-import { AccountPool, ErrorType, classifyError } from './accountPool'
+import { AccountPool, ErrorType, classifyError, isBillingOrQuotaError, isThrottleError } from './accountPool'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
@@ -33,7 +36,13 @@ import {
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
+import { getRuntimeUserDataPath } from '../runtimePaths'
+import { KIRO_PROXY_MODEL_PRESETS, normalizeKiroModelIdForCompare } from './modelCatalog'
 
+type ProxyAttemptError = Error & {
+  proxyAccountId?: string
+  proxyFailureRecorded?: boolean
+}
 
 export interface ProxyServerEvents {
   onRequest?: (info: { path: string; method: string; accountId?: string }) => void
@@ -236,11 +245,51 @@ function buildClientModel(input: {
 }
 
 // 请求体超限错误（统一识别用，触发 413 响应）
+function buildKiroPresetClientModel(preset: (typeof KIRO_PROXY_MODEL_PRESETS)[number], created: number): ClientModel {
+  return buildClientModel({
+    id: preset.id,
+    created,
+    ownedBy: 'kiro-api',
+    description: preset.description,
+    modelName: preset.name,
+    supportedInputTypes: preset.inputTypes,
+    maxInputTokens: preset.maxInputTokens,
+    maxOutputTokens: preset.maxOutputTokens,
+    modelProvider: preset.modelProvider
+  })
+}
+
+function buildKiroPresetModel(preset: (typeof KIRO_PROXY_MODEL_PRESETS)[number]): KiroModel {
+  return {
+    modelId: preset.id,
+    modelName: preset.name,
+    description: preset.description,
+    supportedInputTypes: preset.inputTypes,
+    tokenLimits: {
+      maxInputTokens: preset.maxInputTokens,
+      maxOutputTokens: preset.maxOutputTokens
+    },
+    modelProvider: preset.modelProvider
+  } as KiroModel
+}
+
 class BodyTooLargeError extends Error {
   constructor(public readonly received: number, public readonly limit: number) {
     super(`Request body too large: ${received} bytes exceeds limit of ${limit} bytes`)
     this.name = 'BodyTooLargeError'
   }
+}
+
+export type AccountTier = 'power' | 'free' | 'unknown'
+
+export type NoAccountReason = 'model_unsupported' | 'quota_exhausted' | 'throttled'
+
+export interface NoAccountDiagnosis {
+  reason: NoAccountReason
+  message: string
+  eligibleTotal: number
+  exhausted: number
+  cooldown: number
 }
 
 export class ProxyServer {
@@ -260,6 +309,13 @@ export class ProxyServer {
   private rateLimitBuckets: Map<string, { count: number; windowStart: number }> = new Map()
   /** P1-8 会话粘性：session hint → accountId 的映射（10 分钟 TTL） */
   private sessionAffinity: Map<string, { accountId: string; lastAt: number }> = new Map()
+  private modelLoadBalanceState: Map<string, number> = new Map()
+  private accountModelCapabilityCache: Map<string, { timestamp: number; modelIds: Set<string> }> = new Map()
+  private modelPaceQueues: Map<string, Promise<void>> = new Map()
+  private modelPaceReadyAt: Map<string, number> = new Map()
+  private readonly MODEL_CAPABILITY_CACHE_TTL = 5 * 60 * 1000
+  private readonly OPUS_MODEL_PACE_MS = 10 * 1000
+  private readonly MAX_COMPATIBLE_COOLDOWN_WAIT_MS = 65 * 1000
   /** P2-17 审计日志（最近 200 条） */
   private auditLog: Array<{ ts: number; type: string; data: Record<string, unknown> }> = []
   /** Webhook 触发回调（由外部注入，避免 main → renderer 循环依赖） */
@@ -323,10 +379,13 @@ export class ProxyServer {
       tokenRefreshBeforeExpiry: 300, // 5分钟提前刷新
       autoStart: false, // 是否自动启动
       clientDrivenToolExecution: true,
+      accountSelectionStrategy: 'smart',
+      sessionAffinityEnabled: false,
       ...config
     }
+    this.normalizeAccountBalancingConfig()
     this.accountPool = new AccountPool()
-    this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
+    this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'smart')
     this.stats = {
       totalRequests: 0,
       successRequests: 0,
@@ -512,10 +571,9 @@ export class ProxyServer {
     } else {
       // 自动生成自签证书（位于 userData/proxy-tls/）
       try {
-        const { app } = require('electron')
         const { ensureProxySelfSignedCert } = require('./selfSignedCert')
         const hostnames = [this.config.host || '127.0.0.1']
-        const result = ensureProxySelfSignedCert(app.getPath('userData'), hostnames)
+        const result = ensureProxySelfSignedCert(getRuntimeUserDataPath(), hostnames)
         proxyLogger.info('ProxyServer', `Using self-signed TLS cert (SAN=${result.altNames.join(',')}, fingerprint=${result.fingerprint.slice(0, 19)}...)`)
         cert = result.cert
         key = result.key
@@ -532,9 +590,8 @@ export class ProxyServer {
    */
   getSelfSignedCertInfo(): import('./selfSignedCert').ProxySelfSignedCert | null {
     try {
-      const { app } = require('electron')
       const { ensureProxySelfSignedCert } = require('./selfSignedCert')
-      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'])
+      return ensureProxySelfSignedCert(getRuntimeUserDataPath(), [this.config.host || '127.0.0.1'])
     } catch (err) {
       proxyLogger.warn('ProxyServer', `getSelfSignedCertInfo failed: ${(err as Error).message}`)
       return null
@@ -544,10 +601,9 @@ export class ProxyServer {
   /** 强制重新生成自签证书（用户在 UI 上点"重新生成"） */
   regenerateSelfSignedCert(): import('./selfSignedCert').ProxySelfSignedCert | null {
     try {
-      const { app } = require('electron')
       const { ensureProxySelfSignedCert } = require('./selfSignedCert')
       this.appendAuditLog('regenerate_self_signed_cert', { host: this.config.host })
-      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'], true)
+      return ensureProxySelfSignedCert(getRuntimeUserDataPath(), [this.config.host || '127.0.0.1'], true)
     } catch (err) {
       proxyLogger.warn('ProxyServer', `regenerateSelfSignedCert failed: ${(err as Error).message}`)
       return null
@@ -618,11 +674,29 @@ export class ProxyServer {
       proxyLogger.warn('ProxyServer', `Config change requires restart: ${restartTriggerFields.filter(k => k in config).join(', ')}`)
     }
     this.appendAuditLog('config_changed', { fields: Object.keys(config), needsRestart: willRestart })
-    this.config = { ...this.config, ...config }
-    // 同步账号选择策略到 accountPool
-    if (config.accountSelectionStrategy !== undefined) {
-      this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
+    if (config.modelMappings) {
+      this.modelLoadBalanceState.clear()
     }
+    this.config = { ...this.config, ...config }
+    this.normalizeAccountBalancingConfig()
+    // 同步账号选择策略到 accountPool
+    this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'smart')
+  }
+
+  private normalizeAccountBalancingConfig(): void {
+    const strategy = this.config.accountSelectionStrategy || 'smart'
+    this.config.accountSelectionStrategy = strategy
+
+    if (this.config.enableMultiAccount && strategy !== 'sticky') {
+      this.config.sessionAffinityEnabled = false
+    }
+  }
+
+  private isSessionAffinityActive(): boolean {
+    return Boolean(
+      this.config.sessionAffinityEnabled &&
+      (this.config.accountSelectionStrategy || 'smart') === 'sticky'
+    )
   }
 
   /** UI 可用此判断是否需提示用户重启 */
@@ -802,6 +876,7 @@ export class ProxyServer {
 
   // 获取统计信息
   getStats(): ProxyStats {
+    const poolStats = this.accountPool.getStats()
     // 返回可序列化的统计信息（Map 对象在 IPC 中无法正确序列化）
     return {
       totalRequests: this.stats.totalRequests,
@@ -815,7 +890,7 @@ export class ProxyServer {
       cacheWriteTokens: this.stats.cacheWriteTokens,
       reasoningTokens: this.stats.reasoningTokens,
       startTime: this.stats.startTime,
-      accountStats: this.stats.accountStats,
+      accountStats: poolStats.accounts,
       endpointStats: this.stats.endpointStats,
       modelStats: this.stats.modelStats,
       recentRequests: this.stats.recentRequests
@@ -983,6 +1058,47 @@ export class ProxyServer {
     })
   }
 
+  private getPacedModelGroup(modelId?: string): string | null {
+    if (!modelId) return null
+    const normalized = normalizeKiroModelIdForCompare(modelId)
+    if (normalized.includes('opus')) return 'opus'
+    return null
+  }
+
+  private async runWithModelPacing<T>(
+    account: ProxyAccount,
+    modelId: string | undefined,
+    signal: AbortSignal | undefined,
+    work: () => Promise<T>
+  ): Promise<T> {
+    const group = this.getPacedModelGroup(modelId)
+    if (!group) return await work()
+
+    const key = `${account.id}:${group}`
+    const paceMs = group === 'opus' ? this.OPUS_MODEL_PACE_MS : 0
+    const previous = this.modelPaceQueues.get(key) || Promise.resolve()
+    const queued = previous.catch(() => undefined).then(async () => {
+      this.throwIfAborted(signal)
+      const waitMs = Math.max(0, (this.modelPaceReadyAt.get(key) || 0) - Date.now())
+      if (waitMs > 0) {
+        proxyLogger.info('ProxyServer', `Pacing ${modelId || group} on ${account.email || account.id.slice(0, 8)} for ${waitMs}ms`)
+        await this.waitForRetry(waitMs, signal)
+      }
+      try {
+        return await work()
+      } finally {
+        this.modelPaceReadyAt.set(key, Date.now() + paceMs)
+      }
+    })
+    const marker = queued.then(() => undefined, () => undefined)
+    this.modelPaceQueues.set(key, marker)
+    try {
+      return await queued
+    } finally {
+      if (this.modelPaceQueues.get(key) === marker) this.modelPaceQueues.delete(key)
+    }
+  }
+
   private async abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
     this.throwIfAborted(signal)
     if (!signal) return promise
@@ -1060,6 +1176,7 @@ export class ProxyServer {
 
     // 合并隐藏模型（与 /v1/models 端点一致）
     const modelIds = new Set(kiroModels.map(m => m.modelId))
+    const presetModels = KIRO_PROXY_MODEL_PRESETS.map(buildKiroPresetModel)
     const hiddenModels: KiroModel[] = [
       { modelId: 'claude-3.7-sonnet', modelName: 'Claude 3.7 Sonnet', description: 'Claude 3.7 Sonnet (hidden)', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel,
       { modelId: 'simple-task', modelName: 'Simple Task', description: 'Kiro fast model (routes to Haiku)', supportedInputTypes: ['TEXT'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 4096 } } as KiroModel,
@@ -1067,7 +1184,13 @@ export class ProxyServer {
       { modelId: 'CLAUDE_HAIKU_4_5_20251001_V1_0', modelName: 'Claude Haiku 4.5 (CW)', description: 'CodeWhisperer internal ID', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel,
       { modelId: 'CLAUDE_3_7_SONNET_20250219_V1_0', modelName: 'Claude 3.7 Sonnet (CW)', description: 'CodeWhisperer internal ID', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel
     ]
-    const merged = [...kiroModels, ...hiddenModels.filter(m => !modelIds.has(m.modelId))]
+    const merged = [...kiroModels]
+    for (const model of [...presetModels, ...hiddenModels]) {
+      if (!modelIds.has(model.modelId)) {
+        modelIds.add(model.modelId)
+        merged.push(model)
+      }
+    }
 
     return { models: merged.map(ProxyServer.mapKiroModelToApi), fromCache }
   }
@@ -1146,23 +1269,227 @@ export class ProxyServer {
     return new Set(bindings)
   }
 
+  private isAccountAllowedForRequest(account: ProxyAccount | null, apiKeyId?: string): boolean {
+    if (!account) return true
+    const allowedIds = this.getAllowedAccountIds(apiKeyId)
+    if (allowedIds && !allowedIds.has(account.id)) return false
+    if (this.config.multiAccountSelectionMode === 'groups') {
+      const allowedGroupIds = new Set(this.config.multiAccountGroupIds || [])
+      const groupId = account.groupId || '__ungrouped__'
+      if (!allowedGroupIds.has(groupId)) return false
+    }
+    return true
+  }
+
+  private getNextAccountForRequest(excludeIds: Set<string> = new Set(), apiKeyId?: string): ProxyAccount | null {
+    const excluded = new Set(excludeIds)
+    for (const account of this.accountPool.getAllAccounts()) {
+      if (!this.isAccountAllowedForRequest(account, apiKeyId)) excluded.add(account.id)
+    }
+    return this.accountPool.getNextAccount(excluded)
+  }
+
   // 获取可用账号（包含 Token 刷新检查）
   // P1-8 sessionHint：相同会话尽量复用同一账号（命中 prompt cache + 防风控）
   // P2-21 apiKeyId：用于过滤 API Key 允许使用的账号子集
-  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string): Promise<ProxyAccount | null> {
-    const allowedIds = this.getAllowedAccountIds(apiKeyId)
-    const groupMode = this.config.multiAccountSelectionMode === 'groups'
-    const allowedGroupIds = groupMode ? new Set(this.config.multiAccountGroupIds || []) : null
-    const isAllowed = (acc: ProxyAccount | null): boolean => {
-      if (!acc) return true
-      // API Key 白名单（apiKeyAccountBindings）
-      if (allowedIds && !allowedIds.has(acc.id)) return false
-      // 分组过滤（双保险：即便前端忘了重新同步账号池，这里也能拦住非选中分组的账号）
-      if (groupMode && allowedGroupIds) {
-        const gid = acc.groupId || '__ungrouped__'
-        if (!allowedGroupIds.has(gid)) return false
+  private requiresModelCapabilitySelection(modelId?: string): boolean {
+    if (!modelId) return false
+    const normalized = normalizeKiroModelIdForCompare(modelId)
+    return normalized.startsWith('claude-opus-')
+      || normalized === 'claude-sonnet-4.6'
+      || normalized === 'deepseek-3.2'
+      || normalized === 'qwen3-coder-next'
+      || normalized === 'glm-5'
+      || normalized.startsWith('minimax-')
+  }
+
+  private async accountSupportsModel(account: ProxyAccount, modelId: string, signal?: AbortSignal): Promise<boolean> {
+    const normalizedModelId = normalizeKiroModelIdForCompare(modelId)
+    const cached = this.accountModelCapabilityCache.get(account.id)
+    if (cached && Date.now() - cached.timestamp < this.MODEL_CAPABILITY_CACHE_TTL) {
+      return cached.modelIds.has(normalizedModelId)
+    }
+
+    try {
+      let currentAccount = account
+      let models = await fetchKiroModels(currentAccount, signal)
+      if (models.length === 0 && currentAccount.refreshToken) {
+        const refreshed = await this.refreshToken(currentAccount, signal)
+        if (refreshed) {
+          currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+          models = await fetchKiroModels(currentAccount, signal)
+        }
       }
-      return true
+      const modelIds = new Set(models.map(model => normalizeKiroModelIdForCompare(model.modelId)))
+      this.accountModelCapabilityCache.set(currentAccount.id, { timestamp: Date.now(), modelIds })
+      for (const model of models) {
+        if (model.tokenLimits?.maxInputTokens) setModelContextWindow(model.modelId, model.tokenLimits.maxInputTokens)
+      }
+      return modelIds.has(normalizedModelId)
+    } catch (error) {
+      if (this.isAbortError(error, signal)) throw error
+      proxyLogger.warn('ProxyServer', `Failed to inspect models for ${account.email || account.id.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`)
+      this.accountModelCapabilityCache.set(account.id, { timestamp: Date.now(), modelIds: new Set() })
+      return false
+    }
+  }
+
+  private accountTier(account: ProxyAccount): AccountTier {
+    const cached = this.accountModelCapabilityCache.get(account.id)
+    if (!cached || Date.now() - cached.timestamp >= this.MODEL_CAPABILITY_CACHE_TTL) return 'unknown'
+    for (const id of cached.modelIds) {
+      if (id.startsWith('claude-opus-')) return 'power'
+    }
+    return 'free'
+  }
+
+  private isPowerAccount(account: ProxyAccount): boolean {
+    return this.accountTier(account) === 'power'
+  }
+
+  private async isEligibleForModel(
+    account: ProxyAccount, modelId: string | undefined, apiKeyId?: string, signal?: AbortSignal
+  ): Promise<boolean> {
+    if (!this.isAccountAllowedForRequest(account, apiKeyId)) return false
+    if (!modelId || !this.requiresModelCapabilitySelection(modelId)) return true
+    if (!await this.accountSupportsModel(account, modelId, signal)) return false
+    // strictTierRouting: với model Opus, chỉ chấp nhận Power_Account (tier suy ra
+    // từ capability cache đã được accountSupportsModel làm ấm ở trên).
+    if (this.config.strictTierRouting && normalizeKiroModelIdForCompare(modelId).startsWith('claude-opus-')) {
+      if (!this.isPowerAccount(account)) {
+        proxyLogger.info('ProxyServer', `strictTierRouting: skip ${account.email || account.id.slice(0, 8)} (not a power account) for ${modelId}`)
+        return false
+      }
+    }
+    return true
+  }
+
+  private async buildEligibleSet(
+    modelId: string | undefined, apiKeyId?: string, signal?: AbortSignal
+  ): Promise<ProxyAccount[]> {
+    const out: ProxyAccount[] = []
+    for (const account of this.accountPool.getAllAccounts()) {
+      if (await this.isEligibleForModel(account, modelId, apiKeyId, signal)) out.push(account)
+    }
+    return out
+  }
+
+  /**
+   * 当 getAvailableAccount 对某个 Requested_Model 返回 null 时调用，
+   * 按互斥优先级判定唯一原因 (R6.4)：
+   *   1. Eligible_Account_Set 为空 -> model_unsupported (R6.1)
+   *   2. 否则所有 eligible 账号都已配额耗尽 -> quota_exhausted (R6.2)
+   *   3. 否则 (尚有配额但都在 cooldown / 不可选) -> throttled (R6.3)
+   */
+  private async classifyNoAccountReason(
+    modelId: string | undefined, apiKeyId?: string, signal?: AbortSignal
+  ): Promise<NoAccountDiagnosis> {
+    this.throwIfAborted(signal)
+    const eligible = await this.buildEligibleSet(modelId, apiKeyId, signal)
+    const eligibleTotal = eligible.length
+
+    const now = Date.now()
+    let exhausted = 0
+    let cooldown = 0
+    for (const account of eligible) {
+      const isExhausted = this.accountPool.isQuotaExhausted(account, now)
+      if (isExhausted) {
+        exhausted++
+        continue
+      }
+      if (
+        !this.accountPool.isSuspended(account) &&
+        typeof account.cooldownUntil === 'number' &&
+        account.cooldownUntil > now
+      ) {
+        cooldown++
+      }
+    }
+
+    // 1. 没有任何账号支持该 model
+    if (eligibleTotal === 0) {
+      return {
+        reason: 'model_unsupported',
+        message: `Không có tài khoản nào hỗ trợ model "${modelId ?? ''}"`,
+        eligibleTotal,
+        exhausted,
+        cooldown
+      }
+    }
+
+    // 2. 所有 eligible 账号都已配额耗尽
+    if (exhausted === eligibleTotal) {
+      return {
+        reason: 'quota_exhausted',
+        message: `Tất cả tài khoản phù hợp đã hết quota (${exhausted}/${eligibleTotal})`,
+        eligibleTotal,
+        exhausted,
+        cooldown
+      }
+    }
+
+    // 3. 仍有账号有配额，但都在 cooldown / 超过等待阈值
+    return {
+      reason: 'throttled',
+      message: 'Tất cả tài khoản phù hợp đang bị giới hạn tốc độ, vui lòng thử lại sau',
+      eligibleTotal,
+      exhausted,
+      cooldown
+    }
+  }
+
+  private async getNextAccountForModel(excludeIds: Set<string> = new Set(), apiKeyId?: string, modelId?: string, signal?: AbortSignal): Promise<ProxyAccount | null> {
+    if (!modelId || !this.requiresModelCapabilitySelection(modelId)) {
+      return this.getNextAccountForRequest(excludeIds, apiKeyId)
+    }
+
+    const tried = new Set(excludeIds)
+    const total = Math.max(this.accountPool.size, 1)
+    for (let attempt = 0; attempt < total; attempt++) {
+      this.throwIfAborted(signal)
+      const account = this.getNextAccountForRequest(tried, apiKeyId)
+      if (!account || tried.has(account.id)) break
+      tried.add(account.id)
+      if (await this.isEligibleForModel(account, modelId, apiKeyId, signal)) {
+        const selectedAccount = this.accountPool.getAccount(account.id) || account
+        proxyLogger.info('ProxyServer', `Selected ${selectedAccount.email || selectedAccount.id.slice(0, 8)} for model ${modelId}`)
+        return selectedAccount
+      }
+      proxyLogger.info('ProxyServer', `Skipping ${account.email || account.id.slice(0, 8)} because model ${modelId} is not available`)
+    }
+
+    const cooldownWaitMs = await this.getCompatibleModelCooldownWaitMs(excludeIds, apiKeyId, modelId, signal)
+    if (cooldownWaitMs !== null && cooldownWaitMs <= this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS) {
+      const waitMs = Math.max(250, cooldownWaitMs + 100)
+      proxyLogger.info('ProxyServer', `Waiting ${waitMs}ms for a compatible ${modelId} account to leave cooldown`)
+      await this.waitForRetry(waitMs, signal)
+      return await this.getNextAccountForModel(excludeIds, apiKeyId, modelId, signal)
+    }
+
+    return null
+  }
+
+  private async getCompatibleModelCooldownWaitMs(excludeIds: Set<string>, apiKeyId: string | undefined, modelId: string, signal?: AbortSignal): Promise<number | null> {
+    const now = Date.now()
+    let best: number | null = null
+    for (const account of this.accountPool.getAllAccounts()) {
+      this.throwIfAborted(signal)
+      if (excludeIds.has(account.id)) continue
+      if (!this.isAccountAllowedForRequest(account, apiKeyId)) continue
+      if (this.accountPool.isSuspended(account) || this.accountPool.isQuotaExhausted(account, now)) continue
+      if (!account.cooldownUntil || account.cooldownUntil <= now) continue
+      if (account.isAvailable === false) continue
+      if (!await this.accountSupportsModel(account, modelId, signal)) continue
+      const waitMs = account.cooldownUntil - now
+      best = best === null ? waitMs : Math.min(best, waitMs)
+    }
+    return best
+  }
+
+  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string, modelId?: string): Promise<ProxyAccount | null> {
+    const isAllowed = (acc: ProxyAccount | null): boolean => this.isAccountAllowedForRequest(acc, apiKeyId)
+    const supportsRequestedModel = async (acc: ProxyAccount): Promise<boolean> => {
+      return !modelId || !this.requiresModelCapabilitySelection(modelId) || await this.accountSupportsModel(acc, modelId, signal)
     }
     this.throwIfAborted(signal)
     // 如果 pool 为空，触发懒加载回调尝试同步账号（冷启动场景）
@@ -1173,9 +1500,9 @@ export class ProxyServer {
     this.throwIfAborted(signal)
 
     // P1-8 会话粘性：优先复用已绑定的账号（同时受 API Key 绑定过滤）
-    if (this.config.sessionAffinityEnabled && sessionHint) {
+    if (this.isSessionAffinityActive() && sessionHint) {
       const sticky = this.pickAccountWithAffinity(sessionHint)
-      if (sticky && isAllowed(sticky)) {
+      if (sticky && isAllowed(sticky) && await supportsRequestedModel(sticky)) {
         proxyLogger.debug('ProxyServer', `Session affinity hit: ${sessionHint.slice(0, 16)} → ${sticky.email || sticky.id.slice(0, 8)}`)
         // 仍需检查 token 是否需要刷新
         if (this.isTokenExpiringSoon(sticky)) {
@@ -1192,16 +1519,7 @@ export class ProxyServer {
     let account: ProxyAccount | null
 
     if (this.config.enableMultiAccount) {
-      account = this.accountPool.getNextAccount()
-      if (account && !isAllowed(account)) {
-        // 尝试找一个允许的账号（白名单 + 分组都已合并进 isAllowed）
-        const allAccounts = this.accountPool.getAllAccounts()
-        const exclude = new Set<string>()
-        for (const a of allAccounts) {
-          if (!isAllowed(a)) exclude.add(a.id)
-        }
-        account = this.accountPool.getNextAccount(exclude)
-      }
+      account = await this.getNextAccountForModel(new Set(), apiKeyId, modelId, signal)
       if (!account) {
         const status = this.accountPool.getQuotaStatus()
         if (status.exhausted > 0 && status.available === 0) {
@@ -1246,7 +1564,7 @@ export class ProxyServer {
       if (!refreshed) {
         // 刷新失败，如果启用多账号才尝试获取下一个账号
         if (this.config.enableMultiAccount) {
-          return this.accountPool.getNextAccount()
+          return await this.getNextAccountForModel(new Set([account.id]), apiKeyId, modelId, signal)
         }
         return null
       }
@@ -1291,37 +1609,40 @@ export class ProxyServer {
     account: ProxyAccount,
     apiCall: (acc: ProxyAccount, endpointIndex: number) => Promise<T>,
     _path: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    apiKeyId?: string,
+    modelId?: string
   ): Promise<{ result: T; account: ProxyAccount }> {
-    const maxRetries = this.config.maxRetries || 3
+    const configuredRetries = Math.max(0, this.config.maxRetries ?? 3)
+    const maxAttempts = Math.min(100, Math.max(configuredRetries + 1, this.accountPool.size))
     const retryDelay = this.config.retryDelayMs || 1000
     let lastError: Error | null = null
     let currentAccount = account
-    let endpointIndex = 0
     // 本次请求累计已尝试的账号 ID，避免重试时循环命中已经失败过的账号
     const triedIds = new Set<string>([account.id])
     /** 切到下一个可用账号；多账号模式带 triedIds 排除，单账号场景退化为旧逻辑 */
-    const switchToNextAccount = (): ProxyAccount | null => {
+    const switchToNextAccount = async (): Promise<ProxyAccount | null> => {
       if (this.config.enableMultiAccount) {
-        return this.accountPool.getNextAccount(triedIds)
+        return await this.getNextAccountForModel(triedIds, apiKeyId, modelId, signal)
       }
       if (this.config.autoSwitchOnQuotaExhausted) {
-        return this.accountPool.getNextAvailableAccount(triedIds)
+        const next = this.accountPool.getNextAvailableAccount(triedIds)
+        return this.isAccountAllowedForRequest(next, apiKeyId) ? next : null
       }
       return null
     }
 
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       this.throwIfAborted(signal)
       try {
-        const result = await apiCall(currentAccount, endpointIndex)
+        const result = await this.runWithModelPacing(currentAccount, modelId, signal, () => apiCall(currentAccount, 0))
         return { result, account: currentAccount }
       } catch (error) {
         if (this.isAbortError(error, signal)) throw error
         lastError = error as Error
         const errMsg = lastError.message || ''
 
-        console.log(`[ProxyServer] API call failed (attempt ${attempt + 1}/${maxRetries}): ${errMsg}`)
+        console.log(`[ProxyServer] API call failed (attempt ${attempt + 1}/${maxAttempts}, account=${currentAccount.email || currentAccount.id.slice(0, 8)}): ${errMsg}`)
 
         // 优先检测账号被长期封禁（不是 token 问题，刷新也没用）
         // 特征：HTTP 403 + reason: "TEMPORARILY_SUSPENDED" 或 AccountSuspendedException / 423
@@ -1355,7 +1676,7 @@ export class ProxyServer {
           }
           console.warn(`[ProxyServer] Account ${currentAccount.email || currentAccount.id} suspended (${suspendInfo.reason}), switching to next available account`)
           // 切到下个可用账号（跳过被 suspended 的 + 本请求已试过的）
-          const nextAccount = switchToNextAccount()
+          const nextAccount = await switchToNextAccount()
           if (nextAccount && !triedIds.has(nextAccount.id)) {
             currentAccount = nextAccount
             triedIds.add(nextAccount.id)
@@ -1369,7 +1690,59 @@ export class ProxyServer {
           break
         }
 
+        if (isThrottleError(errMsg)) {
+          console.log(`[ProxyServer] Throttle error on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
+          this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
+          ;(lastError as ProxyAttemptError).proxyFailureRecorded = true
+          const nextAccount = await switchToNextAccount()
+          if (nextAccount && !triedIds.has(nextAccount.id)) {
+            currentAccount = nextAccount
+            triedIds.add(nextAccount.id)
+            continue
+          }
+          if (attempt < configuredRetries) {
+            const cooledAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+            const cooldownWaitMs = cooledAccount.cooldownUntil && cooledAccount.cooldownUntil > Date.now()
+              ? cooledAccount.cooldownUntil - Date.now()
+              : retryDelay * (attempt + 1)
+            const waitMs = Math.min(this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS, Math.max(1000, cooldownWaitMs + 100))
+            proxyLogger.info('ProxyServer', `No alternate ${modelId || 'model'} account after throttle; waiting ${waitMs}ms before retrying ${cooledAccount.email || cooledAccount.id.slice(0, 8)}`)
+            await this.waitForRetry(waitMs, signal)
+            currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+            continue
+          }
+          break
+        }
+
+        if (isBillingOrQuotaError(errMsg)) {
+          console.log(`[ProxyServer] Billing/quota exhausted on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account immediately`)
+          this.accountPool.markQuotaExhausted(currentAccount.id)
+          ;(lastError as ProxyAttemptError).proxyFailureRecorded = true
+          const nextAccount = await switchToNextAccount()
+          if (nextAccount && !triedIds.has(nextAccount.id)) {
+            currentAccount = nextAccount
+            triedIds.add(nextAccount.id)
+            if (!this.config.enableMultiAccount) {
+              this.config.selectedAccountIds = [nextAccount.id]
+              this.events.onAccountUpdate?.(nextAccount)
+            }
+            continue
+          }
+          break
+        }
+
         // 401/403: 尝试刷新 Token
+        if (this.isInvalidModelForAccountError(errMsg)) {
+          console.log(`[ProxyServer] Model not available on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
+          const nextAccount = await switchToNextAccount()
+          if (nextAccount && !triedIds.has(nextAccount.id)) {
+            currentAccount = nextAccount
+            triedIds.add(nextAccount.id)
+            continue
+          }
+          break
+        }
+
         if (errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('Auth')) {
           console.log('[ProxyServer] Auth error, attempting token refresh')
           const refreshed = await this.refreshToken(currentAccount, signal)
@@ -1378,7 +1751,7 @@ export class ProxyServer {
             continue
           }
           // 刷新失败 → 切到没试过的下个账号
-          const nextAccount = switchToNextAccount()
+          const nextAccount = await switchToNextAccount()
           if (nextAccount && !triedIds.has(nextAccount.id)) {
             currentAccount = nextAccount
             triedIds.add(nextAccount.id)
@@ -1386,34 +1759,14 @@ export class ProxyServer {
           }
         }
 
-        // 402/429: 额度耗尽，切换端点或账号
-        if (errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') || errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') || errMsg.includes('rate limit')) {
-          console.log('[ProxyServer] Quota/throttle error, switching endpoint or account')
-          this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
-          endpointIndex = (endpointIndex + 1) % 2 // 切换端点
-          if (endpointIndex === 0) {
-            // 已尝试所有端点，切换到没试过的下个账号
-            const nextAccount = switchToNextAccount()
-            if (nextAccount && !triedIds.has(nextAccount.id)) {
-              console.log(`[ProxyServer] Auto-switching to ${nextAccount.email || nextAccount.id.slice(0, 8)} due to quota exhausted`)
-              currentAccount = nextAccount
-              triedIds.add(nextAccount.id)
-              if (!this.config.enableMultiAccount) {
-                this.config.selectedAccountIds = [nextAccount.id]
-                this.events.onAccountUpdate?.(nextAccount)
-              }
-            }
-          }
-          continue
-        }
-
         // 5xx: 同账号短退避重试一次；再次 5xx 直接 fallback 到没试过的账号（瞬时故障跨账号绕过）
         if (errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504')) {
           console.log('[ProxyServer] Server error, retrying')
           // 第二次及以后的 5xx → 切换账号（旧逻辑会同账号撞死）
           if (attempt > 0) {
-            const nextAccount = switchToNextAccount()
+            const nextAccount = await switchToNextAccount()
             if (nextAccount && !triedIds.has(nextAccount.id)) {
+              this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 503)
               console.log(`[ProxyServer] Persistent 5xx on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
               currentAccount = nextAccount
               triedIds.add(nextAccount.id)
@@ -1429,7 +1782,158 @@ export class ProxyServer {
       }
     }
 
-    throw lastError || new Error('Unknown error')
+    const finalError = (lastError || new Error('Unknown error')) as ProxyAttemptError
+    finalError.proxyAccountId = currentAccount.id
+    throw finalError
+  }
+
+  private recordAccountFailure(account: ProxyAccount, error: Error): void {
+    const message = error.message || ''
+    const statusMatch = message.match(/\b(\d{3})\b/)
+    const statusCode = statusMatch ? Number(statusMatch[1]) : undefined
+    if (isThrottleError(message)) {
+      this.accountPool.recordError(account.id, ErrorType.RECOVERABLE, 429)
+      return
+    }
+    if (isBillingOrQuotaError(message)) {
+      if (!this.accountPool.isQuotaExhausted(account)) this.accountPool.markQuotaExhausted(account.id)
+      return
+    }
+    this.accountPool.recordError(
+      account.id,
+      statusCode && statusCode >= 500 ? ErrorType.RECOVERABLE : classifyError(statusCode || 500, message),
+      statusCode
+    )
+  }
+
+  private recordAccountSuccess(account: ProxyAccount, usage: KiroUsage): ProxyAccount {
+    const updated = this.accountPool.recordSuccess(
+      account.id,
+      usage.inputTokens + usage.outputTokens,
+      usage.credits || 0
+    )
+    if (updated) {
+      this.events.onAccountUpdate?.(updated)
+      return updated
+    }
+    return account
+  }
+
+  private isInvalidModelForAccountError(message: string): boolean {
+    return /invalid_model_id|invalid model id|please select a different model/i.test(message)
+  }
+
+  /**
+   * Retry streaming requests before the first client-visible chunk. Once a
+   * chunk is emitted the stream is committed and cannot safely change account.
+   */
+  private async callStreamWithFailover(
+    initialAccount: ProxyAccount,
+    payload: KiroPayload,
+    onChunk: (account: ProxyAccount, text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void,
+    onComplete: (account: ProxyAccount, usage: KiroUsage) => void,
+    onError: (account: ProxyAccount, error: Error) => void,
+    path: string,
+    signal?: AbortSignal,
+    apiKeyId?: string,
+    modelId?: string
+  ): Promise<void> {
+    const configuredRetries = Math.max(0, this.config.maxRetries ?? 3)
+    const maxAttempts = Math.min(100, Math.max(configuredRetries + 1, this.accountPool.size))
+    const triedIds = new Set<string>([initialAccount.id])
+    let currentAccount = initialAccount
+    let streamCommitted = false
+    let lastError = new Error('Unknown stream error')
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      this.throwIfAborted(signal)
+      const outcome = await this.runWithModelPacing(currentAccount, modelId, signal, () => new Promise<{ completed: boolean; error?: Error }>((resolve) => {
+        callKiroApiStream(
+          currentAccount,
+          payload,
+          (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
+            streamCommitted = true
+            onChunk(currentAccount, text, toolUse, isThinking, reasoningSignature, redactedContent)
+          },
+          (usage) => {
+            streamCommitted = true
+            onComplete(currentAccount, usage)
+            resolve({ completed: true })
+          },
+          (error) => resolve({ completed: false, error }),
+          signal,
+          this.config.preferredEndpoint
+        ).catch((error) => resolve({ completed: false, error: error as Error }))
+      }))
+
+      if (outcome.completed) return
+      if (this.isAbortError(outcome.error, signal)) throw outcome.error
+      lastError = outcome.error || lastError
+
+      if (streamCommitted) {
+        this.recordAccountFailure(currentAccount, lastError)
+        onError(currentAccount, lastError)
+        return
+      }
+
+      const message = lastError.message || ''
+      const invalidModelError = this.isInvalidModelForAccountError(message)
+      const suspendInfo = this.detectSuspendedError(message)
+      if (suspendInfo) {
+        const newlyMarked = this.accountPool.markSuspended(currentAccount.id, suspendInfo.reason, suspendInfo.message)
+        if (newlyMarked) {
+          this.events.onAccountSuspended?.({
+            accountId: currentAccount.id,
+            email: currentAccount.email,
+            reason: suspendInfo.reason,
+            message: suspendInfo.message
+          })
+        }
+      } else if (isBillingOrQuotaError(message) || isThrottleError(message) || /\b5\d\d\b/.test(message)) {
+        this.recordAccountFailure(currentAccount, lastError)
+      } else if (message.includes('401') || message.includes('403') || message.includes('Auth')) {
+        const refreshed = await this.refreshToken(currentAccount, signal)
+        if (refreshed) {
+          currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+          continue
+        }
+      } else if (invalidModelError) {
+        proxyLogger.info('ProxyServer', `Streaming model not available on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
+      } else {
+        this.recordAccountFailure(currentAccount, lastError)
+      }
+
+      const retryable = Boolean(suspendInfo)
+        || isBillingOrQuotaError(message)
+        || isThrottleError(message)
+        || message.includes('401')
+        || message.includes('403')
+        || message.includes('Auth')
+        || invalidModelError
+        || /\b5\d\d\b/.test(message)
+      if (!retryable) break
+
+      const nextAccount = await this.getNextAccountForModel(triedIds, apiKeyId, modelId, signal)
+      if (!nextAccount || triedIds.has(nextAccount.id)) {
+        if (isThrottleError(message) && attempt < configuredRetries) {
+          const cooledAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+          const cooldownWaitMs = cooledAccount.cooldownUntil && cooledAccount.cooldownUntil > Date.now()
+            ? cooledAccount.cooldownUntil - Date.now()
+            : (this.config.retryDelayMs || 1000) * (attempt + 1)
+          const waitMs = Math.min(this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS, Math.max(1000, cooldownWaitMs + 100))
+          proxyLogger.info('ProxyServer', `No alternate streaming ${modelId || 'model'} account after throttle; waiting ${waitMs}ms before retrying ${cooledAccount.email || cooledAccount.id.slice(0, 8)}`)
+          await this.waitForRetry(waitMs, signal)
+          currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+          continue
+        }
+        break
+      }
+      console.log(`[ProxyServer] Streaming failover ${path}: ${currentAccount.email || currentAccount.id.slice(0, 8)} -> ${nextAccount.email || nextAccount.id.slice(0, 8)}`)
+      currentAccount = nextAccount
+      triedIds.add(nextAccount.id)
+    }
+
+    onError(currentAccount, lastError)
   }
 
   /**
@@ -1671,6 +2175,32 @@ export class ProxyServer {
   }
 
   // 应用模型映射
+  private pickWeightedRoundRobinModel(rule: NonNullable<ProxyConfig['modelMappings']>[number], targets: string[], requestedModel: string, apiKeyId?: string): string {
+    const weights = targets.map((_, index) => {
+      const raw = rule.weights?.[index]
+      return Number.isFinite(raw) && raw && raw > 0 ? Math.min(50, Math.floor(raw)) : 1
+    })
+    const expandedTargets: string[] = []
+    targets.forEach((target, index) => {
+      for (let i = 0; i < weights[index]; i++) expandedTargets.push(target)
+    })
+
+    if (expandedTargets.length === 0) return targets[0]
+
+    const key = [
+      rule.id,
+      rule.name,
+      requestedModel.toLowerCase(),
+      apiKeyId || '*',
+      targets.join('|'),
+      weights.join(',')
+    ].join('::')
+    const index = this.modelLoadBalanceState.get(key) || 0
+    const target = expandedTargets[index % expandedTargets.length]
+    this.modelLoadBalanceState.set(key, (index + 1) % expandedTargets.length)
+    return target
+  }
+
   private applyModelMapping(requestedModel: string, apiKeyId?: string): string {
     const mappings = this.config.modelMappings
     if (!mappings || mappings.length === 0) return requestedModel
@@ -1699,19 +2229,8 @@ export class ProxyServer {
       let targetModel: string
 
       if (rule.type === 'loadbalance' && validTargets.length > 1) {
-        // 负载均衡：根据权重随机选择
-        const weights = rule.weights || validTargets.map(() => 1)
-        const totalWeight = weights.reduce((a, b) => a + b, 0)
-        let random = Math.random() * totalWeight
-        let selectedIndex = 0
-        for (let i = 0; i < weights.length; i++) {
-          random -= weights[i]
-          if (random <= 0) {
-            selectedIndex = i
-            break
-          }
-        }
-        targetModel = validTargets[selectedIndex]
+        // 负载均衡：根据权重轮询，低流量下也能均匀分配
+        targetModel = this.pickWeightedRoundRobinModel(rule, validTargets, requestedModel, apiKeyId)
       } else {
         // replace 或 alias：直接使用第一个目标
         targetModel = validTargets[0]
@@ -1990,7 +2509,7 @@ export class ProxyServer {
       'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
-      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog'
+      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'strictTierRouting'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
     ]
@@ -2176,7 +2695,7 @@ export class ProxyServer {
     const startTime = Date.now()
     this.recordNewRequest()
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal)
+    const account = await this.getAvailableAccount(signal, undefined, matchedApiKey?.id, modelId)
     this.throwIfAborted(signal)
     if (!account) {
       this.sendError(res, 503, 'No available accounts')
@@ -2188,24 +2707,30 @@ export class ProxyServer {
       const kiroPayload = openaiToKiro(openaiRequest, account.profileArn, toolNameRegistry)
 
       if (isStream) {
-        // SSE 流式
-        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+        let streamStarted = false
+        const ensureStreamStarted = (): void => {
+          if (streamStarted) return
+          res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+          streamStarted = true
+        }
         return new Promise<void>((resolve) => {
-          callKiroApiStream(
-            account as ProxyAccount,
+          this.callStreamWithFailover(
+            account,
             kiroPayload,
-            (text) => {
+            (_usedAccount, text) => {
               if (signal?.aborted || this.isResponseClosed(res)) return
               if (text) {
+                ensureStreamStarted()
                 const chunk = { candidates: [{ content: { parts: [{ text }], role: 'model' }, finishReason: null }] }
                 res.write(`data: ${JSON.stringify(chunk)}\n\n`)
               }
             },
-            (usage) => {
+            (usedAccount, usage) => {
               if (signal?.aborted || this.isResponseClosed(res)) {
                 resolve()
                 return
               }
+              ensureStreamStarted()
               const finalChunk = { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: usage.inputTokens, candidatesTokenCount: usage.outputTokens, totalTokenCount: usage.inputTokens + usage.outputTokens } }
               res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
               res.end()
@@ -2214,21 +2739,24 @@ export class ProxyServer {
               this.stats.inputTokens += usage.inputTokens
               this.stats.outputTokens += usage.outputTokens
               this.stats.totalCredits += usage.credits || 0
-              this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
+              this.recordAccountSuccess(usedAccount, usage)
               resolve()
             },
-            (error) => {
+            (_usedAccount, error) => {
               if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
                 resolve()
                 return
               }
+              ensureStreamStarted()
               res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
               res.end()
               this.recordRequestFailed()
               resolve()
             },
+            '/v1beta',
             signal,
-            this.config.preferredEndpoint
+            matchedApiKey?.id,
+            modelId
           ).catch(error => {
             if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
               res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
@@ -2239,11 +2767,21 @@ export class ProxyServer {
           })
         })
       } else {
-        // 非流式
-        const result = await callKiroApi(account as ProxyAccount, kiroPayload, signal)
+        const { result, account: usedAccount } = await this.callWithRetry(
+          account,
+          async (acc) => callKiroApi(acc, openaiToKiro(openaiRequest, acc.profileArn, toolNameRegistry), signal),
+          '/v1beta',
+          signal,
+          matchedApiKey?.id,
+          modelId
+        )
         this.throwIfResponseClosed(res, signal)
         this.recordRequestSuccess()
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
+        this.stats.inputTokens += result.usage.inputTokens
+        this.stats.outputTokens += result.usage.outputTokens
+        this.stats.totalCredits += result.usage.credits || 0
+        this.recordAccountSuccess(usedAccount, result.usage)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({
           candidates: [{ content: { parts: [{ text: result.content }], role: 'model' }, finishReason: 'STOP' }],
@@ -2265,11 +2803,8 @@ export class ProxyServer {
     
     // Kiro 官方模型（与 UI 保持一致）
     const kiroOfficialModels = [
-      buildClientModel({ id: 'auto', created: now, ownedBy: 'kiro-api', description: 'Auto select best model' }),
-      buildClientModel({ id: 'claude-sonnet-4.5', created: now, ownedBy: 'kiro-api', description: 'The latest Claude Sonnet model' }),
-      buildClientModel({ id: 'claude-sonnet-4', created: now, ownedBy: 'kiro-api', description: 'Hybrid reasoning and coding' }),
-      buildClientModel({ id: 'claude-haiku-4.5', created: now, ownedBy: 'kiro-api', description: 'The latest Claude Haiku model' }),
-      buildClientModel({ id: 'claude-opus-4.5', created: now, ownedBy: 'kiro-api', description: 'The most powerful model' })
+      ...KIRO_PROXY_MODEL_PRESETS.map(model => buildKiroPresetClientModel(model, now)),
+      buildClientModel({ id: 'auto', created: now, ownedBy: 'kiro-api', description: 'Auto select best model' })
     ]
 
     // 隐藏模型（未在官方 ListAvailableModels 中返回，但后端可能支持）
@@ -2356,12 +2891,10 @@ export class ProxyServer {
     }
     
     // 3. 动态模型缺失时才添加静态兜底
-    if (dynamicModels.length === 0) {
-      for (const m of [...kiroOfficialModels, ...presetModels]) {
-        if (!modelIds.has(m.id)) {
-          modelIds.add(m.id)
-          allModels.push(m)
-        }
+    for (const m of [...kiroOfficialModels, ...presetModels]) {
+      if (!modelIds.has(m.id)) {
+        modelIds.add(m.id)
+        allModels.push(m)
       }
     }
 
@@ -2408,17 +2941,14 @@ export class ProxyServer {
 
     // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHintChat, matchedApiKey?.id)
+    const account = await this.getAvailableAccount(signal, affinityHintChat, matchedApiKey?.id, request.model)
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
-      const quotaStatus = this.accountPool.getQuotaStatus()
-      const errorMsg = quotaStatus.exhausted > 0 && quotaStatus.available === 0
-        ? `All accounts quota exhausted (${quotaStatus.exhausted}/${quotaStatus.total} exhausted, ${quotaStatus.cooldown} in cooldown)`
-        : 'No available accounts'
-      this.sendError(res, 503, errorMsg)
-      this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 503, error: errorMsg })
-      this.recordRequest({ path: '/v1/chat/completions', model: request.model, success: false, error: errorMsg })
+      const diag = await this.classifyNoAccountReason(request.model, matchedApiKey?.id, signal)
+      this.sendError(res, 503, diag.message)
+      this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 503, error: diag.reason })
+      this.recordRequest({ path: '/v1/chat/completions', model: request.model, success: false, error: diag.reason })
       return
     }
 
@@ -2461,7 +2991,9 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/chat/completions',
-          signal
+          signal,
+          matchedApiKey?.id,
+          request.model
         )
         const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
@@ -2470,7 +3002,7 @@ export class ProxyServer {
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
         this.stats.inputTokens += result.usage.inputTokens
         this.stats.outputTokens += result.usage.outputTokens
-        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        this.recordAccountSuccess(usedAccount, result.usage)
 
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
@@ -2522,17 +3054,14 @@ export class ProxyServer {
     }
 
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHintResp, matchedApiKey?.id)
+    const account = await this.getAvailableAccount(signal, affinityHintResp, matchedApiKey?.id, chatRequest.model)
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
-      const quotaStatus = this.accountPool.getQuotaStatus()
-      const errorMsg = quotaStatus.exhausted > 0 && quotaStatus.available === 0
-        ? `All accounts quota exhausted (${quotaStatus.exhausted}/${quotaStatus.total} exhausted, ${quotaStatus.cooldown} in cooldown)`
-        : 'No available accounts'
-      this.sendError(res, 503, errorMsg)
-      this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 503, error: errorMsg })
-      this.recordRequest({ path: '/v1/responses', model: chatRequest.model, success: false, error: 'No available accounts' })
+      const diag = await this.classifyNoAccountReason(chatRequest.model, matchedApiKey?.id, signal)
+      this.sendError(res, 503, diag.message)
+      this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 503, error: diag.reason })
+      this.recordRequest({ path: '/v1/responses', model: chatRequest.model, success: false, error: diag.reason })
       return
     }
 
@@ -2555,7 +3084,9 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/responses',
-          signal
+          signal,
+          matchedApiKey?.id,
+          chatRequest.model
         )
         const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
         this.throwIfResponseClosed(res, signal)
@@ -2590,7 +3121,7 @@ export class ProxyServer {
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
         this.stats.inputTokens += result.usage.inputTokens
         this.stats.outputTokens += result.usage.outputTokens
-        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        this.recordAccountSuccess(usedAccount, result.usage)
         const respTime = Date.now() - startTime
         this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
         this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
@@ -2607,7 +3138,9 @@ export class ProxyServer {
           return callKiroApi(acc, retryPayload, signal)
         },
         '/v1/responses',
-        signal
+        signal,
+        matchedApiKey?.id,
+        chatRequest.model
       )
       const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
       this.throwIfResponseClosed(res, signal)
@@ -2617,7 +3150,7 @@ export class ProxyServer {
       this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
       this.stats.inputTokens += result.usage.inputTokens
       this.stats.outputTokens += result.usage.outputTokens
-      this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+      this.recordAccountSuccess(usedAccount, result.usage)
 
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(response))
@@ -2635,7 +3168,7 @@ export class ProxyServer {
   // 处理 OpenAI 流式响应
   private async handleOpenAIStream(
     res: http.ServerResponse,
-    account: { id: string; accessToken: string; profileArn?: string },
+    account: ProxyAccount,
     kiroPayload: ReturnType<typeof openaiToKiro>,
     model: string,
     startTime: number,
@@ -2646,30 +3179,32 @@ export class ProxyServer {
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
     signal?: AbortSignal
   ): Promise<void> {
-    if (!headersSent) {
+    const id = streamId || `chatcmpl-${uuidv4()}`
+    let toolCallIndex = 0
+    const pendingToolCalls: Map<string, { index: number; name: string; arguments: string }> = new Map()
+    let collectedContent = ''
+    let streamStarted = headersSent
+    const ensureStreamStarted = (): void => {
+      if (streamStarted) return
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive'
       })
-    }
-
-    const id = streamId || `chatcmpl-${uuidv4()}`
-    let toolCallIndex = 0
-    const pendingToolCalls: Map<string, { index: number; name: string; arguments: string }> = new Map()
-    let collectedContent = ''
-    // 发送初始 chunk（仅首轮）
-    if (currentRound === 0) {
-      const initialChunk = createOpenaiStreamChunk(id, model, { role: 'assistant' })
-      res.write(`data: ${JSON.stringify(initialChunk)}\n\n`)
+      if (currentRound === 0) {
+        const initialChunk = createOpenaiStreamChunk(id, model, { role: 'assistant' })
+        res.write(`data: ${JSON.stringify(initialChunk)}\n\n`)
+      }
+      streamStarted = true
     }
 
     return new Promise((resolve) => {
-      callKiroApiStream(
-        account as any,
+      this.callStreamWithFailover(
+        account,
         kiroPayload,
-        (text, toolUse, isThinking) => {
+        (_usedAccount, text, toolUse, isThinking) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
+          ensureStreamStarted()
           if (text && text.trim()) {
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 reasoning_content
@@ -2704,11 +3239,12 @@ export class ProxyServer {
             res.write(`data: ${JSON.stringify(toolChunk)}\n\n`)
           }
         },
-        async (usage) => {
+        async (usedAccount, usage) => {
           if (signal?.aborted || this.isResponseClosed(res)) {
             resolve()
             return
           }
+          ensureStreamStarted()
           
           this.recordRequestSuccess()
           this.stats.totalTokens += usage.inputTokens + usage.outputTokens
@@ -2720,10 +3256,10 @@ export class ProxyServer {
           this.stats.totalCredits += usage.credits || 0
           this.events.onCreditsUpdate?.(this.stats.totalCredits)
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
-          this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
+          this.recordAccountSuccess(usedAccount, usage)
           const oaiRespTime = Date.now() - startTime
           this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: oaiRespTime })
-          this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
+          this.recordRequest({ path: '/v1/chat/completions', model, accountId: usedAccount.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
             this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions')
@@ -2757,24 +3293,25 @@ export class ProxyServer {
           res.end()
           resolve()
         },
-        (error) => {
+        (usedAccount, error) => {
           if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
             resolve()
             return
           }
+          ensureStreamStarted()
           console.error('[ProxyServer] Stream error:', error)
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
           this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 500, error: error.message })
-          this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
+          this.recordRequest({ path: '/v1/chat/completions', model, accountId: usedAccount.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
         },
+        '/v1/chat/completions',
         signal,
-        this.config.preferredEndpoint
+        matchedApiKey?.id,
+        model
       ).catch(error => {
         if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
@@ -2825,17 +3362,14 @@ export class ProxyServer {
 
     // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id)
+    const account = await this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, request.model)
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
-      const quotaStatus = this.accountPool.getQuotaStatus()
-      const errorMsg = quotaStatus.exhausted > 0 && quotaStatus.available === 0
-        ? `All accounts quota exhausted (${quotaStatus.exhausted}/${quotaStatus.total} exhausted, ${quotaStatus.cooldown} in cooldown)`
-        : 'No available accounts'
-      this.sendError(res, 503, errorMsg, 'anthropic')
-      this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 503, error: errorMsg })
-      this.recordRequest({ path: '/v1/messages', model: request.model, success: false, error: errorMsg })
+      const diag = await this.classifyNoAccountReason(request.model, matchedApiKey?.id, signal)
+      this.sendError(res, 503, diag.message, 'anthropic')
+      this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 503, error: diag.reason })
+      this.recordRequest({ path: '/v1/messages', model: request.model, success: false, error: diag.reason })
       return
     }
 
@@ -2893,7 +3427,9 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/messages',
-          signal
+          signal,
+          matchedApiKey?.id,
+          request.model
         )
         const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
@@ -2909,7 +3445,7 @@ export class ProxyServer {
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
         this.stats.inputTokens += result.usage.inputTokens
         this.stats.outputTokens += result.usage.outputTokens
-        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        this.recordAccountSuccess(usedAccount, result.usage)
 
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
@@ -2925,7 +3461,7 @@ export class ProxyServer {
   // 处理 Claude 流式响应
   private async handleClaudeStream(
     res: http.ServerResponse,
-    account: { id: string; accessToken: string; profileArn?: string },
+    account: ProxyAccount,
     kiroPayload: ReturnType<typeof claudeToKiro>,
     model: string,
     startTime: number,
@@ -2938,14 +3474,6 @@ export class ProxyServer {
     signal?: AbortSignal,
     simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string }
   ): Promise<void> {
-    if (!headersSent) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      })
-    }
-
     const id = msgId || `msg_${uuidv4()}`
     let currentBlockIndex = contentBlockIndex
     let hasStartedTextBlock = false
@@ -2966,30 +3494,39 @@ export class ProxyServer {
 
     // 估算输入 tokens（基于 payload 大小）
     const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length / 3))
-    
-    // 发送 message_start（仅首轮）
-    if (currentRound === 0) {
-      const messageStart = createClaudeStreamEvent('message_start', {
-        message: {
-          id,
-          type: 'message',
-          role: 'assistant',
-          content: [],
-          model,
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: estimatedInputTokens, output_tokens: 0 }
-        }
+    let streamStarted = headersSent
+    const ensureStreamStarted = (): void => {
+      if (streamStarted) return
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
       })
-      res.write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`)
+      if (currentRound === 0) {
+        const messageStart = createClaudeStreamEvent('message_start', {
+          message: {
+            id,
+            type: 'message',
+            role: 'assistant',
+            content: [],
+            model,
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: estimatedInputTokens, output_tokens: 0 }
+          }
+        })
+        res.write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`)
+      }
+      streamStarted = true
     }
 
     return new Promise((resolve) => {
-      callKiroApiStream(
-        account as any,
+      this.callStreamWithFailover(
+        account,
         kiroPayload,
-        (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
+        (_usedAccount, text, toolUse, isThinking, reasoningSignature, redactedContent) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
+          ensureStreamStarted()
           // 优先处理 redacted_thinking（加密的 thinking 块，需单独 content_block）
           if (redactedContent) {
             if (hasStartedTextBlock) {
@@ -3111,11 +3648,12 @@ export class ProxyServer {
             currentBlockIndex++
           }
         },
-        async (usage) => {
+        async (usedAccount, usage) => {
           if (signal?.aborted || this.isResponseClosed(res)) {
             resolve()
             return
           }
+          ensureStreamStarted()
           if (hasStartedThinkingBlock) {
             flushThinkingSignature()
             const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
@@ -3138,21 +3676,21 @@ export class ProxyServer {
           this.stats.totalCredits += usage.credits || 0
           this.events.onCreditsUpdate?.(this.stats.totalCredits)
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
-          this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
+          this.recordAccountSuccess(usedAccount, usage)
           this.stats.cacheReadTokens += usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens || 0
           this.stats.cacheWriteTokens += usage.cacheWriteTokens || simulatedCacheUsage?.cacheCreationInputTokens || 0
           this.stats.reasoningTokens += usage.reasoningTokens || 0
           const respTime = Date.now() - startTime
           this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime })
-          this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
+          this.recordRequest({ path: '/v1/messages', model, accountId: usedAccount.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
             this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages')
           }
 
           // 成功后更新 prompt cache tracker
-          if (simulatedCacheUsage?.cacheProfile && simulatedCacheUsage?.accountId) {
-            promptCacheTracker.update(simulatedCacheUsage.accountId, simulatedCacheUsage.cacheProfile as any)
+          if (simulatedCacheUsage?.cacheProfile) {
+            promptCacheTracker.update(usedAccount.id, simulatedCacheUsage.cacheProfile as any)
           }
           // 发送 message_delta（包含完整 usage 信息）
           const hasToolCalls = pendingToolCalls.size > 0
@@ -3168,11 +3706,12 @@ export class ProxyServer {
           res.end()
           resolve()
         },
-        (error) => {
+        (usedAccount, error) => {
           if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
             resolve()
             return
           }
+          ensureStreamStarted()
           console.error('[ProxyServer] Stream error:', error)
           const errorEvent = createClaudeStreamEvent('error', {
             error: { type: 'api_error', message: error.message }
@@ -3181,14 +3720,14 @@ export class ProxyServer {
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
           this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
-          this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
+          this.recordRequest({ path: '/v1/messages', model, accountId: usedAccount.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
         },
+        '/v1/messages',
         signal,
-        this.config.preferredEndpoint
+        matchedApiKey?.id,
+        model
       ).catch(error => {
         if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
           const errorEvent = createClaudeStreamEvent('error', {
@@ -3204,17 +3743,22 @@ export class ProxyServer {
   }
 
   // 处理 API 错误
-  private handleApiError(res: http.ServerResponse, account: { id: string }, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
+  private handleApiError(res: http.ServerResponse, account: ProxyAccount, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
     if (this.isAbortError(error, signal) || this.isResponseClosed(res)) return
     this.recordRequestFailed()
+    const attemptError = error as ProxyAttemptError
+    const failedAccount = attemptError.proxyAccountId
+      ? this.accountPool.getAccount(attemptError.proxyAccountId) || account
+      : account
     const errCode = error.message.match(/(\d{3})/)?.[1]
     const parsedCode = errCode ? parseInt(errCode) : 500
-    const errorType = classifyError(parsedCode)
     const isAuthError = error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth')
 
-    this.accountPool.recordError(account.id, errorType, parsedCode)
+    if (!attemptError.proxyFailureRecorded) this.recordAccountFailure(failedAccount, error)
 
     let statusCode = parsedCode
+    if (isBillingOrQuotaError(error.message)) statusCode = 402
+    else if (isThrottleError(error.message)) statusCode = 429
     if (isAuthError) statusCode = 401
 
     if (res.headersSent) {
@@ -3225,13 +3769,13 @@ export class ProxyServer {
         res.end()
       }
       this.events.onResponse?.({ path, status: statusCode, error: error.message })
-      this.recordRequest({ path, model, accountId: account.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: error.message })
+      this.recordRequest({ path, model, accountId: failedAccount.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: error.message })
       return
     }
 
     this.sendError(res, statusCode, error.message, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
     this.events.onResponse?.({ path, status: statusCode, error: error.message })
-    this.recordRequest({ path, model, accountId: account.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: error.message })
+    this.recordRequest({ path, model, accountId: failedAccount.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: error.message })
   }
 
   // 读取请求体
@@ -3387,12 +3931,12 @@ export class ProxyServer {
    * 实现方式：用 sessionHint hash 索引到固定账号；账号失效时自动失效粘性
    */
   private pickAccountWithAffinity(sessionHint: string | undefined): ProxyAccount | null {
-    if (!this.config.sessionAffinityEnabled || !sessionHint) return null
+    if (!this.isSessionAffinityActive() || !sessionHint) return null
     const entry = this.sessionAffinity.get(sessionHint)
     if (entry) {
       const account = this.accountPool.getAccount(entry.accountId)
-      // 校验账号仍可用且未被封禁
-      if (account && !this.accountPool.isSuspended(account) && account.isAvailable !== false) {
+      // 校验账号仍可用，避免 affinity 把请求送回耗尽/冷却/封禁账号。
+      if (account && this.accountPool.isAccountAvailable(account)) {
         entry.lastAt = Date.now()
         return account
       }
@@ -3404,7 +3948,7 @@ export class ProxyServer {
 
   /** 记录粘性映射 */
   private rememberAffinity(sessionHint: string | undefined, accountId: string): void {
-    if (!this.config.sessionAffinityEnabled || !sessionHint) return
+    if (!this.isSessionAffinityActive() || !sessionHint) return
     this.sessionAffinity.set(sessionHint, { accountId, lastAt: Date.now() })
   }
 

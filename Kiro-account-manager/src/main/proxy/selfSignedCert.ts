@@ -75,7 +75,7 @@ export function ensureProxySelfSignedCert(
 
   const subject = [
     { name: 'commonName', value: 'Kiro Reverse Proxy' },
-    { name: 'organizationName', value: 'Kiro Account Manager' },
+    { name: 'organizationName', value: 'Krouter' },
     { name: 'countryName', value: 'CN' }
   ]
   cert.setSubject(subject)

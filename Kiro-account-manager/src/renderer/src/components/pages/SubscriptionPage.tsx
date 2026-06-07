@@ -24,7 +24,7 @@ import {
   ListChecks,
   X
 } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, randomUuid } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
 
 /**
@@ -426,7 +426,7 @@ export function SubscriptionPage() {
       existingUrls.add(url)
       seq++
       added.push({
-        accountId: `import-${crypto.randomUUID()}`,
+        accountId: `import-${randomUuid()}`,
         email: email || (isEn ? `(Imported #${seq})` : `(导入 #${seq})`),
         status: 'success',
         url,

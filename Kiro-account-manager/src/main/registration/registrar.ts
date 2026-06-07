@@ -13,11 +13,12 @@ import {
   getNestedMap, getNestedStringMap
 } from './http-utils'
 import {
-  TempEmailService, MoEmailService, TempMailPlusService, ProtonWebviewService,
+  TempEmailService, MoEmailService, TempMailPlusService, TingamefiMailService, ProtonWebviewService,
   parseOutlookLines, getInboxCount, waitForOTP
 } from './email-service'
 import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
 import { redactString } from '../utils/redact'
+import { getRuntimeUserDataPath } from '../runtimePaths'
 
 export type LogFn = (message: string) => void
 
@@ -150,20 +151,20 @@ export class Registrar {
       const relayUrl = await this.chainRelay.start()
       this.chainTargetProxy = target
       this.cfg.proxy = relayUrl
-      this.log('[ProxyChain] 已启用代理链：本机 → 上游中转 → 目标代理 → 目标站点')
+      this.log('[ProxyChain] Đã bật chuỗi proxy: máy cục bộ → proxy trung chuyển → proxy đích → trang đích')
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       this.chainRelay = null
       // 严格代理模式下，链路失败必须立刻中止，防止"回退仅用目标代理"时大陆 IP 被目标拒绝
       if (this.cfg.strictProxy) {
-        throw new Error(`[ProxyChain] 启用失败，严格代理模式已中止: ${msg}`)
+        throw new Error(`[ProxyChain] Bật thất bại, chế độ proxy nghiêm ngặt đã dừng: ${msg}`)
       }
-      this.log(`[ProxyChain] 启用失败，回退为直接使用目标代理: ${msg}`)
+      this.log(`[ProxyChain] Bật thất bại, chuyển sang dùng trực tiếp proxy đích: ${msg}`)
     }
   }
 
   private checkAborted(): void {
-    if (this.abortController.signal.aborted) throw new Error('注册已取消')
+    if (this.abortController.signal.aborted) throw new Error('Đăng ký đã bị hủy')
   }
 
   /**
@@ -190,28 +191,29 @@ export class Registrar {
             this.emitStep('exit-ip', { exitIp: ip })
           }
           const via = proxyUrl ? proxyUrl.replace(/:([^:@/]+)@/, ':***@') : undefined
-          this.log(`[✓ IP] 出口 IP: ${ip || '未知'}${via ? ` (via ${via})` : ' (直连)'}`)
+          this.log(`[✓ IP] IP đầu ra: ${ip || 'không xác định'}${via ? ` (qua ${via})` : ' (kết nối trực tiếp)'}`)
           return // 成功，退出
         }
-        this.log(`[IP] 出口 IP 检测失败: HTTP ${resp.status}`)
+        this.log(`[IP] Kiểm tra IP đầu ra thất bại: HTTP ${resp.status}`)
       } catch (err) {
-        this.log(`[IP] 出口 IP 检测失败: ${err instanceof Error ? err.message : String(err)}`)
+        this.log(`[IP] Kiểm tra IP đầu ra thất bại: ${err instanceof Error ? err.message : String(err)}`)
       }
 
       // 失败后尝试换 session 重建代理链
       if (attempt < maxRetries && this.canRefreshProxySession()) {
-        this.log(`[IP] 换 session 重试 (${attempt + 1}/${maxRetries})...`)
+        this.log(`[IP] Đổi phiên và thử lại (${attempt + 1}/${maxRetries})...`)
         await this.refreshProxySession()
       }
     }
-    // 所有重试都失败，继续注册（可能代理暂时不稳定但 TLS Client 走不同路径能通）
-    this.log('[IP] 出口 IP 检测全部失败，继续注册流程')
+    if (this.cfg.strictProxy) {
+      throw new Error('[NetworkGuard] Không thể xác minh IP đầu ra của route đã khóa; đã dừng đăng ký')
+    }
+    this.log('[IP] Tất cả lần kiểm tra IP đầu ra đều thất bại, tiếp tục bằng kết nối hệ thống')
   }
 
   /** 判断当前代理是否支持 session 轮换（参数化格式 + 含 _session- 或含 _area-/_life- 等） */
   private canRefreshProxySession(): boolean {
-    const target = this.chainTargetProxy || this.cfg.proxy || ''
-    return /_(area|life|city|state|region|country)-/i.test(target)
+    return false
   }
 
   /** 重新随机 session 并重建代理链 */
@@ -237,7 +239,7 @@ export class Registrar {
       newTarget = original.slice(0, insertPos) + `_session-${session}` + original.slice(insertPos)
     }
 
-    this.log(`[IP] 新 session: ${newTarget.replace(/:([^:@/]+)@/, ':***@')}`)
+    this.log(`[IP] Phiên mới: ${newTarget.replace(/:([^:@/]+)@/, ':***@')}`)
 
     // 停掉旧代理链
     if (this.chainRelay) {
@@ -254,10 +256,10 @@ export class Registrar {
   /** TLS SessionClient 选项 */
   private get sessionOpts() {
     const explicit = (this.cfg.proxy && this.cfg.proxy.trim()) || undefined
-    // 严格模式：必须有显式代理，禁止回退到环境变量/系统代理，防止裸奔真实 IP
+    // 严格模式：必须有显式代理，禁止回退到环境变量/系统代理，避免网络路径静默改变。
     if (this.cfg.strictProxy) {
       if (!explicit) {
-        throw new Error('严格代理模式：cfg.proxy 为空，已中止以防止裸奔直连')
+        throw new Error('Chế độ proxy nghiêm ngặt: cfg.proxy đang trống, đã dừng để tránh tự động đổi cấu hình mạng')
       }
     }
     const proxyUrl = this.cfg.strictProxy
@@ -311,7 +313,6 @@ export class Registrar {
     const os = require('os')
     const path = require('path')
     const fs = require('fs')
-    const { app } = require('electron')
 
     const platform = os.platform()
     const arch = os.arch()
@@ -325,7 +326,7 @@ export class Registrar {
     }
 
     // 1. userData 永久目录（首选）
-    const userDataDir = app.getPath('userData')
+    const userDataDir = getRuntimeUserDataPath()
     const tlsClientDir = path.join(userDataDir, 'tls-client')
     const finalPath = path.join(tlsClientDir, filename)
 
@@ -339,8 +340,12 @@ export class Registrar {
     }
 
     // 2. 从打包资源复制（安装包自带）
-    const resourcePath = path.join(process.resourcesPath || '', filename)
-    if (fs.existsSync(resourcePath)) {
+    const resourceCandidates = [
+      path.join(process.resourcesPath || '', filename),
+      path.join(__dirname, '..', '..', '..', 'resources', filename)
+    ]
+    const resourcePath = resourceCandidates.find((candidate) => fs.existsSync(candidate))
+    if (resourcePath) {
       this.log('[TLS] Copying library from resources to userData (one-time): ' + resourcePath + ' -> ' + finalPath)
       try {
         fs.copyFileSync(resourcePath, finalPath)
@@ -508,8 +513,8 @@ export class Registrar {
   }
 
   /**
-   * 判断是否为「超时类」失败（出口 IP 慢 / 被限流 / 隧道挂起）。
-   * 这类失败重建 TLS（同 IP 重连）无用，应换 proxy session 切换出口 IP。
+   * 判断是否为「超时类」失败（出口链路慢 / 网络抖动 / 隧道挂起）。
+   * 这类失败重建 TLS 通常无用，应 refresh proxy session 后重建链路。
    */
   private isTimeoutResponse(status: number, body: string): boolean {
     if (status === 504) return true
@@ -529,7 +534,7 @@ export class Registrar {
     headers: Record<string, string>,
     body?: string
   ): Promise<{ body: string; status: number; headers: Record<string, string | string[]> }> {
-    if (!this.session) throw new Error('TLS 客户端未初始化')
+    if (!this.session) throw new Error('TLS client chưa được khởi tạo')
     const maxAttempts = 3
     let lastErr: unknown = null
     let sessionRefreshed = false // 整个请求最多换 1 次 proxy session，避免频繁停建代理链
@@ -542,19 +547,19 @@ export class Registrar {
         const status = resp.status
         if (attempt < maxAttempts && this.isTransientResponse(status, decoded)) {
           const broken = status === 0 || /eof|reset|failed to do request/i.test(decoded)
-          // 超时类（出口 IP 慢/被限/隧道挂起）：重建 TLS 同 IP 无用，换 proxy session 切换出口 IP
+          // 超时类（出口链路慢/网络抖动/隧道挂起）：refresh proxy session 后重建链路。
           if (this.isTimeoutResponse(status, decoded) && !sessionRefreshed && this.canRefreshProxySession()) {
-            this.log(`[Net] ${method} 超时(status=${status})，换 proxy session 切换出口 IP 重试 ${attempt}/${maxAttempts - 1}`)
+            this.log(`[Mạng] ${method} hết thời gian chờ (status=${status}), làm mới phiên proxy rồi thử lại ${attempt}/${maxAttempts - 1}`)
             try {
               await this.refreshProxySession()
               await this.rebuildTlsClient()
               sessionRefreshed = true
             } catch (e) {
-              this.log(`[Net] 换 session 失败，回退普通重建: ${e instanceof Error ? e.message : String(e)}`)
+              this.log(`[Mạng] Đổi phiên thất bại, chuyển sang tạo lại kết nối thông thường: ${e instanceof Error ? e.message : String(e)}`)
               await this.rebuildTlsClient()
             }
           } else {
-            this.log(`[Net] ${method} 瞬时失败 status=${status}，${broken ? '重建 TLS + ' : ''}退避重试 ${attempt}/${maxAttempts - 1}`)
+            this.log(`[Mạng] ${method} tạm thời thất bại status=${status}, ${broken ? 'tạo lại TLS + ' : ''}chờ rồi thử lại ${attempt}/${maxAttempts - 1}`)
             if (broken) await this.rebuildTlsClient()
           }
           await this.abortableSleep(this.netBackoffMs(attempt))
@@ -564,7 +569,7 @@ export class Registrar {
       } catch (err: unknown) {
         lastErr = err
         if (attempt < maxAttempts && this.isRecoverableTlsClientError(err)) {
-          this.log(`[TLS] ${method} 可恢复错误：${err instanceof Error ? err.message : String(err)}，重建 TLS 退避重试 ${attempt}/${maxAttempts - 1}`)
+          this.log(`[TLS] ${method} gặp lỗi có thể khôi phục: ${err instanceof Error ? err.message : String(err)}, tạo lại TLS rồi thử lại ${attempt}/${maxAttempts - 1}`)
           await this.rebuildTlsClient()
           await this.abortableSleep(this.netBackoffMs(attempt))
           continue
@@ -573,16 +578,16 @@ export class Registrar {
       }
     }
     if (lastErr) throw lastErr
-    throw new Error(`${method} ${url} 重试 ${maxAttempts} 次仍失败`)
+    throw new Error(`${method} ${url} vẫn thất bại sau ${maxAttempts} lần thử`)
   }
 
   /** 可被中止打断的 sleep：停止注册时立即结束等待，让 abort 即时生效 */
   private abortableSleep(ms: number): Promise<void> {
     const signal = this.abortController.signal
     return new Promise((resolve, reject) => {
-      if (signal.aborted) { reject(new Error('注册已取消')); return }
+      if (signal.aborted) { reject(new Error('Đăng ký đã bị hủy')); return }
       let timer: ReturnType<typeof setTimeout>
-      const onAbort = (): void => { clearTimeout(timer); reject(new Error('注册已取消')) }
+      const onAbort = (): void => { clearTimeout(timer); reject(new Error('Đăng ký đã bị hủy')) }
       timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve() }, ms)
       signal.addEventListener('abort', onAbort, { once: true })
     })
@@ -600,7 +605,7 @@ export class Registrar {
   private withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
     const signal = this.abortController.signal
     return new Promise<T>((resolve, reject) => {
-      if (signal.aborted) { reject(new Error('注册已取消')); return }
+      if (signal.aborted) { reject(new Error('Đăng ký đã bị hủy')); return }
       let done = false
       const settle = (fn: () => void): void => {
         if (done) return
@@ -609,8 +614,8 @@ export class Registrar {
         signal.removeEventListener('abort', onAbort)
         fn()
       }
-      const timer = setTimeout(() => settle(() => reject(new Error(`${label} 整体超时 ${Math.round(ms / 1000)}s`))), ms)
-      const onAbort = (): void => settle(() => reject(new Error('注册已取消')))
+      const timer = setTimeout(() => settle(() => reject(new Error(`${label} hết thời gian chờ tổng thể ${Math.round(ms / 1000)} giây`))), ms)
+      const onAbort = (): void => settle(() => reject(new Error('Đăng ký đã bị hủy')))
       signal.addEventListener('abort', onAbort, { once: true })
       p.then(
         (v) => settle(() => resolve(v)),
@@ -622,7 +627,7 @@ export class Registrar {
   /**
    * 幂等步骤重试：失败后退避重试（仅用于无副作用的前置步骤，如 OIDC / Device / Portal / WorkflowInit）。
    * - timeoutMs：每次尝试加整体超时看门狗，超时即判失败进入下一次（防止单次卡满 3×25s）
-   * - refreshSession：失败后若代理支持，换 proxy session 切换出口 IP 再退避（避开慢/被限的 IP）
+   * - refreshSession：失败后若代理支持，refresh proxy session 再退避（处理慢链路或隧道挂起）
    */
   private async retryStep(
     name: string,
@@ -639,16 +644,16 @@ export class Registrar {
       } catch (err) {
         lastErr = err
         if (i < attempts) {
-          // 幂等步骤失败：若支持换 session，先切换出口 IP 再退避（针对慢/被限的住宅 IP）
+          // 幂等步骤失败：若支持 session refresh，先重建代理会话再退避。
           if (opts?.refreshSession && this.canRefreshProxySession()) {
             try {
               await this.refreshProxySession()
               await this.rebuildTlsClient()
-              this.log(`[${name}] 已换 proxy session 切换出口 IP`)
+              this.log(`[${name}] Đã làm mới phiên proxy`)
             } catch { /* 换 session 失败则继续普通重试 */ }
           }
           const wait = 1500 * i + Math.floor(Math.random() * 800)
-          this.log(`[${name}] 第 ${i}/${attempts} 次失败：${(err as Error).message}，${wait}ms 后重试`)
+          this.log(`[${name}] Lần ${i}/${attempts} thất bại: ${(err as Error).message}, thử lại sau ${wait}ms`)
           await this.abortableSleep(wait)
         }
       }
@@ -705,7 +710,7 @@ export class Registrar {
   private formatErrorBody(body: string, status: number): string {
     const risk = this.detectRiskControl(body, status)
     if (risk) {
-      return `${risk}（AWS 风控，建议：1) 启用代理池 N:1 分桶；2) 启用限速 + 风控自动暂停；3) 避免同邮箱域名大量注册）`
+      return `${risk} (AWS đã chặn yêu cầu; đề xuất: 1) dừng tác vụ hàng loạt hiện tại; 2) bật giới hạn tốc độ và tự động tạm dừng; 3) tránh đăng ký hàng loạt cùng một tên miền email; 4) nếu tài khoản bị hạn chế, liên hệ Support theo hướng dẫn của AWS/Kiro)`
     }
     return `status=${status} body=${body.substring(0, 200)}`
   }
@@ -786,7 +791,7 @@ export class Registrar {
 
   private async step1OIDC(): Promise<void> {
     this.emitStep('oidc')
-    this.log('[1] OIDC 注册')
+    this.log('[1] Đăng ký OIDC')
     const payload = {
       clientName: 'Amazon Q Developer for command line',
       clientType: 'public',
@@ -801,7 +806,7 @@ export class Registrar {
         if (resp.status === 200) break
       } catch (err: unknown) {
         if (attempt < 2) {
-          this.log(`[1] OIDC 重试 (${attempt + 1}/3)...`)
+          this.log(`[1] Thử lại OIDC (${attempt + 1}/3)...`)
           await this.abortableSleep(2000 * (attempt + 1))
           await this.rebuildTlsClient()
           continue
@@ -809,16 +814,16 @@ export class Registrar {
         throw err
       }
     }
-    if (!resp) throw new Error('OIDC 注册失败: 所有重试均失败')
+    if (!resp) throw new Error('Đăng ký OIDC thất bại: tất cả lần thử đều thất bại')
     const data = this.parseBody(resp.body)
     this.clientId = (data.clientId as string) || ''
     this.clientSecret = (data.clientSecret as string) || ''
-    if (!this.clientId) throw new Error(`OIDC 注册失败: ${resp.body.slice(0, 200)}`)
+    if (!this.clientId) throw new Error(`Đăng ký OIDC thất bại: ${resp.body.slice(0, 200)}`)
   }
 
   private async step2Device(): Promise<void> {
     this.emitStep('device')
-    this.log('[2] 设备授权')
+    this.log('[2] Cấp quyền thiết bị')
     const resp = await this.doPost(this.cfg.oidcBase + '/device_authorization', {
       clientId: this.clientId, clientSecret: this.clientSecret,
       startUrl: this.cfg.startURL
@@ -833,9 +838,9 @@ export class Registrar {
     if (this.cfg.manualMode) return // 手动模式在外部设置
 
     if (this.cfg.useOutlook && this.cfg.outlookData) {
-      this.log('[3] 使用 Outlook 邮箱')
+      this.log('[3] Sử dụng email Outlook')
       const accounts = parseOutlookLines(this.cfg.outlookData)
-      if (accounts.length === 0) throw new Error('无可用的 Outlook 账号')
+      if (accounts.length === 0) throw new Error('Không có tài khoản Outlook khả dụng')
       // 单行 → 直接用（批量并发时前端已为每个 task 切一行，避免并发抢占）
       // 多行（单次注册）→ 随机挑一行
       const acc = accounts.length === 1
@@ -848,45 +853,62 @@ export class Registrar {
     }
 
     if (this.cfg.useTempMailPlus) {
-      this.log('[3] 使用自建域名邮箱 (TempMail.Plus)')
+      this.log('[3] Sử dụng email tên miền riêng (TempMail.Plus)')
       if (!this.cfg.tempMailPlusEmail || !this.cfg.tempMailPlusEpin || !this.cfg.tempMailPlusDomain) {
-        throw new Error('TempMail.Plus 配置不完整')
+        throw new Error('Cấu hình TempMail.Plus chưa đầy đủ')
       }
       this.emailSvc = new TempMailPlusService(
         this.cfg.tempMailPlusEmail, this.cfg.tempMailPlusEpin, this.cfg.tempMailPlusDomain
       )
       this.email = await this.emailSvc.create()
-      if (!this.email) throw new Error('生成邮箱地址失败')
+      if (!this.email) throw new Error('Tạo địa chỉ email thất bại')
+      this.emitStep('email-created')
+      this.log(`email=${this.email}`)
+      return
+    }
+
+    if (this.cfg.useTingamefiMail) {
+      this.log('[3] Sử dụng email tạm Tingamefi')
+      if (!this.cfg.tingamefiMailApiUrl || !this.cfg.tingamefiMailAdminPassword || !this.cfg.tingamefiMailDomain) {
+        throw new Error('Cấu hình email Tingamefi chưa đầy đủ')
+      }
+      this.emailSvc = new TingamefiMailService(
+        this.cfg.tingamefiMailApiUrl,
+        this.cfg.tingamefiMailAdminPassword,
+        this.cfg.tingamefiMailDomain
+      )
+      this.email = await this.emailSvc.create()
+      if (!this.email) throw new Error('Tạo địa chỉ email Tingamefi thất bại')
       this.emitStep('email-created')
       this.log(`email=${this.email}`)
       return
     }
 
     if (this.cfg.useProton) {
-      this.log('[3] 使用 Proton 邮箱 (点号别名)')
+      this.log('[3] Sử dụng email Proton (bí danh dấu chấm)')
       if (!this.cfg.protonEmail) {
-        throw new Error('Proton 邮箱地址未配置')
+        throw new Error('Chưa cấu hình địa chỉ email Proton')
       }
       this.emailSvc = new ProtonWebviewService(this.cfg.protonEmail, (m) => this.log(m))
       this.email = await this.emailSvc.create()
-      if (!this.email) throw new Error('Proton 邮箱地址为空')
+      if (!this.email) throw new Error('Địa chỉ email Proton đang trống')
       this.emitStep('email-created')
       this.log(`email=${this.email}`)
       return
     }
 
-    this.log('[3] 创建临时邮箱')
-    if (!this.cfg.moEmailBaseURL) throw new Error('MoEmail 未配置')
+    this.log('[3] Tạo email tạm')
+    if (!this.cfg.moEmailBaseURL) throw new Error('Chưa cấu hình MoEmail')
     this.emailSvc = new MoEmailService(this.cfg.moEmailBaseURL, this.cfg.moEmailAPIKey)
     this.email = await this.emailSvc.create()
-    if (!this.email) throw new Error('创建临时邮箱失败')
+    if (!this.email) throw new Error('Tạo email tạm thất bại')
     this.emitStep('email-created')
     this.log(`email=${this.email}`)
   }
 
   private async step4Portal(): Promise<void> {
     this.emitStep('portal')
-    this.log('[4] Portal 初始化')
+    this.log('[4] Khởi tạo Portal')
     this.cookies.set('awsccc', awsccc())
     const redirect = `${this.cfg.viewBase}/start/#/device?user_code=${this.userCode}`
     const url = `${this.cfg.portalBase}/login?directory_id=view&redirect_url=${redirect}`
@@ -907,7 +929,7 @@ export class Registrar {
       this.workflowHandle = splitAfter(rurl, 'workflowStateHandle=')
     }
     if (data.csrfToken) this.cookies.set('loginCsrfToken', data.csrfToken as string)
-    if (!this.workflowHandle) throw new Error('Portal 未返回 workflow handle')
+    if (!this.workflowHandle) throw new Error('Portal không trả về workflow handle')
 
     const loginURL = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/login?workflowStateHandle=${this.workflowHandle}`
     await this.fetchD2CToken(this.cfg.signinBase, loginURL)
@@ -915,7 +937,7 @@ export class Registrar {
 
   private async step5WorkflowInit(): Promise<void> {
     this.emitStep('workflow-init')
-    this.log('[5] 工作流初始化')
+    this.log('[5] Khởi tạo quy trình')
     const api = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/api/execute`
     const ref = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/login?workflowStateHandle=${this.workflowHandle}`
 
@@ -952,7 +974,7 @@ export class Registrar {
 
   private async step6SubmitEmail(): Promise<'signup' | 'login'> {
     this.emitStep('submit-email')
-    this.log(`[6] 提交邮箱 ${this.email}`)
+    this.log(`[6] Gửi email ${this.email}`)
     const api = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/api/execute`
     const ref = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/login?workflowStateHandle=${this.workflowHandle}`
     const fp = this.genFP('signin', 'PageSubmit', this.email.length, this.email)
@@ -981,12 +1003,12 @@ export class Registrar {
 
     if (resp.status === 400) return 'signup'
     if (resp.status === 200) return 'login'
-    throw new Error(`提交邮箱失败: ${resp.status} - ${resp.body.slice(0, 200)}`)
+    throw new Error(`Gửi email thất bại: ${resp.status} - ${resp.body.slice(0, 200)}`)
   }
 
   private async step7Signup(): Promise<void> {
     this.emitStep('signup')
-    this.log('[7] 注册 (SIGNUP)')
+    this.log('[7] Đăng ký (SIGNUP)')
     const api = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/api/execute`
     const ref = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/login?workflowStateHandle=${this.workflowHandle}`
     const fp = this.genFP('signup', 'PageSubmit', 0, '')
@@ -1013,7 +1035,7 @@ export class Registrar {
   }
 
   private async step7_5SignupInit(): Promise<void> {
-    this.log('[7.5] Signup API 初始化')
+    this.log('[7.5] Khởi tạo API đăng ký')
     const api = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/signup/api/execute`
     const ref = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/signup?workflowStateHandle=${this.workflowHandle}`
 
@@ -1033,7 +1055,7 @@ export class Registrar {
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     let data = this.parseBody(resp.body)
     if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
-    if (data.stepId !== 'start') throw new Error(`Signup init 失败: ${this.formatErrorBody(resp.body, resp.status)}`)
+    if (data.stepId !== 'start') throw new Error(`Khởi tạo đăng ký thất bại: ${this.formatErrorBody(resp.body, resp.status)}`)
 
     fp = this.genFP('signup', 'PageLoad', 0, '')
     rid = newUUID()
@@ -1059,11 +1081,11 @@ export class Registrar {
       if (hashIdx >= 0) wid = wid.slice(0, hashIdx)
       this.workflowId = wid
     }
-    if (!this.workflowId) throw new Error('Signup init 未返回 workflowID')
+    if (!this.workflowId) throw new Error('Khởi tạo đăng ký không trả về workflowID')
   }
 
   private async step7_8ProfileInit(): Promise<void> {
-    this.log('[7.8] Profile 页面初始化')
+    this.log('[7.8] Khởi tạo trang hồ sơ')
     this.ubid = ubidGen()
     this.cookies.set('aws-user-profile-ubid', this.ubid)
     this.cookies.set('i18next', 'zh-CN')
@@ -1081,7 +1103,7 @@ export class Registrar {
   }
 
   private async step8ProfileStart(): Promise<void> {
-    this.log('[8] Profile 启动')
+    this.log('[8] Khởi động hồ sơ')
     const ref = `${this.cfg.profileBase}/?workflowID=${this.workflowId}`
     const fp = this.genFP('profile', 'PageLoad', 0, '')
 
@@ -1099,12 +1121,12 @@ export class Registrar {
     }, this.buildProfileHeaders(ref))
     const data = this.parseBody(resp.body)
     this.workflowState = (data.workflowState as string) || ''
-    if (!this.workflowState) throw new Error(`Profile start 未返回 workflowState: ${resp.body.slice(0, 200)}`)
+    if (!this.workflowState) throw new Error(`Khởi động hồ sơ không trả về workflowState: ${resp.body.slice(0, 200)}`)
   }
 
   private async step9SendOTP(): Promise<void> {
     this.emitStep('send-otp')
-    this.log('[9] 发送验证码')
+    this.log('[9] Gửi mã xác minh')
 
     if (this.cfg.useOutlook && this.cfg.outlookData) {
       const accounts = parseOutlookLines(this.cfg.outlookData)
@@ -1112,9 +1134,9 @@ export class Registrar {
       if (acc) {
         try {
           this.outlookMailCount = await getInboxCount(acc)
-          this.log(`发送前邮件数: ${this.outlookMailCount}`)
+          this.log(`Số email trước khi gửi: ${this.outlookMailCount}`)
         } catch (err) {
-          this.log(`获取邮件数量失败: ${err}, 默认为0`)
+          this.log(`Lấy số lượng email thất bại: ${err}, dùng giá trị mặc định 0`)
         }
       }
     }
@@ -1139,30 +1161,30 @@ export class Registrar {
     }
 
     const resp = await this.doPost(this.cfg.profileBase + '/api/send-otp', payload, this.buildProfileHeaders(ref))
-    if (resp.status !== 200) throw new Error(`send-otp 失败 (${resp.status}), body: ${resp.body.substring(0, 300)}`)
-    this.log('验证码已发送')
+    if (resp.status !== 200) throw new Error(`Gửi mã xác minh thất bại (${resp.status}), body: ${resp.body.substring(0, 300)}`)
+    this.log('Đã gửi mã xác minh')
   }
 
   private async step10GetOTP(): Promise<string> {
-    if (this.cfg.manualMode) throw new Error('手动模式需外部提供验证码')
+    if (this.cfg.manualMode) throw new Error('Chế độ thủ công yêu cầu cung cấp mã xác minh từ bên ngoài')
 
     this.emitStep('waiting-otp')
-    this.log('[10] 等待验证码')
+    this.log('[10] Chờ mã xác minh')
     const signal = this.abortController.signal
     if (this.cfg.useOutlook && this.cfg.outlookData) {
       const accounts = parseOutlookLines(this.cfg.outlookData)
       const acc = accounts.find((a) => a.email === this.email)
-      if (!acc) throw new Error('未找到对应 Outlook 账号')
+      if (!acc) throw new Error('Không tìm thấy tài khoản Outlook tương ứng')
       return await waitForOTP(acc, this.outlookMailCount, 120, 5, signal)
     }
-    if (!this.emailSvc) throw new Error('邮箱服务未初始化')
+    if (!this.emailSvc) throw new Error('Dịch vụ email chưa được khởi tạo')
     return await this.emailSvc.waitForCode(120, 3, signal)
   }
 
   private async step11CreateIdentity(otp: string): Promise<void> {
     this.emitStep('otp-received')
     this.emitStep('create-identity')
-    this.log('[11] 创建身份')
+    this.log('[11] Tạo danh tính')
     const ref = `${this.cfg.profileBase}/?workflowID=${this.workflowId}`
     const fp = this.genFP('profile', 'EmailVerification', 0, '')
 
@@ -1183,12 +1205,12 @@ export class Registrar {
     const data = this.parseBody(resp.body)
     this.regCode = (data.registrationCode as string) || ''
     this.signState = (data.signInState as string) || ''
-    if (!this.regCode) throw new Error(`create-identity 未返回 registrationCode: ${resp.body.slice(0, 200)}`)
+    if (!this.regCode) throw new Error(`create-identity không trả về registrationCode: ${resp.body.slice(0, 200)}`)
   }
 
   private async step12SetPassword(): Promise<void> {
     this.emitStep('set-password')
-    this.log('[12] 设置密码')
+    this.log('[12] Đặt mật khẩu')
     const api = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/signup/api/execute`
     const ref = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/signup?registrationCode=${this.regCode}&state=${this.signState}`
     let fp = this.genFP('signup', 'PageSubmit', 0, '')
@@ -1212,7 +1234,7 @@ export class Registrar {
 
     const encCtx = getNestedMap(data as Record<string, unknown>, 'workflowResponseData', 'encryptionContextResponse')
     const pubKeyMap = encCtx ? getNestedStringMap(encCtx, 'publicKey') : null
-    if (!pubKeyMap?.n) throw new Error(`未获取到加密公钥: ${this.formatErrorBody(resp.body, resp.status)}`)
+    if (!pubKeyMap?.n) throw new Error(`Không lấy được khóa công khai mã hóa: ${this.formatErrorBody(resp.body, resp.status)}`)
 
     const issuer = (encCtx?.issuer as string) || 'signin'
     const audience = (encCtx?.audience as string) || 'AWSPasswordService'
@@ -1241,7 +1263,7 @@ export class Registrar {
 
     const redir = data.redirect as Record<string, unknown> | undefined
     const rurl = redir?.url as string
-    if (!rurl) throw new Error(`密码设置未返回 redirect: ${resp.body.slice(0, 200)}`)
+    if (!rurl) throw new Error(`Bước đặt mật khẩu không trả về redirect: ${resp.body.slice(0, 200)}`)
 
     const wh = extractParam(rurl, 'workflowStateHandle')
     const st = extractParam(rurl, 'state')
@@ -1250,7 +1272,7 @@ export class Registrar {
   }
 
   private async completeSignup(wh: string, state: string, rh: string): Promise<void> {
-    this.log('[12.5] 完成注册工作流')
+    this.log('[12.5] Hoàn tất quy trình đăng ký')
     const api = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/api/execute`
     const ref = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/login?workflowStateHandle=${wh}&state=${state}&workflowResultHandle=${rh}`
     const fp = this.genFP('signin', 'PageLoad', 0, '')
@@ -1269,7 +1291,7 @@ export class Registrar {
     }, h)
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     const data = this.parseBody(resp.body)
-    if (data.stepId !== 'end-of-workflow-success') throw new Error(`完成工作流失败: ${data.stepId || 'undefined'} ${this.formatErrorBody(resp.body, resp.status)}`)
+    if (data.stepId !== 'end-of-workflow-success') throw new Error(`Hoàn tất quy trình thất bại: ${data.stepId || 'undefined'} ${this.formatErrorBody(resp.body, resp.status)}`)
 
     const redir = data.redirect as Record<string, unknown> | undefined
     const rurl = redir?.url as string
@@ -1284,7 +1306,7 @@ export class Registrar {
 
   private async step12_8SSOWorkflow(): Promise<void> {
     this.emitStep('sso-workflow')
-    this.log('[12.8] SSO 工作流')
+    this.log('[12.8] Quy trình SSO')
     const redirectURL = encodeURIComponent(this.cfg.viewBase + '/start/#/')
     const loginURL = `${this.cfg.portalBase}/login?directory_id=view&redirect_url=${redirectURL}`
 
@@ -1307,7 +1329,7 @@ export class Registrar {
     if (rurl.includes('workflowStateHandle=')) {
       wh = splitAfter(rurl, 'workflowStateHandle=')
     }
-    if (!wh) throw new Error('SSO 无法获取 workflowStateHandle')
+    if (!wh) throw new Error('SSO không lấy được workflowStateHandle')
 
     await this.completeSSOWorkflow(wh)
   }
@@ -1376,9 +1398,9 @@ export class Registrar {
 
   private async step13SSOToken(): Promise<Record<string, unknown>> {
     this.emitStep('sso-token')
-    this.log('[13] 获取 SSO Token')
+    this.log('[13] Lấy SSO Token')
     const csrf = this.cookies.get('loginCsrfToken')
-    if (!csrf) throw new Error('缺少 loginCsrfToken')
+    if (!csrf) throw new Error('Thiếu loginCsrfToken')
 
     const h: Record<string, string> = {
       'Accept': 'application/json, text/plain, */*',
@@ -1409,13 +1431,13 @@ export class Registrar {
           await this.abortableSleep(3000)
           continue
         }
-        throw new Error(`SSO Token 失败: ${resp.body?.slice(0, 200)}`)
+        throw new Error(`Lấy SSO Token thất bại: ${resp.body?.slice(0, 200)}`)
       }
     } finally {
       try { await ssoSession.destroySession() } catch { /* ignore */ }
     }
 
-    if (!this.ssoToken) throw new Error('SSO Token 重试 5 次仍失败')
+    if (!this.ssoToken) throw new Error('Lấy SSO Token vẫn thất bại sau 5 lần thử')
 
     // Accept device + Associate token
     let resp = await this.doPost(this.cfg.oidcBase + '/device_authorization/accept_user_code', {
@@ -1439,13 +1461,13 @@ export class Registrar {
       if (resp.status === 200) return this.parseBody(resp.body)
       await this.abortableSleep(2000)
     }
-    throw new Error('Token 轮询超时')
+    throw new Error('Hết thời gian chờ lấy Token')
   }
 
   // ============ 验活 ============
 
   private async verifyAlive(awsToken: Record<string, unknown>): Promise<Record<string, unknown>> {
-    this.log('[验活] 刷新 Token + 查用量')
+    this.log('[Kiểm tra] Làm mới Token và đọc hạn mức')
     const refreshToken = (awsToken.refreshToken as string) || ''
 
     const resp = await this.doPost('https://oidc.us-east-1.amazonaws.com/token', {
@@ -1454,14 +1476,18 @@ export class Registrar {
     }, { 'Content-Type': 'application/json' })
 
     if (resp.status !== 200) {
-      this.log(`Token 刷新失败: ${resp.status}`)
+      this.log(`Làm mới Token thất bại: ${resp.status}`)
       return { alive: false, error: `refresh failed: ${resp.status}` }
     }
 
     const tok = this.parseBody(resp.body)
     const access = (tok.accessToken as string) || ''
+    if (access) {
+      awsToken.accessToken = access
+    }
 
     const usageUA = 'aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18'
+    const usageErrors: string[] = []
 
     for (const baseURL of ['https://q.us-east-1.amazonaws.com/getUsageLimits', 'https://q.eu-central-1.amazonaws.com/getUsageLimits']) {
       const usageURL = baseURL + '?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true'
@@ -1477,8 +1503,15 @@ export class Registrar {
       if (usageResp.status === 200) {
         return this.parseUsage(usageResp.body)
       }
+      if (usageResp.status === 401 || usageResp.status === 403) {
+        const err = `${baseURL} -> ${usageResp.status}: ${usageResp.body.slice(0, 200)}`
+        usageErrors.push(err)
+        this.log(`[Kiểm tra] ${err}`)
+      } else {
+        usageErrors.push(`${baseURL} -> ${usageResp.status}`)
+      }
     }
-    return { alive: false, error: 'usage query failed' }
+    return { alive: false, error: `usage query failed${usageErrors.length ? ` (${usageErrors.join(' | ')})` : ''}` }
   }
 
   private parseUsage(body: string): Record<string, unknown> {
@@ -1508,7 +1541,7 @@ export class Registrar {
       }
     }
 
-    this.log(`验活成功! 邮箱=${emailAddr} 订阅=${sub} Credit=${totalUsed}/${totalLimit}`)
+    this.log(`Kiểm tra thành công! Email=${emailAddr} Gói=${sub} Credit=${totalUsed}/${totalLimit}`)
     return { alive: true, email: emailAddr, subscription: sub, credit_used: totalUsed, credit_limit: totalLimit }
   }
 
@@ -1526,7 +1559,7 @@ export class Registrar {
       await refreshAppJSConfig((url, init) => this.fetchAppJS(url, init))
       await this.rebuildTlsClient()
 
-      // 幂等只读步骤：retry 次数 + 整体超时看门狗 + 失败换出口 IP。
+      // 幂等只读步骤：retry 次数 + 整体超时看门狗 + session refresh。
       // OIDC 为首步（失败即废号）保留自带 3 次重试不快速超时；Email 创建有副作用不重试。
       const initSteps: Array<{ name: string; fn: StepFn; retry?: number; timeoutMs?: number; refreshSession?: boolean }> = [
         { name: 'OIDC', fn: () => this.step1OIDC() },
@@ -1584,7 +1617,7 @@ export class Registrar {
           await this.humanDelay()
         }
       } else {
-        return { status: 'failed', email: this.email, error: '该邮箱已注册过' }
+        return { status: 'failed', email: this.email, error: 'Email này đã được đăng ký' }
       }
 
       // ====== 后期步骤（SSO + Token）======
@@ -1605,11 +1638,11 @@ export class Registrar {
         } catch (err) {
           const errMsg = (err as Error).message
           if (ssoAttempt < SSO_MAX_RETRIES) {
-            this.log(`[SSO] 后期步骤失败，内部重试 (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`)
+            this.log(`[SSO] Bước cuối thất bại, thử lại nội bộ (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`)
             await this.abortableSleep(3000 + Math.floor(Math.random() * 2000))
           } else {
             // 最终失败：账号已创建但拿不到 Token
-            return { status: 'failed', email: this.email, error: `[SSOToken] ${errMsg} (账号已创建，可手动导入刷新)` }
+            return { status: 'failed', email: this.email, error: `[SSOToken] ${errMsg} (tài khoản đã được tạo, có thể nhập thủ công để làm mới)` }
           }
         }
       }
@@ -1692,13 +1725,13 @@ export class Registrar {
     if (fullName) this.cfg.fullName = fullName
 
     try {
-      // 幂等只读步骤：retry + 超时看门狗 + 失败换出口 IP；后续非幂等步骤仅加超时快速失败
+      // 幂等只读步骤：retry + 超时看门狗 + session refresh；后续非幂等步骤仅加超时快速失败
       const STEP_TIMEOUT = 55000
       await this.retryStep('Portal', () => this.step4Portal(), 3, { timeoutMs: 35000, refreshSession: true })
       await this.retryStep('WorkflowInit', () => this.step5WorkflowInit(), 2, { timeoutMs: 35000, refreshSession: true })
 
       const status = await this.withTimeout(this.step6SubmitEmail(), STEP_TIMEOUT, 'SubmitEmail')
-      if (status !== 'signup') return { success: false, error: '该邮箱已注册过' }
+      if (status !== 'signup') return { success: false, error: 'Email này đã được đăng ký' }
 
       await this.withTimeout(this.step7Signup(), STEP_TIMEOUT, 'Signup')
       await this.withTimeout(this.step7_5SignupInit(), STEP_TIMEOUT, 'SignupInit')
@@ -1731,10 +1764,10 @@ export class Registrar {
         } catch (err) {
           const errMsg = (err as Error).message
           if (ssoAttempt < SSO_MAX_RETRIES) {
-            this.log(`[SSO] 后期步骤失败，内部重试 (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`)
+            this.log(`[SSO] Bước cuối thất bại, thử lại nội bộ (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`)
             await this.abortableSleep(3000 + Math.floor(Math.random() * 2000))
           } else {
-            return { status: 'failed', email: this.email, error: `[SSOToken] ${errMsg} (账号已创建，可手动导入刷新)` }
+            return { status: 'failed', email: this.email, error: `[SSOToken] ${errMsg} (tài khoản đã được tạo, có thể nhập thủ công để làm mới)` }
           }
         }
       }

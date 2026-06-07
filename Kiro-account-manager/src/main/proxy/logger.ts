@@ -1,8 +1,8 @@
 // 代理服务器日志模块
 import * as fs from 'fs'
 import * as path from 'path'
-import { app } from 'electron'
 import { redactString, redactValue } from '../utils/redact'
+import { getRuntimeUserDataPath } from '../runtimePaths'
 
 export interface LogEntry {
   timestamp: string
@@ -42,7 +42,7 @@ class ProxyLogger {
     
     if (this.config.enabled && !this.config.logDir) {
       // 默认日志目录
-      this.config.logDir = path.join(app.getPath('userData'), 'logs', 'proxy')
+      this.config.logDir = path.join(getRuntimeUserDataPath(), 'logs', 'proxy')
     }
 
     if (this.config.enabled) {

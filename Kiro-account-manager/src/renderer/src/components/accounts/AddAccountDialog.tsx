@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Input, Label, Select } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
-import type { SubscriptionType } from '@/types/account'
+import type { IdpType, SubscriptionType } from '@/types/account'
 import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff } from 'lucide-react'
 import { splitCredentialLine } from '@/lib/utils'
 
@@ -55,6 +55,21 @@ interface VerifiedData {
   }
   daysRemaining?: number
   expiresAt?: number
+  profileArn?: string
+}
+
+interface OidcCredential {
+  refreshToken: string
+  _email?: string
+  password?: string
+  clientId?: string
+  clientSecret?: string
+  region?: string
+  authMethod?: 'IdC' | 'social'
+  provider?: string
+  profileArn?: string
+  startUrl?: string
+  machineId?: string
 }
 
 type ImportMode = 'oidc' | 'sso' | 'login'
@@ -88,6 +103,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const [region, setRegion] = useState('us-east-1')
   const [authMethod, setAuthMethod] = useState<'IdC' | 'social'>('IdC')
   const [provider, setProvider] = useState('BuilderId')  // 'BuilderId', 'Enterprise', 'Github', 'Google'
+  const [profileArn, setProfileArn] = useState('')
+  const [machineId, setMachineId] = useState('')
+  const [startUrl, setStartUrl] = useState('')
 
   // SSO Token 导入
   const [ssoToken, setSsoToken] = useState('')
@@ -108,10 +126,65 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
 
+  const normalizeProfileArnInput = (value?: string): string | undefined => {
+    const trimmed = value?.trim()
+    if (!trimmed) return undefined
+    return !trimmed.startsWith('arn:') && trimmed.includes(':codewhisperer:')
+      ? `arn:${trimmed}`
+      : trimmed
+  }
+
+  const normalizeProviderInput = (value?: string): string => {
+    const raw = value?.trim()
+    if (!raw) return 'BuilderId'
+    const normalized = raw.toLowerCase().replace(/[\s_-]/g, '')
+    if (normalized === 'github') return 'Github'
+    if (normalized === 'google') return 'Google'
+    if (normalized === 'enterprise' || normalized === 'iam' || normalized === 'iamsso' || normalized === 'awsidc') return 'Enterprise'
+    if (normalized === 'builderid' || normalized === 'kiro') return 'BuilderId'
+    return raw
+  }
+
+  const normalizeAuthMethodInput = (value?: string, providerName?: string): 'IdC' | 'social' => {
+    const raw = value?.trim().toLowerCase()
+    const providerLower = providerName?.trim().toLowerCase()
+    if (raw === 'social' || providerLower === 'github' || providerLower === 'google') return 'social'
+    return 'IdC'
+  }
+
+  const readStringField = (input: Record<string, unknown>, keys: string[]): string | undefined => {
+    for (const key of keys) {
+      const value = input[key]
+      if (typeof value === 'string' && value.trim()) return value.trim()
+    }
+    return undefined
+  }
+
+  const normalizeOidcCredential = (raw: unknown): OidcCredential => {
+    const item = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+    const providerName = normalizeProviderInput(readStringField(item, ['provider', 'idp', 'type']))
+    const authMethodName = normalizeAuthMethodInput(readStringField(item, ['authMethod', 'auth_method']), providerName)
+    return {
+      refreshToken: readStringField(item, ['refreshToken', 'refresh_token']) || '',
+      password: readStringField(item, ['password', 'pwd']),
+      clientId: readStringField(item, ['clientId', 'client_id']),
+      clientSecret: readStringField(item, ['clientSecret', 'client_secret']),
+      region: readStringField(item, ['region']) || 'us-east-1',
+      authMethod: authMethodName,
+      provider: providerName,
+      profileArn: normalizeProfileArnInput(readStringField(item, ['profileArn', 'profile_arn', 'arn'])),
+      startUrl: readStringField(item, ['startUrl', 'start_url']),
+      machineId: readStringField(item, ['machineId', 'machine_id'])
+    }
+  }
+
   // 登录相关状态
   const [loginType, setLoginType] = useState<LoginType>('builderid')
   const [isLoggingIn, setIsLoggingIn] = useState(false)
   const [usePrivateMode, setUsePrivateMode] = useState(loginPrivateMode) // 临时隐私模式开关，默认跟随全局设置
+  const [socialLoginUrl, setSocialLoginUrl] = useState('')
+  const [socialCallbackInput, setSocialCallbackInput] = useState('')
+  const [isExchangingSocialCallback, setIsExchangingSocialCallback] = useState(false)
   const [builderIdLoginData, setBuilderIdLoginData] = useState<{
     userCode: string
     verificationUri: string
@@ -193,6 +266,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     startUrl?: string
     authMethod?: string
     provider?: string
+    profileArn?: string
+    machineId?: string
   }) => {
     console.log('[AddAccountDialog] Login successful, verifying credentials...')
     
@@ -204,7 +279,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         clientSecret: tokenData.clientSecret || '',
         region: tokenData.region || 'us-east-1',
         authMethod: tokenData.authMethod,
-        provider: tokenData.provider
+        provider: tokenData.provider,
+        profileArn: tokenData.profileArn,
+        machineId: tokenData.machineId
       })
 
       if (result.success && result.data) {
@@ -223,7 +300,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           email,
           userId,
           nickname: email ? email.split('@')[0] : undefined,
-          idp: providerName as 'BuilderId' | 'Google' | 'Github',
+          idp: providerName as IdpType,
+          profileArn: result.data.profileArn || tokenData.profileArn,
+          machineId: tokenData.machineId,
           groupId: selectedGroupId,
           credentials: {
             accessToken: result.data.accessToken,
@@ -235,7 +314,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             startUrl: tokenData.startUrl,
             expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
             authMethod: tokenData.authMethod as 'IdC' | 'social',
-            provider: (tokenData.provider || 'BuilderId') as 'BuilderId' | 'Github' | 'Google'
+            provider: (tokenData.provider || 'BuilderId') as 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO'
           },
           subscription: {
             type: result.data.subscriptionType as SubscriptionType,
@@ -310,7 +389,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     }
   }
 
-  // 启动 IAM SSO 登录 (Authorization Code flow)
+  // 启动 IAM SSO 登录。Web 后端返回 device flow，Electron 旧版仍可能返回 authorizeUrl。
   const handleStartIamSsoLogin = async () => {
     if (!ssoStartUrl.trim()) {
       setError(isEn ? 'Please enter SSO Start URL' : '请输入 SSO Start URL')
@@ -324,20 +403,21 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     try {
       const result = await window.api.startIamSsoLogin(ssoStartUrl.trim(), region)
       
-      if (result.success && result.authorizeUrl) {
+      const verificationUri = result.verificationUri || result.authorizeUrl
+      if (result.success && verificationUri) {
         // 设置登录数据（用于显示等待状态）
         setIamSsoLoginData({
-          userCode: '',
-          verificationUri: result.authorizeUrl,
+          userCode: result.userCode || '',
+          verificationUri,
           expiresIn: result.expiresIn || 600,
-          interval: 3
+          interval: result.interval || 3
         })
 
         // 打开浏览器（支持隐私模式）
-        window.api.openExternal(result.authorizeUrl, usePrivateMode)
+        window.api.openExternal(verificationUri, usePrivateMode)
 
-        // 开始轮询（等待服务器回调自动完成 token 交换）
-        startIamSsoPolling(3)
+        // 开始轮询（device flow 轮询 AWS；旧 Electron 流程轮询本地回调结果）
+        startIamSsoPolling(result.interval || 3)
       } else {
         setError(result.error || (isEn ? 'Failed to start login' : '启动登录失败'))
         setIsLoggingIn(false)
@@ -461,13 +541,35 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setIsLoggingIn(false)
     setBuilderIdLoginData(null)
     setIamSsoLoginData(null)
+    setSocialLoginUrl('')
+    setSocialCallbackInput('')
+    setIsExchangingSocialCallback(false)
     setError(null)
   }
 
   // 启动 Social Auth 登录 (Google/GitHub)
+  const parseSocialCallbackInput = (raw: string): { code: string; state: string } | null => {
+    const trimmed = raw.trim()
+    if (!trimmed) return null
+    try {
+      const url = new URL(trimmed)
+      const code = url.searchParams.get('code')
+      const state = url.searchParams.get('state')
+      return code && state ? { code, state } : null
+    } catch {
+      const query = trimmed.includes('?') ? trimmed.slice(trimmed.indexOf('?') + 1) : trimmed
+      const params = new URLSearchParams(query)
+      const code = params.get('code')
+      const state = params.get('state')
+      return code && state ? { code, state } : null
+    }
+  }
+
   const handleStartSocialLogin = async (socialProvider: 'Google' | 'Github') => {
     setIsLoggingIn(true)
     setError(null)
+    setSocialLoginUrl('')
+    setSocialCallbackInput('')
 
     try {
       const result = await window.api.startSocialLogin(socialProvider, usePrivateMode)
@@ -475,6 +577,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       if (!result.success) {
         setError(result.error || '启动登录失败')
         setIsLoggingIn(false)
+      } else {
+        setSocialLoginUrl(result.loginUrl || '')
       }
       // 成功后等待回调
     } catch (e) {
@@ -484,6 +588,37 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   }
 
   // 复制 user_code
+  const handleSubmitSocialCallback = async () => {
+    const parsed = parseSocialCallbackInput(socialCallbackInput)
+    if (!parsed) {
+      setError(isEn ? 'Paste the full kiro:// callback URL or code=...&state=...' : '请粘贴完整的 kiro:// 回调 URL，或 code=...&state=...')
+      return
+    }
+
+    setIsExchangingSocialCallback(true)
+    setError(null)
+    try {
+      const result = await window.api.exchangeSocialToken(parsed.code, parsed.state)
+      if (result.success) {
+        await handleLoginSuccess({
+          accessToken: result.accessToken!,
+          refreshToken: result.refreshToken!,
+          authMethod: 'social',
+          provider: result.provider
+        })
+        setSocialLoginUrl('')
+        setSocialCallbackInput('')
+      } else {
+        setError(result.error || (isEn ? 'Token exchange failed' : 'Token 交换失败'))
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : (isEn ? 'Login failed' : '登录失败'))
+    } finally {
+      setIsExchangingSocialCallback(false)
+      setIsLoggingIn(false)
+    }
+  }
+
   const handleCopyUserCode = async () => {
     if (builderIdLoginData?.userCode) {
       await navigator.clipboard.writeText(builderIdLoginData.userCode)
@@ -503,6 +638,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         setRegion(result.data.region)
         setAuthMethod(result.data.authMethod as 'IdC' | 'social' || 'IdC')
         setProvider(result.data.provider || 'BuilderId')
+        setProfileArn(result.data.profileArn || '')
+        setMachineId(result.data.machineId || '')
+        setStartUrl(result.data.startUrl || '')
         setError(null)
       } else {
         setError(result.error || '导入失败')
@@ -656,22 +794,16 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     }
 
     // 解析凭证数据：自动识别 JSON 或卡密格式
-    let credentials: Array<{
-      refreshToken: string
-      password?: string
-      clientId?: string
-      clientSecret?: string
-      region?: string
-      authMethod?: 'IdC' | 'social'
-      provider?: string
-    }>
+    let credentials: OidcCredential[]
 
     const trimmed = oidcBatchData.trim()
     let isKamiFormat = false
 
     try {
       const parsed = JSON.parse(trimmed)
-      credentials = Array.isArray(parsed) ? parsed : [parsed]
+      credentials = (Array.isArray(parsed) ? parsed : [parsed])
+        .map(normalizeOidcCredential)
+        .filter(item => item.refreshToken)
     } catch {
       // JSON 解析失败，尝试卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret
       // 支持分隔符：----、Tab、连续空格
@@ -699,7 +831,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           clientSecret,
           provider
         }
-      }).filter(item => item.refreshToken) as typeof credentials
+      }).filter(item => item.refreshToken) as OidcCredential[]
 
       if (credentials.length === 0) {
         setError(isEn ? 'Invalid format' : '格式错误，请输入 JSON 数组或卡密格式（邮箱----密码----Token----ID----Secret）')
@@ -739,7 +871,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           clientSecret: cred.clientSecret || '',
           region: cred.region || 'us-east-1',
           authMethod: credAuthMethod,
-          provider: credProvider
+          provider: credProvider,
+          profileArn: cred.profileArn,
+          machineId: cred.machineId,
+          startUrl: cred.startUrl
         })
 
         if (result.success && result.data) {
@@ -770,6 +905,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             userId,
             nickname: email ? email.split('@')[0] : undefined,
             idp,
+            profileArn: result.data.profileArn || cred.profileArn,
+            machineId: cred.machineId,
             groupId: selectedGroupId,
             credentials: {
               accessToken: result.data.accessToken,
@@ -778,9 +915,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               clientId: cred.clientId || '',
               clientSecret: cred.clientSecret || '',
               region: cred.region || 'us-east-1',
+              startUrl: cred.startUrl,
               expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
               authMethod,
-              provider
+              provider: provider as 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO'
             },
             subscription: {
               type: result.data.subscriptionType as SubscriptionType,
@@ -853,7 +991,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           if (isKamiFormat) {
             // 卡密格式：还原为卡密文本
             const kamiLines = failedCredentials.map(c => 
-              [(c as Record<string, string>)._email || '', c.password || '', c.refreshToken, c.clientId || '', c.clientSecret || '', c.provider || ''].join('----')
+              [c._email || '', c.password || '', c.refreshToken, c.clientId || '', c.clientSecret || '', c.provider || ''].join('----')
             )
             setOidcBatchData(kamiLines.join('\n'))
           } else {
@@ -895,7 +1033,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         clientSecret,
         region,
         authMethod,
-        provider
+        provider,
+        profileArn: normalizeProfileArnInput(profileArn),
+        machineId: machineId.trim() || undefined,
+        startUrl: startUrl.trim() || undefined
       })
 
       if (result.success && result.data) {
@@ -914,7 +1055,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           email,
           userId,
           nickname: email ? email.split('@')[0] : undefined,
-          idp: providerName as 'BuilderId' | 'Github' | 'Google',
+          idp: providerName as IdpType,
+          profileArn: result.data.profileArn || normalizeProfileArnInput(profileArn),
+          machineId: machineId.trim() || undefined,
           groupId: selectedGroupId,
           credentials: {
             accessToken: result.data.accessToken,
@@ -923,9 +1066,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             clientId,
             clientSecret,
             region,
+            startUrl: startUrl.trim() || undefined,
             expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
             authMethod,
-            provider: (provider || 'BuilderId') as 'BuilderId' | 'Github' | 'Google'
+            provider: (provider || 'BuilderId') as 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO'
           },
           subscription: {
             type: result.data.subscriptionType as SubscriptionType,
@@ -977,6 +1121,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setRegion('us-east-1')
     setAuthMethod('IdC')
     setProvider('BuilderId')
+    setProfileArn('')
+    setMachineId('')
+    setStartUrl('')
     setSsoToken('')
     setVerifiedData(null)
     setError(null)
@@ -1119,10 +1266,44 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                       {isEn ? 'Complete login in browser...' : '请在浏览器中完成登录...'}
                     </p>
                     <p className="text-xs text-muted-foreground mt-1">
-                      {isEn ? 'Will auto return after login' : '登录完成后会自动返回'}
+                      {isEn
+                        ? 'Kiro social login uses the desktop callback. If the browser asks to open Kiro, allow it.'
+                        : 'Kiro 社交登录使用桌面端回调。如浏览器询问是否打开 Kiro，请允许。'}
                     </p>
                   </div>
                   
+                  <div className="space-y-2">
+                    {socialLoginUrl && (
+                      <Button
+                        variant="outline"
+                        className="w-full"
+                        onClick={() => window.api.openExternal(socialLoginUrl, usePrivateMode)}
+                      >
+                        <ExternalLink className="h-4 w-4 mr-2" />
+                        {isEn ? 'Open Login Again' : '重新打开登录'}
+                      </Button>
+                    )}
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">{isEn ? 'Callback URL' : '回调 URL'}</Label>
+                      <Input
+                        value={socialCallbackInput}
+                        onChange={(e) => setSocialCallbackInput(e.target.value)}
+                        placeholder="kiro://kiro.kiroAgent/authenticate-success?code=...&state=..."
+                        className="font-mono text-xs"
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                    </div>
+                    <Button
+                      className="w-full"
+                      disabled={isExchangingSocialCallback || !socialCallbackInput.trim()}
+                      onClick={handleSubmitSocialCallback}
+                    >
+                      {isExchangingSocialCallback && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                      {isEn ? 'Complete Login' : '完成登录'}
+                    </Button>
+                  </div>
+
                   <Button 
                     variant="destructive" 
                     className="w-full"
@@ -1341,23 +1522,27 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                   {loginType === 'iamsso' && iamSsoLoginData && (
                     <div className="space-y-4 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700">
                       <div className="text-center space-y-2">
-                        <p className="text-sm font-medium">{isEn ? 'Enter this code in browser:' : '在浏览器中输入此代码:'}</p>
-                        <div className="flex items-center justify-center gap-2">
-                          <code className="px-4 py-2 bg-primary/10 text-primary font-mono text-2xl font-bold rounded-lg">
-                            {iamSsoLoginData.userCode}
-                          </code>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => {
-                              navigator.clipboard.writeText(iamSsoLoginData.userCode)
-                              setCopied(true)
-                              setTimeout(() => setCopied(false), 2000)
-                            }}
-                          >
-                            {copied ? <Check className="w-4 h-4 text-success" /> : <Copy className="w-4 h-4" />}
-                          </Button>
-                        </div>
+                        {iamSsoLoginData.userCode && (
+                          <>
+                            <p className="text-sm font-medium">{isEn ? 'Enter this code in browser:' : '在浏览器中输入此代码:'}</p>
+                            <div className="flex items-center justify-center gap-2">
+                              <code className="px-4 py-2 bg-primary/10 text-primary font-mono text-2xl font-bold rounded-lg">
+                                {iamSsoLoginData.userCode}
+                              </code>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => {
+                                  navigator.clipboard.writeText(iamSsoLoginData.userCode)
+                                  setCopied(true)
+                                  setTimeout(() => setCopied(false), 2000)
+                                }}
+                              >
+                                {copied ? <Check className="w-4 h-4 text-success" /> : <Copy className="w-4 h-4" />}
+                              </Button>
+                            </div>
+                          </>
+                        )}
                       </div>
                       <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
                         <Loader2 className="w-4 h-4 animate-spin" />
@@ -1702,6 +1887,43 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                               onChange={(e) => setRegion(e.target.value)}
                               placeholder={isEn ? 'e.g., cn-north-1' : '例如: cn-north-1'}
                               className="w-28 h-10 px-2 text-sm rounded-xl border border-input bg-background/50"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="space-y-2">
+                          <label className="text-sm font-medium">Profile ARN</label>
+                          <input
+                            type="text"
+                            className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                            placeholder="arn:aws:codewhisperer:us-east-1:..."
+                            value={profileArn}
+                            onChange={(e) => setProfileArn(e.target.value)}
+                          />
+                          <p className="text-xs text-muted-foreground">
+                            {isEn ? 'Required for Kiro Power/Enterprise model chat.' : 'Kiro Power/Enterprise cần ARN thật để chat model.'}
+                          </p>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                          <div className="space-y-2">
+                            <label className="text-sm font-medium">Start URL</label>
+                            <input
+                              type="text"
+                              className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                              placeholder="https://view.awsapps.com/start"
+                              value={startUrl}
+                              onChange={(e) => setStartUrl(e.target.value)}
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm font-medium">Machine ID</label>
+                            <input
+                              type="text"
+                              className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                              placeholder="optional"
+                              value={machineId}
+                              onChange={(e) => setMachineId(e.target.value)}
                             />
                           </div>
                         </div>

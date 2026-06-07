@@ -11,6 +11,7 @@ import type {
   AccountExportData,
   AccountImportItem,
   BatchOperationResult,
+  AccountUsage,
   AccountSubscription,
   SubscriptionType,
   IdpType
@@ -50,6 +51,22 @@ let saveMaxWaitTimer: ReturnType<typeof setTimeout> | null = null
 let saveInFlight: Promise<void> | null = null
 /** 等待本轮防抖窗口落盘的所有调用方 resolver；批量唤醒，避免风暴时 Promise 永久挂起 */
 let savePendingResolvers: Array<() => void> = []
+/** Web multi-session tombstones: prevent stale tabs from restoring explicitly deleted accounts. */
+const deletedAccountIds = new Set<string>()
+
+type ProxyAccountUpdate = {
+  id: string
+  accessToken?: string
+  refreshToken?: string
+  expiresAt?: number
+  profileArn?: string
+  quotaUsed?: number
+  quotaUsedDelta?: number
+  quotaLimit?: number
+  quotaResetAt?: number
+  requestCount?: number
+  lastUsed?: number
+}
 
 // ============ getFilteredAccounts / getStats 引用缓存 ============
 // 大账号量场景下这两个 selector 每次 re-render 都跑 O(n) 计算（filter + sort）
@@ -128,7 +145,10 @@ async function syncLocalSsoAccountAsync(
       clientSecret: importResult.data.clientSecret || '',
       region: importResult.data.region,
       authMethod: importResult.data.authMethod,
-      provider: importResult.data.provider
+      provider: importResult.data.provider,
+      profileArn: importResult.data.profileArn,
+      machineId: importResult.data.machineId,
+      startUrl: importResult.data.startUrl
     })
     if (!verifyResult.success || !verifyResult.data) return
 
@@ -139,7 +159,9 @@ async function syncLocalSsoAccountAsync(
       email: verifyResult.data.email,
       userId: verifyResult.data.userId,
       nickname: verifyResult.data.email ? verifyResult.data.email.split('@')[0] : undefined,
-      idp: (importResult.data.provider || 'BuilderId') as 'BuilderId' | 'Google' | 'Github',
+      idp: (importResult.data.provider || 'BuilderId') as Account['idp'],
+      profileArn: verifyResult.data.profileArn || importResult.data.profileArn,
+      machineId: importResult.data.machineId,
       credentials: {
         accessToken: verifyResult.data.accessToken,
         csrfToken: '',
@@ -147,9 +169,10 @@ async function syncLocalSsoAccountAsync(
         clientId: importResult.data.clientId || '',
         clientSecret: importResult.data.clientSecret || '',
         region: importResult.data.region || 'us-east-1',
+        startUrl: importResult.data.startUrl,
         expiresAt: verifyResult.data.expiresIn ? now + verifyResult.data.expiresIn * 1000 : now + 3600 * 1000,
         authMethod: importResult.data.authMethod as 'IdC' | 'social',
-        provider: (importResult.data.provider || 'BuilderId') as 'BuilderId' | 'Github' | 'Google'
+        provider: (importResult.data.provider || 'BuilderId') as Account['credentials']['provider']
       },
       subscription: {
         type: verifyResult.data.subscriptionType as SubscriptionType,
@@ -229,6 +252,51 @@ function isBannedAccountError(error?: string): boolean {
 }
 
 // 自动换号定时器
+function normalizeUsagePercent(usage: { current?: number; limit?: number; percentUsed?: number }): number {
+  const current = Number(usage.current)
+  const limit = Number(usage.limit)
+  if (Number.isFinite(current) && Number.isFinite(limit) && limit > 0) {
+    return current / limit
+  }
+  const persisted = Number(usage.percentUsed)
+  if (!Number.isFinite(persisted)) return 0
+  return persisted > 1 && persisted <= 100 ? persisted / 100 : persisted
+}
+
+function normalizeAccountUsage(account: Account): Account {
+  const percentUsed = normalizeUsagePercent(account.usage)
+  if (account.usage.percentUsed === percentUsed) return account
+  return {
+    ...account,
+    usage: {
+      ...account.usage,
+      percentUsed
+    }
+  }
+}
+
+function usageResetAdvanced(currentUsage: AccountUsage, incomingUsage: Partial<AccountUsage>): boolean {
+  const currentReset = currentUsage.nextResetDate ? Date.parse(currentUsage.nextResetDate) : NaN
+  const incomingReset = incomingUsage.nextResetDate ? Date.parse(incomingUsage.nextResetDate) : NaN
+  return Number.isFinite(currentReset) && Number.isFinite(incomingReset) && incomingReset > currentReset
+}
+
+function mergeUsageSnapshot(currentUsage: AccountUsage, incomingUsage: Partial<AccountUsage>, now: number): AccountUsage {
+  const incomingCurrent = incomingUsage.current ?? currentUsage.current
+  const limit = incomingUsage.limit ?? currentUsage.limit
+  const current = incomingCurrent < currentUsage.current && !usageResetAdvanced(currentUsage, incomingUsage)
+    ? currentUsage.current
+    : incomingCurrent
+  return {
+    ...currentUsage,
+    ...incomingUsage,
+    current,
+    limit,
+    percentUsed: limit > 0 ? current / limit : 0,
+    lastUpdated: incomingUsage.lastUpdated ?? now
+  }
+}
+
 let autoSwitchTimer: ReturnType<typeof setInterval> | null = null
 
 // 定时自动保存定时器（防止数据丢失）
@@ -259,6 +327,7 @@ interface AccountsState {
 
   // 加载状态
   isLoading: boolean
+  hasLoadedStorage: boolean
   isSyncing: boolean
 
   // 自动刷新设置
@@ -449,6 +518,7 @@ interface AccountsActions {
   handleBackgroundCheckResult: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void
   /** 批量处理后台刷新结果：一次 set 应用 N 条结果，消除 N 次 Map 全量复制 */
   applyBackgroundRefreshResults: (items: Array<{ id: string; success: boolean; data?: unknown; error?: string }>) => void
+  applyProxyAccountUpdate: (account: ProxyAccountUpdate) => void
   /** 批量处理后台检查结果：一次 set 应用 N 条结果 */
   applyBackgroundCheckResults: (items: Array<{ id: string; success: boolean; data?: unknown; error?: string }>) => void
 
@@ -549,6 +619,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   sort: defaultSort,
   selectedIds: new Set(),
   isLoading: false,
+  hasLoadedStorage: false,
   isSyncing: false,
   autoRefreshEnabled: true,
   autoRefreshInterval: 5,
@@ -593,11 +664,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   addAccount: (accountData) => {
     const id = uuidv4()
     const now = Date.now()
+    deletedAccountIds.delete(id)
 
     // 如果没有提供 machineId，自动生成一个随机的 64 位十六进制设备 ID
     const machineId = accountData.machineId || generateRandomMachineId()
 
-    const account: Account = {
+    const account: Account = normalizeAccountUsage({
       ...accountData,
       id,
       machineId,
@@ -605,7 +677,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       lastUsedAt: now,
       isActive: false,
       tags: accountData.tags || []
-    }
+    } as Account)
 
     set((state) => {
       const accounts = new Map(state.accounts)
@@ -622,14 +694,66 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const accounts = new Map(state.accounts)
       const account = accounts.get(id)
       if (account) {
-        accounts.set(id, { ...account, ...updates })
+        accounts.set(id, normalizeAccountUsage({ ...account, ...updates }))
       }
       return { accounts }
     })
     get().saveToStorage()
   },
 
+  applyProxyAccountUpdate: (proxyAccount) => {
+    if (!proxyAccount.id) return
+    set((state) => {
+      const account = state.accounts.get(proxyAccount.id)
+      if (!account) return {}
+
+      const accounts = new Map(state.accounts)
+      const now = Date.now()
+      const incomingCurrent = typeof proxyAccount.quotaUsed === 'number'
+        ? proxyAccount.quotaUsed
+        : account.usage.current
+      const limit = typeof proxyAccount.quotaLimit === 'number'
+        ? proxyAccount.quotaLimit
+        : account.usage.limit
+      const nextResetDate = typeof proxyAccount.quotaResetAt === 'number'
+        ? new Date(proxyAccount.quotaResetAt).toISOString().slice(0, 10)
+        : account.usage.nextResetDate
+      const delta = typeof proxyAccount.quotaUsedDelta === 'number' && proxyAccount.quotaUsedDelta > 0
+        ? proxyAccount.quotaUsedDelta
+        : 0
+      const current = delta > 0 && account.usage.current > incomingCurrent
+        ? account.usage.current + delta
+        : Math.max(account.usage.current, incomingCurrent)
+
+      accounts.set(proxyAccount.id, normalizeAccountUsage({
+        ...account,
+        profileArn: proxyAccount.profileArn || account.profileArn,
+        credentials: {
+          ...account.credentials,
+          accessToken: proxyAccount.accessToken || account.credentials.accessToken,
+          refreshToken: proxyAccount.refreshToken || account.credentials.refreshToken,
+          expiresAt: proxyAccount.expiresAt || account.credentials.expiresAt
+        },
+        usage: {
+          ...account.usage,
+          current,
+          limit,
+          percentUsed: limit > 0 ? current / limit : 0,
+          lastUpdated: now,
+          nextResetDate
+        },
+        lastUsedAt: proxyAccount.lastUsed || now,
+        status: 'active',
+        lastError: undefined
+      }))
+
+      return { accounts }
+    })
+    get().saveToStorage()
+  },
+
   removeAccount: (id) => {
+    deletedAccountIds.add(id)
     set((state) => {
       const accounts = new Map(state.accounts)
       accounts.delete(id)
@@ -650,6 +774,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   removeAccounts: (ids) => {
     const result: BatchOperationResult = { success: 0, failed: 0, errors: [] }
+    for (const id of ids) deletedAccountIds.add(id)
 
     set((state) => {
       const accounts = new Map(state.accounts)
@@ -737,7 +862,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           machineIdHistory: [
             ...s.machineIdHistory,
             {
-              id: crypto.randomUUID(),
+              id: uuidv4(),
               machineId: newMachineId,
               timestamp: Date.now(),
               action: 'auto_switch' as const,
@@ -1453,11 +1578,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
             // 合并 usage 数据，确保包含所有必要字段
             const apiUsage = result.data!.usage
-            const mergedUsage = apiUsage ? {
-              current: apiUsage.current ?? acc.usage.current,
-              limit: apiUsage.limit ?? acc.usage.limit,
-              percentUsed: apiUsage.limit > 0 ? apiUsage.current / apiUsage.limit : 0,
-              lastUpdated: apiUsage.lastUpdated ?? Date.now(),
+            const mergedUsage = apiUsage ? mergeUsageSnapshot(acc.usage, {
+              current: apiUsage.current,
+              limit: apiUsage.limit,
+              lastUpdated: apiUsage.lastUpdated,
               baseLimit: apiUsage.baseLimit,
               baseCurrent: apiUsage.baseCurrent,
               freeTrialLimit: apiUsage.freeTrialLimit,
@@ -1466,7 +1590,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               bonuses: apiUsage.bonuses,
               nextResetDate: apiUsage.nextResetDate,
               resourceDetail: apiUsage.resourceDetail
-            } : acc.usage
+            }, Date.now()) : acc.usage
 
             // 合并订阅信息
             const apiSub = result.data!.subscription
@@ -1493,6 +1617,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               email: result.data!.email ?? acc.email,
               userId: result.data!.userId ?? acc.userId,
               idp: idpType,
+              profileArn: result.data!.profileArn ?? acc.profileArn,
               status: result.data!.status as AccountStatus,
               usage: mergedUsage,
               subscription: mergedSubscription as AccountSubscription,
@@ -1654,17 +1779,26 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const data = await window.api.loadAccounts()
 
       if (data) {
+        // Keep this set session-local. Persisted delete tombstones are enforced by
+        // the server merge layer; re-sending old tombstones from every browser tab
+        // can delete accounts restored or added by another session.
+        deletedAccountIds.clear()
         const accounts = new Map(Object.entries(data.accounts ?? {}) as [string, Account][])
         const activeAccountId = data.activeAccountId ?? null
 
         // 为没有 machineId 的现有账户生成一个
         let needsSave = false
         for (const [id, account] of accounts) {
-          if (!account.machineId) {
-            account.machineId = generateRandomMachineId()
-            accounts.set(id, account)
+          let nextAccount = normalizeAccountUsage(account)
+          if (!nextAccount.machineId) {
+            const generatedMachineId = generateRandomMachineId()
+            nextAccount = { ...nextAccount, machineId: generatedMachineId }
             needsSave = true
-            console.log(`[Store] Generated machineId for account ${account.email}: ${account.machineId.substring(0, 16)}...`)
+            console.log(`[Store] Generated machineId for account ${nextAccount.email}: ${generatedMachineId.substring(0, 16)}...`)
+          }
+          if (nextAccount !== account) {
+            accounts.set(id, nextAccount)
+            needsSave = true
           }
         }
 
@@ -1741,7 +1875,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     } catch (error) {
       console.error('Failed to load accounts:', error)
     } finally {
-      set({ isLoading: false })
+      set({ isLoading: false, hasLoadedStorage: true })
     }
   },
 
@@ -1782,14 +1916,16 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   flushSaveImmediately: async () => {
     if (saveDebounceTimer) { clearTimeout(saveDebounceTimer); saveDebounceTimer = null }
     if (saveMaxWaitTimer) { clearTimeout(saveMaxWaitTimer); saveMaxWaitTimer = null }
-    const pending = savePendingResolvers
-    savePendingResolvers = []
     if (saveInFlight) {
       const inflight = saveInFlight
-      void inflight.then(() => { for (const r of pending) r() })
-      return inflight
+      await inflight
+      // State may have changed while the previous snapshot was being persisted.
+      // Flush again so callers waiting on this save observe their latest mutation on disk.
+      return get().flushSaveImmediately()
     }
 
+    const pending = savePendingResolvers
+    savePendingResolvers = []
     const {
       accounts,
       groups,
@@ -1849,7 +1985,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           proxyPool: Object.fromEntries(proxyPool),
           proxyPoolConfig,
           proxyPoolCursor,
-          accountProxyBindings
+          accountProxyBindings,
+          _deletedAccountIds: Array.from(deletedAccountIds)
         })
       } catch (error) {
         console.error('Failed to save accounts:', error)
@@ -2484,13 +2621,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           expiresAt: refreshData?.expiresIn ? now + refreshData.expiresIn * 1000 : account.credentials.expiresAt
         },
         usage: refreshData?.usage ? (() => {
-          const newCurrent = refreshData.usage.current ?? account.usage.current
-          const newLimit = refreshData.usage.limit ?? account.usage.limit
-          return {
-            ...account.usage,
-            current: newCurrent,
-            limit: newLimit,
-            percentUsed: newLimit > 0 ? newCurrent / newLimit : 0,
+          return mergeUsageSnapshot(account.usage, {
+            current: refreshData.usage.current,
+            limit: refreshData.usage.limit,
             baseCurrent: refreshData.usage.baseCurrent ?? account.usage.baseCurrent,
             baseLimit: refreshData.usage.baseLimit ?? account.usage.baseLimit,
             freeTrialCurrent: refreshData.usage.freeTrialCurrent ?? account.usage.freeTrialCurrent,
@@ -2500,7 +2633,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             nextResetDate: refreshData.usage.nextResetDate ?? account.usage.nextResetDate,
             resourceDetail: refreshData.usage.resourceDetail ?? account.usage.resourceDetail,
             lastUpdated: now
-          }
+          }, now)
         })() : account.usage,
         subscription: refreshData?.subscription ? {
           ...account.subscription,
@@ -2593,13 +2726,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       accounts.set(id, {
         ...account,
         usage: checkData?.usage ? (() => {
-          const newCurrent = checkData.usage.current ?? account.usage.current
-          const newLimit = checkData.usage.limit ?? account.usage.limit
-          return {
-            ...account.usage,
-            current: newCurrent,
-            limit: newLimit,
-            percentUsed: newLimit > 0 ? newCurrent / newLimit : 0,
+          return mergeUsageSnapshot(account.usage, {
+            current: checkData.usage.current,
+            limit: checkData.usage.limit,
             baseCurrent: checkData.usage.baseCurrent ?? account.usage.baseCurrent,
             baseLimit: checkData.usage.baseLimit ?? account.usage.baseLimit,
             freeTrialCurrent: checkData.usage.freeTrialCurrent ?? account.usage.freeTrialCurrent,
@@ -2609,7 +2738,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             nextResetDate: checkData.usage.nextResetDate ?? account.usage.nextResetDate,
             resourceDetail: checkData.usage.resourceDetail ?? account.usage.resourceDetail,
             lastUpdated: now
-          }
+          }, now)
         })() : account.usage,
         subscription: checkData?.subscription ? {
           ...account.subscription,
@@ -2726,7 +2855,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           machineIdHistory: [
             ...s.machineIdHistory,
             {
-              id: crypto.randomUUID(),
+              id: uuidv4(),
               machineId: machineIdToSet,
               timestamp: Date.now(),
               action: 'manual'
@@ -2765,7 +2894,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           machineIdHistory: [
             ...s.machineIdHistory,
             {
-              id: crypto.randomUUID(),
+              id: uuidv4(),
               machineId: originalMachineId,
               timestamp: Date.now(),
               action: 'restore'
@@ -2787,7 +2916,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     if (!account) return
 
     // 生成或使用提供的机器码
-    const boundMachineId = machineId || crypto.randomUUID()
+    const boundMachineId = machineId || uuidv4()
 
     set((state) => ({
       accountMachineIds: {
@@ -2797,7 +2926,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       machineIdHistory: [
         ...state.machineIdHistory,
         {
-          id: crypto.randomUUID(),
+          id: uuidv4(),
           machineId: boundMachineId,
           timestamp: Date.now(),
           action: 'bind',
@@ -2828,7 +2957,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         machineIdHistory: [
           ...s.machineIdHistory,
           {
-            id: crypto.randomUUID(),
+            id: uuidv4(),
             machineId: currentMachineId,
             timestamp: Date.now(),
             action: 'initial'

@@ -202,6 +202,9 @@ const api = {
     region?: string
     authMethod?: string  // 'IdC' 或 'social'
     provider?: string    // 'BuilderId', 'Github', 'Google'
+    profileArn?: string
+    machineId?: string
+    startUrl?: string
   }): Promise<{
     success: boolean
     data?: {
@@ -212,6 +215,7 @@ const api = {
       expiresIn?: number
       subscriptionType: string
       subscriptionTitle: string
+      profileArn?: string
       usage: { current: number; limit: number }
       daysRemaining?: number
       expiresAt?: number
@@ -246,6 +250,9 @@ const api = {
       region: string
       authMethod: string  // 'IdC' 或 'social'
       provider: string    // 'BuilderId', 'Github', 'Google'
+      profileArn?: string
+      startUrl?: string
+      machineId?: string
     }
     error?: string
   }> => {
@@ -307,11 +314,14 @@ const api = {
     return ipcRenderer.invoke('cancel-builder-id-login')
   },
 
-  // 启动 IAM Identity Center SSO 登录 (Authorization Code flow)
+  // 启动 IAM Identity Center SSO 登录
   startIamSsoLogin: (startUrl: string, region?: string): Promise<{
     success: boolean
     authorizeUrl?: string
+    userCode?: string
+    verificationUri?: string
     expiresIn?: number
+    interval?: number
     error?: string
   }> => {
     return ipcRenderer.invoke('start-iam-sso-login', startUrl, region || 'us-east-1')
@@ -476,6 +486,8 @@ const api = {
     releaseName?: string
     releaseUrl?: string
     publishedAt?: string
+    source?: string
+    packageName?: string
     assets?: Array<{
       name: string
       downloadUrl: string
@@ -495,6 +507,16 @@ const api = {
   installUpdate: (): Promise<void> => {
     return ipcRenderer.invoke('install-update')
   },
+
+  applyKrouterUpdate: async (): Promise<{
+    success: boolean
+    updated?: boolean
+    error?: string
+  }> => ({
+    success: false,
+    updated: false,
+    error: 'Dashboard self-update is available in the web/npm backend.'
+  }),
 
   // 监听更新事件
   onUpdateChecking: (callback: () => void): (() => void) => {
@@ -613,7 +635,7 @@ const api = {
   // ============ Kiro API 反代服务器 ============
 
   // 启动反代服务器
-  proxyStart: (config?: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; logRequests?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think' }): Promise<{ success: boolean; port?: number; error?: string }> => {
+  proxyStart: (config?: { port?: number; host?: string; apiKey?: string; enabled?: boolean; autoStart?: boolean; enableMultiAccount?: boolean; accountSelectionStrategy?: 'smart' | 'round-robin' | 'sticky' | 'least-used'; sessionAffinityEnabled?: boolean; logRequests?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think' }): Promise<{ success: boolean; port?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-start', config)
   },
 
@@ -628,6 +650,18 @@ const api = {
   },
 
   // 重置累计 credits
+  dashboardTunnelGetStatus: (): Promise<{ running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }> => {
+    return ipcRenderer.invoke('dashboard-tunnel-get-status')
+  },
+
+  dashboardTunnelStart: (input?: { localUrl?: string; binary?: string }): Promise<{ success: boolean; status: { running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }; error?: string }> => {
+    return ipcRenderer.invoke('dashboard-tunnel-start', input)
+  },
+
+  dashboardTunnelStop: (): Promise<{ success: boolean; status: { running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }; error?: string }> => {
+    return ipcRenderer.invoke('dashboard-tunnel-stop')
+  },
+
   proxyResetCredits: (): Promise<{ success: boolean }> => {
     return ipcRenderer.invoke('proxy-reset-credits')
   },
@@ -738,7 +772,7 @@ const api = {
     return ipcRenderer.invoke('proxy-get-models')
   },
 
-  proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null }> }): Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }> => {
+  proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null }> }): Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; apiKey?: { id?: string; name?: string; key: string }; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }> => {
     return ipcRenderer.invoke('proxy-configure-clients', input)
   },
 
@@ -818,6 +852,16 @@ const api = {
     ipcRenderer.on('proxy-status-change', handler)
     return () => {
       ipcRenderer.removeListener('proxy-status-change', handler)
+    }
+  },
+
+  onProxyAccountUpdate: (callback: (account: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string; quotaUsed?: number; quotaUsedDelta?: number; quotaLimit?: number; quotaResetAt?: number; requestCount?: number; lastUsed?: number }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, account: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string; quotaUsed?: number; quotaUsedDelta?: number; quotaLimit?: number; quotaResetAt?: number; requestCount?: number; lastUsed?: number }): void => {
+      callback(account)
+    }
+    ipcRenderer.on('proxy-account-update', handler)
+    return () => {
+      ipcRenderer.removeListener('proxy-account-update', handler)
     }
   },
 
@@ -1199,6 +1243,13 @@ const api = {
     return ipcRenderer.invoke('proxy-pool:validate', params)
   },
 
+  networkRouteValidate: (params?: {
+    testUrl?: string
+    timeoutMs?: number
+  }): Promise<{ success: boolean; latencyMs?: number; externalIp?: string; route: string; error?: string }> => {
+    return ipcRenderer.invoke('network-route:validate', params)
+  },
+
   /** 代理链分阶段诊断（用于定位"上游/目标/端到端"哪一层失败） */
   proxyPoolDiagnoseChain: (params: {
     targetUrl: string
@@ -1272,6 +1323,7 @@ const api = {
     latencyMs: number
     model?: string
     content?: string
+    profileArn?: string
     usage?: { inputTokens: number; outputTokens: number; credits: number }
     error?: string
   }> => {

@@ -16,7 +16,8 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, isPlaceholderProfileArn, resolveProfileArn } from './proxy/kiroApi'
+import { KIRO_PROXY_MODEL_PRESETS } from './proxy/modelCatalog'
 import {
   writeKiroAuthTokenFile,
   readKiroAuthTokenFile,
@@ -45,6 +46,36 @@ import {
 // ============ 自动更新配置 ============
 autoUpdater.autoDownload = false
 autoUpdater.autoInstallOnAppQuit = true
+
+type KiroModelUiRecord = {
+  id: string
+  name?: string
+  description?: string
+  inputTypes?: string[]
+  maxInputTokens?: number | null
+  maxOutputTokens?: number | null
+  rateMultiplier?: number
+  rateUnit?: string
+}
+
+function withKiroModelPresets(models: KiroModelUiRecord[]): KiroModelUiRecord[] {
+  const output = [...models]
+  const seen = new Set(output.map(model => model.id))
+  for (const preset of KIRO_PROXY_MODEL_PRESETS) {
+    if (!seen.has(preset.id)) {
+      seen.add(preset.id)
+      output.push({
+        id: preset.id,
+        name: preset.name,
+        description: preset.description,
+        inputTypes: preset.inputTypes,
+        maxInputTokens: preset.maxInputTokens,
+        maxOutputTokens: preset.maxOutputTokens
+      })
+    }
+  }
+  return output
+}
 
 function setupAutoUpdater(): void {
   // 检查更新出错
@@ -394,7 +425,14 @@ function initProxyServer(): ProxyServer {
           id: account.id,
           accessToken: account.accessToken,
           refreshToken: account.refreshToken,
-          expiresAt: account.expiresAt
+          expiresAt: account.expiresAt,
+          profileArn: account.profileArn,
+          quotaUsed: account.quotaUsed,
+          quotaUsedDelta: account.quotaUsedDelta,
+          quotaLimit: account.quotaLimit,
+          quotaResetAt: account.quotaResetAt,
+          requestCount: account.requestCount,
+          lastUsed: account.lastUsed
         })
       },
       // 账号被 Kiro 后端长期封禁 - 通知渲染进程标记 lastError + 持久化到 store
@@ -795,7 +833,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        clientName: 'Kiro Account Manager',
+        clientName: 'Krouter',
         clientType: 'public',
         scopes,
         grantTypes: ['urn:ietf:params:oauth:grant-type:device_code', 'refresh_token'],
@@ -1129,6 +1167,8 @@ async function fetchRestApi(
   return await fetchWithAppProxy(url, { method: 'GET', headers })
 }
 
+const LEGACY_BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
+
 async function getUsageLimitsRest(
   accessToken: string,
   profileArn?: string,
@@ -1146,8 +1186,9 @@ async function getUsageLimitsRest(
     resourceType: 'AGENTIC_REQUEST',
     isEmailRequired: 'true'
   })
-  if (profileArn) {
-    params.set('profileArn', profileArn)
+  const normalizedProfileArn = profileArn?.trim()
+  if (normalizedProfileArn && normalizedProfileArn !== LEGACY_BUILDER_ID_PROFILE_ARN) {
+    params.set('profileArn', normalizedProfileArn)
   }
   const path = `/getUsageLimits?${params.toString()}`
   
@@ -1983,14 +2024,14 @@ function initTray(): void {
   })
 
   // 设置初始提示
-  setTrayTooltip(`Kiro 账号管理器 v${app.getVersion()}`)
+  setTrayTooltip(`Krouter v${app.getVersion()}`)
 }
 
 function createWindow(): void {
   // Create the browser window.
   const isMac = process.platform === 'darwin'
   mainWindow = new BrowserWindow({
-    title: `Kiro 账号管理器 v${app.getVersion()}`,
+    title: `Krouter v${app.getVersion()}`,
     width: 1200,   // 刚好容纳 3 列卡片 (340*3 + 16*2 + 边距)
     height: 1200,
     minWidth: 800,
@@ -2017,7 +2058,7 @@ function createWindow(): void {
 
   mainWindow.on('ready-to-show', () => {
     // 设置带版本号的标题（HTML 加载后会覆盖初始标题）
-    mainWindow?.setTitle(`Kiro 账号管理器 v${app.getVersion()}`)
+    mainWindow?.setTitle(`Krouter v${app.getVersion()}`)
     mainWindow?.show()
     
     // 检查代理服务自启动配置
@@ -2031,7 +2072,7 @@ function createWindow(): void {
         
         console.log('[ProxyServer] Auto-starting proxy server...')
         const server = initProxyServer()
-        server.updateConfig(savedProxyConfig)
+        server.updateConfig({ ...savedProxyConfig, enabled: true })
         
         // 自启动时同步账号到代理池（含重试机制应对冷启动数据延迟）
         const syncAccountsToPool = (): number => {
@@ -2071,8 +2112,7 @@ function createWindow(): void {
             }))
           if (proxyAccounts.length > 0) {
             const pool = server.getAccountPool()
-            pool.clear()
-            proxyAccounts.forEach(acc => pool.addAccount(acc))
+            pool.replaceAccounts(proxyAccounts)
           }
           return proxyAccounts.length
         }
@@ -2099,6 +2139,7 @@ function createWindow(): void {
         }
         
         await server.start()
+        store.set('proxyConfig', server.getConfig())
         console.log('[ProxyServer] Auto-started successfully on port', savedProxyConfig.port || 5580)
       } catch (error) {
         console.error('[ProxyServer] Auto-start failed:', error)
@@ -2365,9 +2406,9 @@ app.whenReady().then(async () => {
     
     // 更新托盘提示
     if (account) {
-      setTrayTooltip(`Kiro 账号管理器\n当前账户: ${account.email}`)
+      setTrayTooltip(`Krouter\nTài khoản hiện tại: ${account.email}`)
     } else {
-      setTrayTooltip(`Kiro 账号管理器 v${app.getVersion()}`)
+      setTrayTooltip(`Krouter v${app.getVersion()}`)
     }
   })
 
@@ -2456,7 +2497,7 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 手动检查更新（使用 GitHub API，用于 AboutPage）
-  const GITHUB_REPO = 'chaogei/Kiro-account-manager'
+  const GITHUB_REPO = 'LightHaru/Krouter'
   const GITHUB_API_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`
   
   ipcMain.handle('check-for-updates-manual', async () => {
@@ -2467,7 +2508,7 @@ app.whenReady().then(async () => {
       const response = await fetchWithAppProxy(GITHUB_API_URL, {
         headers: {
           'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'Kiro-Account-Manager'
+          'User-Agent': 'Krouter'
         }
       })
       
@@ -2726,15 +2767,82 @@ app.whenReady().then(async () => {
       }
 
       // 3) 构建最小 OpenAI chat 请求 → 转 Kiro payload
+      const resolvedProfileArn = resolveProfileArn(proxyAccount)
+      const compactErrorMessage = (error: unknown, maxLength = 360): string => {
+        const raw = error instanceof Error ? error.message : String(error)
+        return raw.split('\n')[0].slice(0, maxLength)
+      }
+      const isAccountAuthBlocked = (error: unknown): boolean => {
+        const message = (error instanceof Error ? error.message : String(error)).toLowerCase()
+        return message.includes('auth error 401')
+          || message.includes('auth error 403')
+          || message.includes('temporarily_suspended')
+          || message.includes('permanently_suspended')
+          || message.includes('accountsuspendedexception')
+          || message.includes('temporarily suspended')
+          || message.includes('account suspended')
+          || message.includes('user id is temporarily suspended')
+          || message.includes('unusual user activity')
+          || message.includes('locked it as a security precaution')
+          || message.includes('restricted your ability to use kiro')
+      }
+      const runCredentialCheck = async (fallbackReason?: string): Promise<{
+        success: boolean
+        latencyMs: number
+        model: string
+        content: string
+      }> => {
+        const usageResult = await getUsageAndLimits(
+          accessToken,
+          acc.provider || 'BuilderId',
+          undefined,
+          acc.machineId,
+          acc.region,
+          acc.email
+        )
+        const creditUsage = usageResult.usageBreakdownList?.find(
+          item => item.resourceType === 'CREDIT' || item.type === 'CREDIT'
+        )
+        const current = creditUsage?.currentUsageWithPrecision ?? creditUsage?.currentUsage ?? 0
+        const limit = creditUsage?.usageLimitWithPrecision ?? creditUsage?.usageLimit ?? 0
+        return {
+          success: true,
+          latencyMs: Date.now() - start,
+          model: 'credential-check',
+          content: `${fallbackReason ? `${fallbackReason} ` : ''}Credential and quota check passed for ${acc.email || 'unknown'}, usage ${current}/${limit}.`
+        }
+      }
+
+      if (!resolvedProfileArn) {
+        return await runCredentialCheck('No usable streaming profileArn is available for this account, so model chat was skipped.')
+      }
+
       const payload = openaiToKiro({
         model,
         messages: [{ role: 'user', content: message }],
         stream: false,
         max_tokens: 64
-      }, proxyAccount.profileArn)
+      }, resolvedProfileArn)
 
       // 4) 调用（与反代服务器内部完全相同的底层调用）
-      const result = await callKiroApi(proxyAccount, payload, controller.signal)
+      let result: Awaited<ReturnType<typeof callKiroApi>>
+      try {
+        result = await callKiroApi(proxyAccount, payload, controller.signal)
+      } catch (error) {
+        if (!controller.signal.aborted && isPlaceholderProfileArn(resolvedProfileArn)) {
+          const detail = compactErrorMessage(error)
+          if (isAccountAuthBlocked(error)) {
+            return {
+              success: false,
+              latencyMs: Date.now() - start,
+              model,
+              error: `Builder ID model liveness failed: ${detail}`
+            }
+          }
+          return await runCredentialCheck(`Builder ID model liveness fallback: Kiro did not accept the fixed placeholder profileArn (${detail}).`)
+        }
+        throw error
+      }
       const latencyMs = Date.now() - start
       const content = (result.content || '').trim()
       return {
@@ -4805,7 +4913,7 @@ app.whenReady().then(async () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          clientName: 'Kiro Account Manager',
+          clientName: 'Krouter',
           clientType: 'public',
           scopes,
           grantTypes: ['urn:ietf:params:oauth:grant-type:device_code', 'refresh_token'],
@@ -4990,7 +5098,7 @@ app.whenReady().then(async () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          clientName: 'Kiro Account Manager',
+          clientName: 'Krouter',
           clientType: 'public',
           scopes,
           grantTypes: ['authorization_code', 'refresh_token'],
@@ -5451,11 +5559,11 @@ app.whenReady().then(async () => {
 
       const models = await fetchKiroModels(proxyAccount)
       return {
-        models: models.map(m => ({
+        models: withKiroModelPresets(models.map(m => ({
           id: m.modelId,
           name: m.modelName,
           description: m.description
-        }))
+        })))
       }
     } catch (error) {
       console.error('[KiroSettings] Failed to fetch models:', error)
@@ -5755,10 +5863,9 @@ app.whenReady().then(async () => {
   ipcMain.handle('proxy-start', async (_event, config?: Partial<ProxyConfig>) => {
     try {
       const server = initProxyServer()
-      if (config) {
-        server.updateConfig(config)
-      }
+      server.updateConfig({ ...(config || {}), enabled: true })
       await server.start()
+      if (store) store.set('proxyConfig', server.getConfig())
       // 更新托盘菜单状态
       updateTrayMenu()
       return { success: true, port: server.getConfig().port }
@@ -5771,9 +5878,10 @@ app.whenReady().then(async () => {
   // IPC: 停止反代服务器
   ipcMain.handle('proxy-stop', async () => {
     try {
-      if (proxyServer) {
-        await proxyServer.stop()
-      }
+      const server = proxyServer || initProxyServer()
+      if (server.isRunning()) await server.stop()
+      server.updateConfig({ enabled: false })
+      if (store) store.set('proxyConfig', server.getConfig())
       // 更新托盘菜单状态
       updateTrayMenu()
       return { success: true }
@@ -6157,10 +6265,7 @@ app.whenReady().then(async () => {
     try {
       const server = initProxyServer()
       const pool = server.getAccountPool()
-      pool.clear()
-      for (const account of accounts) {
-        pool.addAccount(account)
-      }
+      pool.replaceAccounts(accounts)
       return { success: true, accountCount: pool.size }
     } catch (error) {
       console.error('[ProxyServer] Sync accounts failed:', error)
@@ -6251,7 +6356,7 @@ app.whenReady().then(async () => {
       } as ProxyAccount)
       return {
         success: true,
-        models: models.map(m => ({
+        models: withKiroModelPresets(models.map(m => ({
           id: m.modelId,
           name: m.modelName,
           description: m.description,
@@ -6260,7 +6365,7 @@ app.whenReady().then(async () => {
           maxOutputTokens: m.tokenLimits?.maxOutputTokens,
           rateMultiplier: m.rateMultiplier,
           rateUnit: m.rateUnit
-        }))
+        })))
       }
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to get models', models: [] }

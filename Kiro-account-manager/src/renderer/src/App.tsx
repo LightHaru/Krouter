@@ -23,6 +23,7 @@ function App(): React.JSX.Element {
     stopAutoTokenRefresh,
     applyBackgroundRefreshResults,
     applyBackgroundCheckResults,
+    applyProxyAccountUpdate,
     flushSaveImmediately,
     accounts,
     activeAccountId,
@@ -245,6 +246,16 @@ function App(): React.JSX.Element {
     }
   }, [applyBackgroundCheckResults])
 
+  useEffect(() => {
+    if (typeof window.api.onProxyAccountUpdate !== 'function') return
+    const unsubscribe = window.api.onProxyAccountUpdate((account) => {
+      applyProxyAccountUpdate(account)
+    })
+    return () => {
+      unsubscribe()
+    }
+  }, [applyProxyAccountUpdate])
+
   // 监听反代账号被封禁事件（TEMPORARILY_SUSPENDED / AccountSuspendedException）
   // 反代触发后，把封禁状态同步到 store 让 UI 显示
   useEffect(() => {
@@ -297,14 +308,14 @@ function App(): React.JSX.Element {
   return (
     <div className="h-screen ambient-bg overflow-hidden flex flex-col">
       <TitleBar />
-      <div className="flex-1 min-h-0 flex gap-2 p-2">
+      <div className="flex-1 min-h-0 flex gap-2 p-2 max-md:flex-col">
         <Sidebar
           currentPage={currentPage}
           onPageChange={setCurrentPage}
           collapsed={sidebarCollapsed}
           onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
         />
-        <main className="flex-1 min-w-0 overflow-hidden rounded-3xl page-surface">
+        <main className="flex-1 min-w-0 overflow-hidden rounded-3xl page-surface max-md:rounded-2xl">
           <AnimatePresence mode="wait">
             <motion.div
               key={currentPage}

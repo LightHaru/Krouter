@@ -178,14 +178,6 @@ function getKiroAmzUserAgent(machineId?: string): string {
   return `aws-sdk-js/${AWS_SDK_VERSION} ${suffix}`
 }
 
-const KIRO_CLI_OS = OS_PLATFORM === 'win32' ? 'windows' : OS_PLATFORM === 'macos' ? 'macos' : 'linux'
-const KIRO_CLI_USER_AGENT = `aws-sdk-rust/1.3.9 os/${KIRO_CLI_OS} lang/rust/1.87.0`
-const KIRO_CLI_AMZ_USER_AGENT = `aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/${KIRO_CLI_OS} lang/rust/1.87.0 m/E app/AmazonQ-For-CLI`
-
-// Agent 模式
-const AGENT_MODE_SPEC = 'spec' // IDE 模式
-const AGENT_MODE_VIBE = 'vibe' // CLI 模式
-
 // profileArn 决策中心已迁移到 ../kiroAuthSync，反代和账号管理器主进程共用同一份定义，
 // 防止多处常量漂移。注意 KIRO_BUILDER_ID_PLACEHOLDER_ARN 仍以本模块为出口 re-export，
 // 这样 main/index.ts 等老 import 路径不需要改。
@@ -196,20 +188,29 @@ import {
 } from '../kiroAuthSync'
 
 export const KIRO_BUILDER_ID_PLACEHOLDER_ARN = _KIRO_BUILDER_ID_PLACEHOLDER_ARN
+export const KIRO_BUILDER_ID_PROFILE_ARN = KIRO_BUILDER_ID_PLACEHOLDER_ARN
 export const isPlaceholderProfileArn = _isPlaceholderProfileArn
 
 /**
  * 反代调 Kiro API 时使用的 profileArn 决策。
  * BuilderId 使用占位符 ARN，Social 使用固定 ARN。
- * 注意：流式端点（generateAssistantResponse / SendMessageStreaming）对占位符 ARN 会 403，
- * 需在 callKiroApiStream 中额外剥离。
+ * Streaming endpoints currently require the Builder ID placeholder ARN on
+ * some deployments and reject it on others. callKiroApiStream handles the
+ * compatibility retry.
  */
-function resolveProfileArn(account: ProxyAccount): string | undefined {
-  if (account.profileArn && !isPlaceholderProfileArn(account.profileArn)) {
-    return account.profileArn
+export function resolveProfileArn(account: Pick<ProxyAccount, 'profileArn' | 'authMethod' | 'provider'>): string | undefined {
+  const explicit = account.profileArn?.trim()
+  if (explicit && !isPlaceholderProfileArn(explicit)) {
+    return explicit
   }
-  if (account.authMethod === 'social' || account.provider === 'Github' || account.provider === 'Google') {
+
+  const authMethod = account.authMethod?.toLowerCase()
+  const provider = account.provider?.toLowerCase()
+  if (authMethod === 'social' || provider === 'github' || provider === 'google') {
     return KIRO_SOCIAL_PROFILE_ARN
+  }
+  if (provider === 'enterprise' || provider === 'iam_sso' || provider === 'awsidc' || authMethod === 'external_idp') {
+    return undefined
   }
   return KIRO_BUILDER_ID_PLACEHOLDER_ARN
 }
@@ -1159,20 +1160,25 @@ function getAccountMachineId(accountId: string, accountMachineId?: string): stri
 }
 
 // 获取认证方式对应的请求头
-function getAuthHeaders(account: ProxyAccount, _endpoint: typeof KIRO_ENDPOINTS[0]): Record<string, string> {
-  const isIDC = account.authMethod?.toLowerCase() === 'idc'
+function getAuthHeaders(
+  account: ProxyAccount,
+  _endpoint: typeof KIRO_ENDPOINTS[0],
+  agentMode = 'vibe'
+): Record<string, string> {
   const machineId = getAccountMachineId(account.id, account.machineId)
-  const agentMode = isIDC ? AGENT_MODE_VIBE : AGENT_MODE_SPEC
-  
+
+  // authMethod controls token refresh only. Official Kiro IDE uses its IDE
+  // identity for Builder ID, social, and enterprise requests alike.
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     'x-amzn-kiro-agent-mode': agentMode,
-    'x-amz-user-agent': isIDC ? KIRO_CLI_AMZ_USER_AGENT : getKiroAmzUserAgent(machineId),
-    'user-agent': isIDC ? KIRO_CLI_USER_AGENT : getKiroUserAgent(machineId),
+    'x-amz-user-agent': getKiroAmzUserAgent(machineId),
+    'user-agent': getKiroUserAgent(machineId),
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=3',
     'Authorization': `Bearer ${account.accessToken}`
   }
+  if (account.authMethod === 'external_idp') headers.TokenType = 'EXTERNAL_IDP'
   return headers
 }
 
@@ -1207,6 +1213,35 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw getAbortError(signal)
 }
 
+function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal)
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }, ms)
+    const abort = () => {
+      clearTimeout(timeout)
+      reject(getAbortError(signal))
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
+
+function parseRetryAfterMs(headers: Headers): number | undefined {
+  const value = headers.get('retry-after')
+  if (!value) return undefined
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return Math.min(15000, Math.max(500, Math.ceil(seconds * 1000)))
+  }
+  const dateMs = Date.parse(value)
+  if (Number.isFinite(dateMs) && dateMs > Date.now()) {
+    return Math.min(15000, Math.max(500, dateMs - Date.now()))
+  }
+  return undefined
+}
+
 // 调用 Kiro API（流式）
 export async function callKiroApiStream(
   account: ProxyAccount,
@@ -1224,9 +1259,11 @@ export async function callKiroApiStream(
     try {
       throwIfAborted(signal)
       const requestPayload = clonePayload(payload)
-      // 流式端点对 BuilderId 占位符 ARN 返回 403，仅传真实 ARN 或 Social ARN
+      // Builder ID streaming behavior differs across Kiro backends. Current
+      // endpoints require the placeholder ARN, while some older deployments
+      // reject it with 403. Send it first, then retry once without it on 403.
       const resolvedArn = resolveProfileArn(account)
-      if (resolvedArn && !isPlaceholderProfileArn(resolvedArn)) {
+      if (resolvedArn) {
         requestPayload.profileArn = resolvedArn
       } else {
         delete requestPayload.profileArn
@@ -1244,8 +1281,8 @@ export async function callKiroApiStream(
         delete (requestPayload.conversationState as unknown as Record<string, unknown>).agentTaskType
       }
 
-      const payloadStr = JSON.stringify(requestPayload)
-      const headers = getAuthHeaders(account, endpoint)
+      let payloadStr = JSON.stringify(requestPayload)
+      const headers = getAuthHeaders(account, endpoint, requestPayload.conversationState.agentTaskType || 'vibe')
       const currentUserInput = requestPayload.conversationState.currentMessage.userInputMessage
       const historyMessages = requestPayload.conversationState.history ?? []
       const historyToolUseCount = historyMessages.reduce((count, message) => count + (message.assistantResponseMessage?.toolUses?.length ?? 0), 0)
@@ -1263,14 +1300,39 @@ export async function callKiroApiStream(
       
       const agent = getNetworkAgent(account)
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
-      const response = agent
+      const sendRequest = async (): Promise<Response> => agent
         ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
         : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
 
+      let response = await sendRequest()
+      if (response.status === 403 && isPlaceholderProfileArn(requestPayload.profileArn)) {
+        const originalStatus = response.status
+        const originalBody = await response.text().catch(() => '')
+        throwIfAborted(signal)
+        console.log(`[KiroAPI] Endpoint ${endpoint.name} rejected Builder ID placeholder profileArn, retrying without it...`)
+        delete requestPayload.profileArn
+        payloadStr = JSON.stringify(requestPayload)
+        response = await sendRequest()
+        if (!response.ok) {
+          // Current Kiro endpoints require profileArn. Preserve the original
+          // authorization failure instead of masking it as "profileArn is required".
+          await response.text().catch(() => '')
+          throw new Error(`Auth error ${originalStatus}: ${originalBody}`)
+        }
+      }
+
       if (response.status === 429) {
-        console.log(`[KiroAPI] Endpoint ${endpoint.name} quota exhausted, trying next...`)
-        lastError = new Error(`Quota exhausted on ${endpoint.name}`)
-        continue
+        const retryDelayMs = parseRetryAfterMs(response.headers) ?? 2500
+        const firstBody = await response.text().catch(() => '')
+        console.log(`[KiroAPI] Endpoint ${endpoint.name} rate limited, retrying once after ${retryDelayMs}ms...`)
+        await waitForRetry(retryDelayMs, signal)
+        response = await sendRequest()
+        if (response.status === 429) {
+          const body = await response.text().catch(() => firstBody)
+          console.log(`[KiroAPI] Endpoint ${endpoint.name} rate limited, trying next...`)
+          lastError = new Error(`Endpoint rate limited on ${endpoint.name} (429)${body ? `: ${body}` : ''}`)
+          continue
+        }
       }
 
       if (response.status === 401 || response.status === 403) {
@@ -1298,7 +1360,7 @@ export async function callKiroApiStream(
         return
       }
       lastError = error as Error
-      console.error(`[KiroAPI] Endpoint ${endpoint.name} failed:`, error)
+      console.error(`[KiroAPI] Endpoint ${endpoint.name} failed:`, error instanceof Error ? error.message : String(error))
       
       // 如果是认证错误，不继续尝试其他端点
       if ((error as Error).message.includes('Auth error')) {
@@ -2000,7 +2062,7 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
         break
       }
 
-      const data = await response.json()
+      const data = await response.json() as { models?: KiroModel[]; nextToken?: string }
       allModels.push(...(data.models || []))
       nextToken = data.nextToken
     } while (nextToken)
@@ -2131,12 +2193,12 @@ export async function fetchSubscriptionToken(
     const response = await fetchWithProxy(url, { method: 'POST', headers, body: JSON.stringify(payload) }, account)
     
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
+      const errorData = await response.json().catch(() => ({})) as { message?: string }
       console.error('[KiroAPI] CreateSubscriptionToken failed:', response.status, errorData)
       return { message: errorData.message || `Request failed with status ${response.status}` }
     }
 
-    const data = await response.json()
+    const data = await response.json() as SubscriptionTokenResponse
     return data
   } catch (error) {
     console.error('[KiroAPI] CreateSubscriptionToken error:', error)

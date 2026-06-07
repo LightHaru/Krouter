@@ -2,9 +2,10 @@ import { useMemo } from 'react'
 import { useAccountsStore } from '@/store/accounts'
 import { Card, CardContent, CardHeader, CardTitle } from '../ui'
 import { Users, CheckCircle, AlertTriangle, Clock, Zap, Shield, Fingerprint, FolderPlus, Tag, TrendingUp, Activity, BarChart3 } from 'lucide-react'
-import kiroLogo from '@/assets/kiro-high-resolution-logo-transparent.png'
+import krouterLogo from '@/assets/krouter-logo.svg'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
+import { APP_NAME, APP_TAGLINE, APP_TAGLINE_VI } from '@/brand'
 
 // 订阅类型颜色映射
 const getSubscriptionColor = (type: string, title?: string): string => {
@@ -94,20 +95,20 @@ export function HomePage() {
   )
 
   return (
-    <div className="flex-1 p-6 space-y-6 overflow-auto">
+    <div className="flex-1 p-4 md:p-6 space-y-5 md:space-y-6 overflow-auto">
       {/* Header */}
-      <div className="page-hero p-6">
+      <div className="page-hero p-5 md:p-6">
         <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-primary/20 to-transparent rounded-full blur-2xl" />
         <div className="absolute bottom-0 left-0 w-24 h-24 bg-gradient-to-tr from-primary/20 to-transparent rounded-full blur-2xl" />
-        <div className="relative flex items-center gap-4">
+        <div className="relative flex flex-col sm:flex-row sm:items-center gap-4">
           <img 
-            src={kiroLogo} 
-            alt="Kiro" 
-            className={cn("h-14 w-auto transition-all", darkMode && "invert brightness-0")} 
+            src={krouterLogo} 
+            alt={APP_NAME} 
+            className={cn("h-14 sm:h-16 w-auto max-w-full transition-all", darkMode && "brightness-110")} 
           />
-          <div>
-            <h1 className="text-2xl font-bold text-primary">{isEn ? 'Welcome to Kiro Account Manager' : '欢迎使用 Kiro 账户管理器'}</h1>
-            <p className="text-muted-foreground">{isEn ? 'Manage your Kiro IDE accounts, one-click switch' : '管理你的 Kiro IDE 账号，一键切换，高效开发'}</p>
+          <div className="min-w-0">
+            <h1 className="text-xl sm:text-2xl font-bold text-primary">{APP_NAME}</h1>
+            <p className="text-sm sm:text-base text-muted-foreground max-w-2xl">{isEn ? APP_TAGLINE : APP_TAGLINE_VI}</p>
           </div>
         </div>
       </div>

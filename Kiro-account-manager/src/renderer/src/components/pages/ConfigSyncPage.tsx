@@ -21,7 +21,7 @@ import { Card, CardContent, CardHeader, CardTitle, Button, Label, Switch } from 
 interface PortableConfig {
   version: 1
   exportedAt: string
-  app: string  // "kiro-account-manager"
+  app: string  // "krouter"
   /** 代理池条目（脱敏：密码字段会被打码） */
   proxyPool?: Array<Record<string, unknown>>
   proxyPoolConfig?: Record<string, unknown>
@@ -92,7 +92,7 @@ export function ConfigSyncPage(): React.ReactNode {
     const payload: PortableConfig = {
       version: 1,
       exportedAt: new Date().toISOString(),
-      app: 'kiro-account-manager'
+      app: 'krouter'
     }
 
     if (opts.proxyPool && store.proxyPool.size > 0) {
@@ -178,7 +178,7 @@ export function ConfigSyncPage(): React.ReactNode {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `kiro-config-${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.${extension}`
+    a.download = `krouter-config-${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.${extension}`
     a.click()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   }, [opts, store, encryptPassword, isEn])
@@ -198,8 +198,8 @@ export function ConfigSyncPage(): React.ReactNode {
         }
       }
       const data = JSON.parse(text) as PortableConfig
-      if (data.app !== 'kiro-account-manager') {
-        setLastImportResult({ success: false, error: '文件不是有效的 Kiro 账号管理器配置（app 标识不匹配）' })
+      if (data.app !== 'krouter' && data.app !== 'kiro-account-manager') {
+        setLastImportResult({ success: false, error: '文件不是有效的 Krouter配置（app 标识不匹配）' })
         return
       }
 
@@ -614,3 +614,4 @@ async function decryptText(envelope: string, password: string): Promise<string> 
   )
   return new TextDecoder().decode(plaintext)
 }
+

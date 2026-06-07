@@ -86,7 +86,7 @@ export class CertManager {
     // 设置证书属性
     const attrs = [
       { name: 'commonName', value: 'K-Proxy CA' },
-      { name: 'organizationName', value: 'Kiro Account Manager' },
+      { name: 'organizationName', value: 'Krouter' },
       { name: 'countryName', value: 'CN' }
     ]
     cert.setSubject(attrs)

@@ -324,7 +324,7 @@ export function ProxyPoolPage(): React.ReactNode {
   const [advancedSearchOpen, setAdvancedSearchOpen] = useState(false)
   const [isValidatingAll, setIsValidatingAll] = useState(false)
   const [testConcurrency, setTestConcurrency] = useState(10)
-  // 反代分桶：每代理承载账号数（0 = 均分）
+  // 反代路由：每代理承载账号数（0 = 均分）
   const [accountsPerProxy, setAccountsPerProxy] = useState<number>(5)
   const [bindingPanelExpanded, setBindingPanelExpanded] = useState(false)
   // 代理链诊断状态
@@ -370,7 +370,7 @@ export function ProxyPoolPage(): React.ReactNode {
   const proxies = useMemo(() => Array.from(proxyPool.values()), [proxyPool])
   const poolHealth = useMemo(() => computePoolHealth(proxies), [proxies])
 
-  // 反代分桶：当前账号-代理绑定关系
+  // 反代路由：当前账号-代理绑定关系
   const bindingStats = useMemo(() => {
     const allAccounts = Array.from(accounts.values())
     const totalActive = allAccounts.filter((a) => a.status === 'active').length
@@ -622,8 +622,8 @@ export function ProxyPoolPage(): React.ReactNode {
             </h1>
             <p className="text-muted-foreground">
               {isEn
-                ? 'IP rotation pool for registration tasks. Reduces association/risk control on batch sign-ups.'
-                : '注册批量任务的 IP 轮换池。降低同 IP 多账号关联风控。'
+                ? 'Proxy routing for registration tasks. Use only for legitimate network configuration; it does not bypass provider risk controls.'
+                : '注册任务的代理路由配置。仅用于合规网络配置，不能绕过服务商风控。'
               }
             </p>
           </div>
@@ -792,8 +792,8 @@ export function ProxyPoolPage(): React.ReactNode {
             </div>
             <p className="text-[11px] text-muted-foreground leading-relaxed">
               {isEn
-                ? 'When set, traffic chains: local → relay → target proxy → site. Use when the target proxy requires a non-mainland source IP (e.g. bestproxy). Supports http/socks5; your VPN local port works.'
-                : '填写后链路为：本机 → 上游中转 → 目标代理 → 目标站点。用于目标代理要求非大陆来源 IP 的情况（如 bestproxy）。支持 http/socks5，可填你科学上网的本地端口。'}
+                ? 'When set, traffic chains: local → relay → target proxy → site. Use only to satisfy your proxy provider routing or allowlist requirements. Supports http/socks5.'
+                : '填写后链路为：本机 → 上游中转 → 目标代理 → 目标站点。仅用于满足代理服务商的路由或白名单要求。支持 http/socks5。'}
             </p>
             {chainDiagnose && <ChainDiagnosisCard diag={chainDiagnose} isEn={isEn} />}
           </div>
@@ -1076,16 +1076,16 @@ export function ProxyPoolPage(): React.ReactNode {
         </CardContent>
       </Card>
 
-      {/* 反代账号-代理 N:1 分桶 */}
+      {/* 反代账号-代理路由 */}
       <Card className="hover-lift">
         <CardHeader className="pb-3">
           <CardTitle className="text-base flex items-center gap-2">
             <Link2 className="h-4 w-4 text-primary" />
-            {isEn ? 'Reverse Proxy: Account-to-IP Bucketing' : '反代分桶（账号绑定代理 IP）'}
+            {isEn ? 'Reverse Proxy: Account Routing' : '反代路由（账号绑定代理）'}
             <span className="text-[10px] font-normal text-muted-foreground">
               {isEn
-                ? '— Limit accounts per IP to avoid risk-control association'
-                : '— 限制每 IP 账号数，避免被风控关联'
+                ? '— Keep routing explicit and auditable'
+                : '— 保持路由配置明确且可审计'
               }
             </span>
           </CardTitle>

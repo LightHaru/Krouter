@@ -87,6 +87,8 @@ export function KProxyPanel() {
   const [deviceIdCopied, setDeviceIdCopied] = useState(false)
   const [recentRequests, setRecentRequests] = useState<KProxyRecentRequest[]>(_kproxyRecentRequests)
   const [caInstalled, setCaInstalled] = useState<boolean | null>(null)
+  const [useKProxyForApi, setUseKProxyForApi] = useState(false)
+  const [routingLoading, setRoutingLoading] = useState(false)
 
   // 检查 CA 证书是否已安装
   const checkCaInstalled = useCallback(async () => {
@@ -135,6 +137,12 @@ export function KProxyPanel() {
     initKProxy()
     checkCaInstalled()
   }, [initKProxy, checkCaInstalled])
+
+  useEffect(() => {
+    window.api.getUseKProxyForApi()
+      .then(setUseKProxyForApi)
+      .catch(() => setUseKProxyForApi(false))
+  }, [])
 
   // 监听事件
   useEffect(() => {
@@ -191,6 +199,21 @@ export function KProxyPanel() {
       await window.api.kproxyUpdateConfig(updates)
     } catch (err) {
       console.error('Failed to update config:', err)
+    }
+  }
+
+  const toggleApiRouting = async () => {
+    const next = !useKProxyForApi
+    setRoutingLoading(true)
+    setUseKProxyForApi(next)
+    try {
+      const result = await window.api.setUseKProxyForApi(next)
+      setUseKProxyForApi(Boolean(result.enabled))
+    } catch (err) {
+      setUseKProxyForApi(!next)
+      setError(err instanceof Error ? err.message : 'Failed to update API routing')
+    } finally {
+      setRoutingLoading(false)
     }
   }
 
@@ -280,6 +303,50 @@ export function KProxyPanel() {
       )}
 
       {/* 主控制卡片 */}
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
+        <div className="rounded-lg border bg-card p-4">
+          <div className="text-xs text-muted-foreground">{isEn ? 'MITM daemon' : 'MITM daemon'}</div>
+          <div className={cn('mt-2 text-sm font-semibold', isRunning ? 'text-green-600' : 'text-muted-foreground')}>
+            {isRunning ? (isEn ? 'Running' : 'Dang chay') : (isEn ? 'Stopped' : 'Dang tat')}
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">{config.host}:{config.port}</div>
+        </div>
+        <div className="rounded-lg border bg-card p-4">
+          <div className="text-xs text-muted-foreground">{isEn ? 'Auto start' : 'Tu khoi dong'}</div>
+          <div className={cn('mt-2 text-sm font-semibold', config.autoStart ? 'text-green-600' : 'text-muted-foreground')}>
+            {config.autoStart ? (isEn ? 'Enabled' : 'Da bat') : (isEn ? 'Disabled' : 'Chua bat')}
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {isEn ? 'Web backend restores it on restart.' : 'Backend web se tu bat lai sau restart.'}
+          </div>
+        </div>
+        <div className="rounded-lg border bg-card p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-xs text-muted-foreground">{isEn ? 'API routing' : 'Route API'}</div>
+              <div className={cn('mt-2 text-sm font-semibold', useKProxyForApi ? 'text-green-600' : 'text-muted-foreground')}>
+                {useKProxyForApi ? (isEn ? 'Via K-Proxy' : 'Qua K-Proxy') : (isEn ? 'Direct' : 'Di thang')}
+              </div>
+            </div>
+            <Switch checked={useKProxyForApi} onCheckedChange={toggleApiRouting} disabled={routingLoading} />
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {useKProxyForApi && !isRunning
+              ? (isEn ? 'Start K-Proxy before this route.' : 'Can Start K-Proxy truoc khi dung route nay.')
+              : (isEn ? 'Controls API Proxy network path.' : 'Dieu khien duong di cua API Proxy.')}
+          </div>
+        </div>
+        <div className="rounded-lg border bg-card p-4">
+          <div className="text-xs text-muted-foreground">{isEn ? 'CA certificate' : 'CA certificate'}</div>
+          <div className={cn('mt-2 text-sm font-semibold', caInstalled ? 'text-green-600' : 'text-muted-foreground')}>
+            {caInstalled ? (isEn ? 'Trusted' : 'Da trust') : (isEn ? 'Not trusted' : 'Chua trust')}
+          </div>
+          <div className="mt-1 truncate text-xs text-muted-foreground">
+            {caInfo?.fingerprint || (isEn ? 'CA is created after init.' : 'CA duoc tao sau khi init.')}
+          </div>
+        </div>
+      </div>
+
       <Card>
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between">

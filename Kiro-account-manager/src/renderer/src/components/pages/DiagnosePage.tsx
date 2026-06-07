@@ -24,8 +24,38 @@ interface LivenessResult {
   latencyMs: number
   model?: string
   content?: string
+  profileArn?: string
   usage?: { inputTokens: number; outputTokens: number; credits: number }
   error?: string
+}
+
+function getAuthBlockedLivenessMessage(result: LivenessResult): string | null {
+  const raw = `${result.error || ''} ${result.content || ''}`.trim()
+  const message = raw.toLowerCase()
+  if (!message) return null
+  const blocked = message.includes('auth error 401')
+    || message.includes('auth error 403')
+    || message.includes('temporarily_suspended')
+    || message.includes('permanently_suspended')
+    || message.includes('accountsuspendedexception')
+    || message.includes('temporarily suspended')
+    || message.includes('account suspended')
+    || message.includes('user id is temporarily suspended')
+    || message.includes('unusual user activity')
+    || message.includes('locked it as a security precaution')
+    || message.includes('restricted your ability to use kiro')
+  return blocked ? raw : null
+}
+
+function normalizeLivenessResult(result: LivenessResult): LivenessResult {
+  const blockedMessage = getAuthBlockedLivenessMessage(result)
+  if (!blockedMessage) return result
+  return {
+    ...result,
+    success: false,
+    content: undefined,
+    error: blockedMessage
+  }
 }
 
 /** 脱敏代理 URL（隐藏密码） */
@@ -48,59 +78,59 @@ interface DiagnoseTarget {
 const DEFAULT_TARGETS: DiagnoseTarget[] = [
   // 网络连通
   {
-    id: 'public-ip', label: { en: 'Public connectivity', zh: '公网连通性' }, url: 'https://api.ipify.org?format=json',
-    category: 'network', description: { en: 'Check basic internet access', zh: '检测能否访问互联网（基础连通性）' }
+    id: 'public-ip', label: { en: 'Public connectivity', zh: 'Kết nối internet' }, url: 'https://api.ipify.org?format=json',
+    category: 'network', description: { en: 'Check basic internet access', zh: 'Kiểm tra truy cập internet cơ bản' }
   },
   {
     id: 'cloudflare', label: { en: 'Cloudflare', zh: 'Cloudflare' }, url: 'https://1.1.1.1',
-    category: 'network', description: { en: 'Check international network reachability', zh: '检测国际网络是否通畅' }
+    category: 'network', description: { en: 'Check international network reachability', zh: 'Kiểm tra đường mạng quốc tế' }
   },
   // Kiro / AWS
   {
     id: 'kiro-auth', label: { en: 'Kiro Auth Endpoint', zh: 'Kiro Auth Endpoint' },
     url: 'https://prod.us-east-1.auth.desktop.kiro.dev/.well-known/openid-configuration',
-    category: 'kiro', description: { en: 'Social login token refresh endpoint', zh: '社交登录 Token 刷新端点' },
+    category: 'kiro', description: { en: 'Social login token refresh endpoint', zh: 'Endpoint làm mới token đăng nhập' },
     expectStatus: [200, 401, 403, 404]
   },
   {
     id: 'kiro-oidc', label: { en: 'AWS OIDC', zh: 'AWS OIDC' },
     url: 'https://oidc.us-east-1.amazonaws.com/',
-    category: 'kiro', description: { en: 'OIDC registration endpoint', zh: 'OIDC 注册端点' },
+    category: 'kiro', description: { en: 'OIDC registration endpoint', zh: 'Endpoint đăng ký OIDC' },
     expectStatus: [200, 400, 403, 405]
   },
   {
     id: 'kiro-codewhisperer', label: { en: 'CodeWhisperer API', zh: 'CodeWhisperer API' },
     url: 'https://q.us-east-1.amazonaws.com/',
-    category: 'kiro', description: { en: 'Kiro main API endpoint (q.amazonaws.com)', zh: 'Kiro 主 API 端点（q.amazonaws.com）' },
+    category: 'kiro', description: { en: 'Kiro main API endpoint (q.amazonaws.com)', zh: 'Endpoint API chính của Kiro (q.amazonaws.com)' },
     expectStatus: [200, 400, 403, 405]
   },
   {
     id: 'aws-signin', label: { en: 'AWS SignIn', zh: 'AWS SignIn' },
     url: 'https://us-east-1.signin.aws/',
-    category: 'kiro', description: { en: 'Required endpoint for the signup flow', zh: '注册流程必经端点' },
+    category: 'kiro', description: { en: 'Required endpoint for the signup flow', zh: 'Endpoint cần cho luồng đăng ký' },
     expectStatus: [200, 400, 403]
   },
   // Email Services
   {
     id: 'tempmail-plus', label: { en: 'TempMail.Plus API', zh: 'TempMail.Plus API' },
     url: 'https://tempmail.plus/api/mails?email=test@mailto.plus',
-    category: 'email', description: { en: 'TempMail.Plus mailbox service', zh: 'TempMail.Plus 邮箱服务' },
+    category: 'email', description: { en: 'TempMail.Plus mailbox service', zh: 'Dịch vụ hộp thư TempMail.Plus' },
     expectStatus: [200, 400, 401, 403]
   },
   {
     id: 'outlook-login', label: { en: 'Outlook Login', zh: 'Outlook Login' },
     url: 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
-    category: 'email', description: { en: 'Outlook token refresh endpoint', zh: 'Outlook Token 刷新端点' },
+    category: 'email', description: { en: 'Outlook token refresh endpoint', zh: 'Endpoint làm mới token Outlook' },
     expectStatus: [200, 400, 405]
   }
 ]
 
 const CATEGORIES = [
-  { id: 'network', label: { en: 'Network', zh: '网络' }, icon: Globe, color: 'text-blue-500' },
+  { id: 'network', label: { en: 'Network', zh: 'Mạng' }, icon: Globe, color: 'text-blue-500' },
   { id: 'kiro', label: { en: 'Kiro / AWS', zh: 'Kiro / AWS' }, icon: Activity, color: 'text-purple-500' },
-  { id: 'email', label: { en: 'Email', zh: '邮箱服务' }, icon: Mail, color: 'text-amber-500' },
-  { id: 'proxy', label: { en: 'Proxy', zh: '代理' }, icon: Network, color: 'text-cyan-500' },
-  { id: 'custom', label: { en: 'Custom', zh: '自定义' }, icon: Activity, color: 'text-emerald-500' }
+  { id: 'email', label: { en: 'Email', zh: 'Email' }, icon: Mail, color: 'text-amber-500' },
+  { id: 'proxy', label: { en: 'Proxy', zh: 'Proxy' }, icon: Network, color: 'text-cyan-500' },
+  { id: 'custom', label: { en: 'Custom', zh: 'Tùy chỉnh' }, icon: Activity, color: 'text-emerald-500' }
 ] as const
 
 type DiagnoseResult = { id: string; success: boolean; httpStatus?: number; latencyMs?: number; error?: string }
@@ -192,7 +222,7 @@ export function DiagnosePage(): React.ReactNode {
   const testOneAccount = useCallback(async (account: typeof accountList[number]): Promise<LivenessResult> => {
     const cred = account.credentials
     try {
-      return await window.api.diagnoseAccountLiveness({
+      const result = await window.api.diagnoseAccountLiveness({
         account: {
           id: account.id,
           email: account.email,
@@ -202,7 +232,7 @@ export function DiagnosePage(): React.ReactNode {
           clientSecret: cred.clientSecret,
           region: cred.region,
           authMethod: cred.authMethod,
-          provider: cred.provider,
+          provider: cred.provider || account.idp,
           profileArn: account.profileArn,
           machineId: account.machineId,
           expiresAt: cred.expiresAt,
@@ -211,10 +241,15 @@ export function DiagnosePage(): React.ReactNode {
         model: livenessModel.trim(),
         message: livenessMessage.trim() || undefined
       })
+      const normalized = normalizeLivenessResult(result)
+      if (normalized.profileArn && normalized.profileArn !== account.profileArn) {
+        updateAccount(account.id, { profileArn: normalized.profileArn })
+      }
+      return normalized
     } catch (err) {
       return { success: false, latencyMs: 0, error: err instanceof Error ? err.message : String(err) }
     }
-  }, [livenessModel, livenessMessage, getAccountProxyUrl])
+  }, [livenessModel, livenessMessage, getAccountProxyUrl, updateAccount])
 
   const runLiveness = useCallback(async (): Promise<void> => {
     const account = accounts.get(livenessAccountId)
@@ -225,8 +260,13 @@ export function DiagnosePage(): React.ReactNode {
     const res = await testOneAccount(account)
     if (livenessAbort.current) return  // 组件已卸载，不再 setState
     setLivenessResult(res)
+    if (res.success) {
+      updateAccount(account.id, { status: 'active', lastError: undefined })
+    } else {
+      updateAccount(account.id, { status: 'error', lastError: res.error || (isEn ? 'Liveness test failed' : 'Kiểm tra liveness thất bại') })
+    }
     setLivenessRunning(false)
-  }, [accounts, livenessAccountId, testOneAccount])
+  }, [accounts, livenessAccountId, testOneAccount, updateAccount, isEn])
 
   /** 批量测活选中账号（并发受限，可中止） */
   const runLivenessBatch = useCallback(async (): Promise<void> => {
@@ -251,12 +291,17 @@ export function DiagnosePage(): React.ReactNode {
           next.set(acc.id, res)
           return next
         })
+        if (res.success) {
+          updateAccount(acc.id, { status: 'active', lastError: undefined })
+        } else {
+          updateAccount(acc.id, { status: 'error', lastError: res.error || (isEn ? 'Liveness test failed' : 'Kiểm tra liveness thất bại') })
+        }
       }
     }
     const workers = Array.from({ length: Math.min(livenessConcurrency, selectedAccounts.length) }, () => worker())
     await Promise.all(workers)
     if (!livenessAbort.current) setLivenessRunning(false)
-  }, [selectedAccounts, testOneAccount, livenessConcurrency])
+  }, [selectedAccounts, testOneAccount, livenessConcurrency, updateAccount, isEn])
 
   /** 停止批量测活 */
   const stopLivenessBatch = useCallback((): void => {
@@ -273,7 +318,12 @@ export function DiagnosePage(): React.ReactNode {
     const res = await testOneAccount(account)
     if (livenessAbort.current) return
     setLivenessBatch((prev) => new Map(prev).set(accountId, res))
-  }, [accounts, testOneAccount])
+    if (res.success) {
+      updateAccount(accountId, { status: 'active', lastError: undefined })
+    } else {
+      updateAccount(accountId, { status: 'error', lastError: res.error || (isEn ? 'Liveness test failed' : 'Kiểm tra liveness thất bại') })
+    }
+  }, [accounts, testOneAccount, updateAccount, isEn])
 
   /** 当前批量结果里失败的账号（保持 selectedAccounts 顺序） */
   const failedAccountIds = useMemo(() => {
@@ -300,18 +350,23 @@ export function DiagnosePage(): React.ReactNode {
         const res = await testOneAccount(acc)
         if (livenessAbort.current) break
         setLivenessBatch((prev) => new Map(prev).set(acc.id, res))
+        if (res.success) {
+          updateAccount(acc.id, { status: 'active', lastError: undefined })
+        } else {
+          updateAccount(acc.id, { status: 'error', lastError: res.error || (isEn ? 'Liveness test failed' : 'Kiểm tra liveness thất bại') })
+        }
       }
     }
     const workers = Array.from({ length: Math.min(livenessConcurrency, queue.length) }, () => worker())
     await Promise.all(workers)
     if (!livenessAbort.current) setLivenessRunning(false)
-  }, [failedAccountIds, accounts, testOneAccount, livenessConcurrency])
+  }, [failedAccountIds, accounts, testOneAccount, livenessConcurrency, updateAccount, isEn])
 
   /** 一键把失败账号标记为 error 状态（账号管理页会显示红色错误态） */
   const markFailedAsError = useCallback((): void => {
     for (const id of failedAccountIds) {
       const r = livenessBatch.get(id)
-      updateAccount(id, { status: 'error', lastError: r?.error || (isEn ? 'Liveness test failed' : '测活失败') })
+      updateAccount(id, { status: 'error', lastError: r?.error || (isEn ? 'Liveness test failed' : 'Kiểm tra liveness thất bại') })
     }
   }, [failedAccountIds, livenessBatch, updateAccount, isEn])
 
@@ -322,7 +377,7 @@ export function DiagnosePage(): React.ReactNode {
     const ok = window.confirm(
       isEn
         ? `Delete ${ids.length} accounts that failed the liveness test? This cannot be undone.`
-        : `确定删除 ${ids.length} 个测活失败的账号？此操作不可恢复。`
+        : `Xóa ${ids.length} tài khoản kiểm tra liveness thất bại? Không thể hoàn tác.`
     )
     if (!ok) return
     removeAccounts(ids)
@@ -379,10 +434,10 @@ export function DiagnosePage(): React.ReactNode {
       const probeUrl = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
       list.push({
         id: 'custom-probe',
-        label: { en: 'Custom Probe URL', zh: '自定义探测 URL' },
+        label: { en: 'Custom Probe URL', zh: 'URL kiểm tra tùy chỉnh' },
         url: probeUrl,
         category: 'custom',
-        description: { en: 'User-provided URL for connectivity test', zh: '用户填写的 URL 连通性测试' },
+        description: { en: 'User-provided URL for connectivity test', zh: 'URL người dùng nhập để kiểm tra kết nối' },
         expectStatus: [200, 201, 204, 301, 302, 400, 401, 403, 404, 405]
       })
     }
@@ -425,9 +480,9 @@ export function DiagnosePage(): React.ReactNode {
   const exportReport = useCallback(() => {
     const targets = buildTargets()
     const lines = [
-      isEn ? 'Kiro Account Manager - Diagnostic Report' : 'Kiro Account Manager - 诊断报告',
+      isEn ? 'Krouter - Diagnostic Report' : 'Krouter - 诊断报告',
       `${isEn ? 'Generated' : '生成时间'}: ${new Date().toLocaleString()}`,
-      `${isEn ? 'Proxy' : '代理'}: ${useProxy && selectedProxyId ? proxyPool.get(selectedProxyId)?.url : (isEn ? 'Direct' : '直连')}`,
+      `${isEn ? 'Proxy' : 'Proxy'}: ${useProxy && selectedProxyId ? proxyPool.get(selectedProxyId)?.url : (isEn ? 'Direct' : 'Trực tiếp')}`,
       `------------------------------------`
     ]
     for (const tg of targets) {
@@ -435,9 +490,9 @@ export function DiagnosePage(): React.ReactNode {
       lines.push(`[${pick(tg.label)}]`)
       lines.push(`  URL: ${tg.url}`)
       if (!r) {
-        lines.push(`  ${isEn ? 'Status' : '状态'}: ${isEn ? 'Not tested' : '未测试'}`)
+        lines.push(`  ${isEn ? 'Status' : 'Trạng thái'}: ${isEn ? 'Not tested' : 'Chưa kiểm tra'}`)
       } else {
-        lines.push(`  ${isEn ? 'Status' : '状态'}: ${r.success ? (isEn ? '✓ Pass' : '✓ 通过') : (isEn ? '✗ Fail' : '✗ 失败')}`)
+        lines.push(`  ${isEn ? 'Status' : 'Trạng thái'}: ${r.success ? (isEn ? '✓ Pass' : '✓ Đạt') : (isEn ? '✗ Fail' : '✗ Lỗi')}`)
         if (r.httpStatus) lines.push(`  HTTP: ${r.httpStatus}`)
         if (r.latencyMs != null) lines.push(`  ${isEn ? 'Latency' : '延迟'}: ${r.latencyMs}ms`)
         if (r.error) lines.push(`  ${isEn ? 'Error' : '错误'}: ${r.error}`)
@@ -474,7 +529,7 @@ export function DiagnosePage(): React.ReactNode {
             <p className="text-muted-foreground">
               {isEn
                 ? 'Test network / Kiro API / email service / proxy connectivity in one click.'
-                : '一键检测网络、Kiro/AWS API、邮箱服务、代理连通性，快速定位问题'
+                : 'Kiểm tra mạng, Kiro/AWS API, email service và proxy trong một lần.'
               }
             </p>
           </div>
@@ -492,7 +547,7 @@ export function DiagnosePage(): React.ReactNode {
         <CardContent className="space-y-3">
           {/* 自定义探测 URL */}
           <div className="space-y-1">
-            <Label className="text-xs">{isEn ? 'Custom probe URL (optional)' : '自定义探测 URL（可选）'}</Label>
+            <Label className="text-xs">{isEn ? 'Custom probe URL (optional)' : 'URL kiểm tra tùy chỉnh (tùy chọn)'}</Label>
             <Input
               value={customProbeUrl}
               onChange={(e) => setCustomProbeUrl(e.target.value)}
@@ -503,7 +558,7 @@ export function DiagnosePage(): React.ReactNode {
             <p className="text-[11px] text-muted-foreground">
               {isEn
                 ? 'Any HTTP/HTTPS endpoint will be added to the diagnostic list (HEAD request, expecting 2xx/3xx/4xx).'
-                : '可填任意 HTTP/HTTPS 地址用于连通性测试（HEAD 请求，2xx/3xx/4xx 都视为通）。'}
+                : 'Có thể nhập endpoint HTTP/HTTPS bất kỳ để kiểm tra kết nối (HEAD, 2xx/3xx/4xx đều tính là thông).'}
             </p>
           </div>
 
@@ -516,7 +571,7 @@ export function DiagnosePage(): React.ReactNode {
                 onChange={(e) => setUseProxy(e.target.checked)}
                 disabled={isRunning}
               />
-              <span>{isEn ? 'Test through proxy' : '通过代理测试'}</span>
+              <span>{isEn ? 'Test through proxy' : 'Kiểm tra qua proxy'}</span>
             </label>
             {useProxy && (
               availableProxies.length > 0 ? (
@@ -526,7 +581,7 @@ export function DiagnosePage(): React.ReactNode {
                   disabled={isRunning}
                   className="h-8 px-2 rounded-md border bg-background text-xs flex-1 max-w-md"
                 >
-                  <option value="">-- {isEn ? 'Select a proxy' : '选择一个代理'} --</option>
+                  <option value="">-- {isEn ? 'Select a proxy' : 'Chọn proxy'} --</option>
                   {availableProxies.map((p) => (
                     <option key={p.id} value={p.id}>
                       {p.protocol}://{p.host}:{p.port}
@@ -538,8 +593,8 @@ export function DiagnosePage(): React.ReactNode {
               ) : (
                 <span className="text-xs text-muted-foreground italic">
                   {proxyPoolConfig.enabled
-                    ? (isEn ? 'No available proxy in pool' : '代理池无可用代理')
-                    : (isEn ? 'Proxy pool disabled, configure it in "Proxy Pool" first' : '代理池未启用，请先在「代理池」配置')}
+                    ? (isEn ? 'No available proxy in pool' : 'Không có proxy khả dụng trong kho')
+                    : (isEn ? 'Proxy pool disabled, configure it in "Proxy Pool" first' : 'Kho proxy chưa bật, hãy cấu hình trong trang Proxy Pool trước')}
                 </span>
               )
             )}
@@ -553,7 +608,7 @@ export function DiagnosePage(): React.ReactNode {
               }
               {isRunning
                 ? `运行中 ${progress.done}/${progress.total}`
-                : (isEn ? 'Run Diagnostics' : '开始诊断')
+                : (isEn ? 'Run Diagnostics' : 'Chạy chẩn đoán')
               }
             </Button>
             {stats.total > 0 && (
@@ -583,14 +638,14 @@ export function DiagnosePage(): React.ReactNode {
         <CardHeader className="pb-2">
           <CardTitle className="text-sm flex items-center gap-2">
             <MessageSquare className="h-4 w-4 text-emerald-500" />
-            {isEn ? 'Account Liveness Test' : '账号测活'}
+            {isEn ? 'Account Liveness Test' : 'Kiểm tra liveness tài khoản'}
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-[11px] text-muted-foreground">
             {isEn
               ? 'Send a real chat message to the selected model via the reverse-proxy call path (account-bound proxy applies). Verifies the account can actually get a response.'
-              : '走反代底层调用给指定模型发一条真实消息（自动应用账号绑定的代理），验证账号能否正常返回。'}
+              : 'Gửi một tin nhắn thật tới model qua đường API proxy, tự dùng proxy đã gán cho tài khoản để xác nhận tài khoản còn trả lời được.'}
           </p>
 
           {/* 模式切换：单个账号 / 选中账号批量 */}
@@ -604,7 +659,7 @@ export function DiagnosePage(): React.ReactNode {
                 livenessMode === 'single' ? 'bg-background shadow-sm' : 'text-muted-foreground hover:text-foreground'
               )}
             >
-              {isEn ? 'Single' : '单个账号'}
+              {isEn ? 'Single' : 'Một tài khoản'}
             </button>
             <button
               type="button"
@@ -615,7 +670,7 @@ export function DiagnosePage(): React.ReactNode {
                 livenessMode === 'selected' ? 'bg-background shadow-sm' : 'text-muted-foreground hover:text-foreground'
               )}
             >
-              {isEn ? 'Selected' : '选中账号'}
+              {isEn ? 'Selected' : 'Đã chọn'}
               <Badge variant="secondary" className="h-4 px-1.5 text-[10px] tabular-nums">{selectedAccounts.length}</Badge>
             </button>
           </div>
@@ -625,7 +680,7 @@ export function DiagnosePage(): React.ReactNode {
               <AlertTriangle className="h-3.5 w-3.5" />
               {isEn
                 ? 'No accounts selected. Go to the Accounts page and multi-select first.'
-                : '未选中任何账号。请先到「账号管理」页面多选账号。'}
+                : 'Chưa chọn tài khoản nào. Hãy sang trang Tài khoản và chọn nhiều tài khoản trước.'}
             </div>
           )}
 
@@ -633,14 +688,14 @@ export function DiagnosePage(): React.ReactNode {
             {/* 单个模式：账号选择 */}
             {livenessMode === 'single' && (
               <div className="space-y-1">
-                <Label className="text-xs">{isEn ? 'Account' : '账号'}</Label>
+                <Label className="text-xs">{isEn ? 'Account' : 'Tài khoản'}</Label>
                 <select
                   value={livenessAccountId}
                   onChange={(e) => setLivenessAccountId(e.target.value)}
                   disabled={livenessRunning}
                   className="h-9 w-full px-2 rounded-md border bg-background text-xs"
                 >
-                  <option value="">-- {isEn ? 'Select an account' : '选择账号'} --</option>
+                  <option value="">-- {isEn ? 'Select an account' : 'Chọn tài khoản'} --</option>
                   {accountList.map((a) => {
                     const bound = getAccountProxyUrl(a.id)
                     return (
@@ -654,7 +709,7 @@ export function DiagnosePage(): React.ReactNode {
                 </select>
                 {livenessAccountId && getAccountProxyUrl(livenessAccountId) && (
                   <p className="text-[10px] text-muted-foreground">
-                    {isEn ? 'Bound proxy: ' : '绑定代理: '}
+                    {isEn ? 'Bound proxy: ' : 'Proxy đã gán: '}
                     <code className="font-mono">{maskProxyUrl(getAccountProxyUrl(livenessAccountId)!)}</code>
                   </p>
                 )}
@@ -670,7 +725,7 @@ export function DiagnosePage(): React.ReactNode {
                   onClick={() => void loadModels()}
                   disabled={modelsLoading}
                   className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
-                  title={isEn ? 'Refresh models from proxy cache / Kiro' : '从代理缓存 / Kiro 刷新可用模型'}
+                  title={isEn ? 'Refresh models from proxy cache / Kiro' : 'Làm mới model từ cache proxy / Kiro'}
                 >
                   <RefreshCw className={cn('h-3 w-3', modelsLoading && 'animate-spin')} />
                   {cachedModels.length > 0
@@ -694,7 +749,7 @@ export function DiagnosePage(): React.ReactNode {
 
           {/* 测试消息 */}
           <div className="space-y-1">
-            <Label className="text-xs">{isEn ? 'Test message' : '测试消息'}</Label>
+            <Label className="text-xs">{isEn ? 'Test message' : 'Tin nhắn test'}</Label>
             <Input
               value={livenessMessage}
               onChange={(e) => setLivenessMessage(e.target.value)}
@@ -708,15 +763,15 @@ export function DiagnosePage(): React.ReactNode {
             {livenessMode === 'single' ? (
               <Button onClick={runLiveness} disabled={livenessRunning || !livenessAccountId || !livenessModel.trim()}>
                 {livenessRunning ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Zap className="h-4 w-4 mr-1" />}
-                {livenessRunning ? (isEn ? 'Testing...' : '测试中...') : (isEn ? 'Test Now' : '开始测活')}
+                {livenessRunning ? (isEn ? 'Testing...' : 'Đang test...') : (isEn ? 'Test Now' : 'Test ngay')}
               </Button>
             ) : (
               <>
                 <Button onClick={runLivenessBatch} disabled={livenessRunning || selectedAccounts.length === 0 || !livenessModel.trim()}>
                   {livenessRunning ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Zap className="h-4 w-4 mr-1" />}
                   {livenessRunning
-                    ? `${isEn ? 'Testing' : '测试中'} ${batchStats.done}/${batchStats.total}`
-                    : `${isEn ? 'Test Selected' : '批量测活'} (${selectedAccounts.length})`}
+                    ? `${isEn ? 'Testing' : 'Đang test'} ${batchStats.done}/${batchStats.total}`
+                    : `${isEn ? 'Test Selected' : 'Test đã chọn'} (${selectedAccounts.length})`}
                 </Button>
                 {livenessRunning && (
                   <Button variant="destructive" onClick={stopLivenessBatch}>
@@ -755,8 +810,8 @@ export function DiagnosePage(): React.ReactNode {
                 }
                 <span className="font-medium">
                   {livenessResult.success
-                    ? (isEn ? 'Account is alive' : '账号正常')
-                    : (isEn ? 'Failed' : '失败')}
+                    ? (isEn ? 'Account is alive' : 'Tài khoản hoạt động')
+                    : (isEn ? 'Failed' : 'Thất bại')}
                 </span>
                 <span className="ml-auto font-mono tabular-nums text-muted-foreground">
                   {livenessResult.latencyMs}ms
@@ -767,13 +822,13 @@ export function DiagnosePage(): React.ReactNode {
                 <>
                   {livenessResult.content && (
                     <div className="bg-background/60 rounded p-2 font-mono text-[11px] break-all max-h-32 overflow-y-auto">
-                      {livenessResult.content || <span className="text-muted-foreground italic">{isEn ? '(empty response)' : '(空响应)'}</span>}
+                      {livenessResult.content || <span className="text-muted-foreground italic">{isEn ? '(empty response)' : '(phản hồi trống)'}</span>}
                     </div>
                   )}
                   {livenessResult.usage && (
                     <div className="flex items-center gap-3 text-[10px] text-muted-foreground tabular-nums">
-                      <span>{isEn ? 'Input' : '输入'}: {livenessResult.usage.inputTokens}</span>
-                      <span>{isEn ? 'Output' : '输出'}: {livenessResult.usage.outputTokens}</span>
+                      <span>{isEn ? 'Input' : 'Đầu vào'}: {livenessResult.usage.inputTokens}</span>
+                      <span>{isEn ? 'Output' : 'Đầu ra'}: {livenessResult.usage.outputTokens}</span>
                       <span>Credits: {livenessResult.usage.credits}</span>
                     </div>
                   )}
@@ -794,20 +849,20 @@ export function DiagnosePage(): React.ReactNode {
             <div className="flex flex-wrap items-center gap-2 p-2 rounded-md bg-red-50/50 dark:bg-red-950/10 border border-red-200 dark:border-red-900">
               <span className="text-xs text-red-600 dark:text-red-400 flex items-center gap-1">
                 <AlertTriangle className="h-3.5 w-3.5" />
-                {isEn ? `${failedAccountIds.length} failed` : `${failedAccountIds.length} 个失败`}
+                {isEn ? `${failedAccountIds.length} failed` : `${failedAccountIds.length} lỗi`}
               </span>
               <div className="ml-auto flex items-center gap-1.5">
                 <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => void retestFailed()}>
                   <RotateCcw className="h-3.5 w-3.5 mr-1" />
-                  {isEn ? 'Retest failed' : '重测失败'}
+                  {isEn ? 'Retest failed' : 'Test lại lỗi'}
                 </Button>
                 <Button variant="outline" size="sm" className="h-7 text-xs" onClick={markFailedAsError}>
                   <Flag className="h-3.5 w-3.5 mr-1" />
-                  {isEn ? 'Mark as error' : '标记为错误'}
+                  {isEn ? 'Mark as error' : 'Đánh dấu lỗi'}
                 </Button>
                 <Button variant="destructive" size="sm" className="h-7 text-xs" onClick={deleteFailed}>
                   <Trash2 className="h-3.5 w-3.5 mr-1" />
-                  {isEn ? 'Delete failed' : '删除失败'}
+                  {isEn ? 'Delete failed' : 'Xóa lỗi'}
                 </Button>
               </div>
             </div>
@@ -837,7 +892,7 @@ export function DiagnosePage(): React.ReactNode {
                     <div className="flex-1 min-w-0">
                       <div className="font-medium truncate flex items-center gap-1">
                         {a.email}
-                        {getAccountProxyUrl(a.id) && <span title={isEn ? 'bound proxy' : '已绑定代理'}>🔗</span>}
+                        {getAccountProxyUrl(a.id) && <span title={isEn ? 'bound proxy' : 'Đã gán proxy'}>🔗</span>}
                       </div>
                       {r && r.success && r.content && (
                         <div className="text-[10px] text-muted-foreground truncate font-mono" title={r.content}>
@@ -859,7 +914,7 @@ export function DiagnosePage(): React.ReactNode {
                         type="button"
                         onClick={() => void retestOne(a.id)}
                         disabled={livenessRunning}
-                        title={isEn ? 'Retest this account' : '重测该账号'}
+                        title={isEn ? 'Retest this account' : 'Test lại tài khoản này'}
                         className="flex-shrink-0 p-1 rounded hover:bg-background/80 text-muted-foreground hover:text-foreground transition-colors disabled:opacity-40"
                       >
                         <RotateCcw className="h-3.5 w-3.5" />

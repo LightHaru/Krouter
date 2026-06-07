@@ -9,6 +9,7 @@ Kiro CodeWhispererRuntimeService API 测试脚本
 
 import requests
 import json
+import os
 import sys
 
 # API 基础 URL
@@ -17,8 +18,8 @@ import sys
 BASE_URL = "https://codewhisperer.us-east-1.amazonaws.com"
 Q_BASE_URL = "https://q.us-east-1.amazonaws.com"
 
-# 请在这里填入你的 Access Token
-ACCESS_TOKEN = "aoaAAAAAGlrshs50x0CL6_dxY2IFGtph5p504T1psy2lmhCrxenO03IHpe4o1r71vBUqHGe7xcV3MY6mSRW8zkpNsBkc0:MGUCMA/OP4ypxKWFuBlvCsXR3rUi6imzOvzqRCehw7lHRiqq30qiXsz2mgpXc64fka1+jAIxAOdSOE0tgyMeHAYginufeT24ExSu4nKeZ9PW/WIslUGumE+eP/FVpuh+6yT03XB9ug"
+# Read credentials at runtime. Never commit live access tokens.
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
 
 
 def get_headers():
@@ -240,7 +241,7 @@ def main():
     if not ACCESS_TOKEN:
         print("\n⚠️  请设置 ACCESS_TOKEN!")
         print("你可以通过以下方式获取 Token:")
-        print("1. 从 Kiro Account Manager 复制账号的 Access Token")
+        print("1. 从 Krouter 复制账号的 Access Token")
         print("2. 或者通过命令行参数传入: python test_kiro_apis.py <token>")
         
         if len(sys.argv) > 1:
@@ -279,8 +280,11 @@ def main():
     # 6. 额外: ListFeatureEvaluations
     test_list_feature_evaluations()
     
-    # 7. UpdateUsageLimits
-    test_update_usage_limits()
+    # 7. UpdateUsageLimits mutates account state and must be explicitly enabled.
+    if os.environ.get("ALLOW_MUTATING_KIRO_TESTS") == "1":
+        test_update_usage_limits()
+    else:
+        print("\nSkipping UpdateUsageLimits (set ALLOW_MUTATING_KIRO_TESTS=1 to enable)")
     
     # 8. GetProfile
     test_get_profile()

@@ -42,8 +42,6 @@ function getNestedValue(obj: Translations, path: string): string {
  * 检测系统语言
  */
 export function detectSystemLanguage(): 'en' | 'zh' {
-  const lang = navigator.language.toLowerCase()
-  if (lang.startsWith('zh')) return 'zh'
   return 'en'
 }
 
@@ -51,10 +49,8 @@ export function detectSystemLanguage(): 'en' | 'zh' {
  * 获取实际使用的语言
  */
 export function getActualLanguage(language: Language): 'en' | 'zh' {
-  if (language === 'auto') {
-    return detectSystemLanguage()
-  }
-  return language
+  void language
+  return detectSystemLanguage()
 }
 
 /**

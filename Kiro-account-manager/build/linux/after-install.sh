@@ -3,8 +3,8 @@
 # Electron deb 包安装后脚本
 # 修复 chrome-sandbox SUID 权限和空格路径问题
 
-APP_NAME="Kiro Account Manager"
-APP_DIR_NOSPACE="kiro-account-manager"
+APP_NAME="Krouter"
+APP_DIR_NOSPACE="krouter"
 OPT_DIR="/opt/${APP_NAME}"
 OPT_DIR_NOSPACE="/opt/${APP_DIR_NOSPACE}"
 

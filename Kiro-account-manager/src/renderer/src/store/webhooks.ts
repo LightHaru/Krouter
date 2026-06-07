@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { randomUuid } from '@/lib/utils'
 
 /**
  * Webhook 通知中心
@@ -77,7 +78,7 @@ export const useWebhookStore = create<WebhooksStore>()((set, get) => ({
   webhooks: new Map(),
 
   addWebhook: (input) => {
-    const id = crypto.randomUUID()
+    const id = randomUuid()
     const entry: WebhookEntry = {
       ...input,
       id,
@@ -134,7 +135,7 @@ export const useWebhookStore = create<WebhooksStore>()((set, get) => ({
     try {
       await sendWebhook(webhook, {
         title: '🧪 测试通知',
-        message: '这是来自 Kiro 账号管理器的测试消息。如果你看到这条消息，说明 Webhook 配置正确。',
+        message: 'Đây là tin nhắn kiểm tra từ Krouter. Nếu anh thấy tin này, cấu hình Webhook đã đúng.',
         level: 'info',
         fields: { 时间: new Date().toLocaleString('zh-CN') }
       })
@@ -294,7 +295,7 @@ function buildWebhookBody(webhook: WebhookEntry, payload: WebhookMessage): unkno
     case 'discord':
       // Discord webhook
       return {
-        username: 'Kiro Account Manager',
+        username: 'Krouter',
         embeds: [{
           title: `${icon} ${payload.title}`,
           description: payload.message,

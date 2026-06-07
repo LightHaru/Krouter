@@ -5,8 +5,58 @@
 
 import { ipcMain } from 'electron'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
-import { safeCreateProxyAgent } from '../proxy/systemProxy'
+import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
 import { ChainProxyRelay } from '../registration/chainProxy'
+
+function extractExternalIp(contentType: string, text: string): string | undefined {
+  if (contentType.includes('json') || text.trimStart().startsWith('{')) {
+    try {
+      const body = JSON.parse(text) as Record<string, unknown>
+      const raw = body.ip ?? body.query ?? body.origin ?? body.ipAddress ?? ''
+      const match = String(raw).match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/)
+      if (match) return match[0]
+    } catch { /* fall through to text extraction */ }
+  }
+  return text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/)?.[0]
+}
+
+async function validateNetworkRequest(params: {
+  testUrl?: string
+  timeoutMs?: number
+  proxyUrl?: string | null
+  route: string
+}): Promise<{ success: boolean; latencyMs?: number; externalIp?: string; route: string; error?: string }> {
+  const { testUrl = 'https://api.ipify.org?format=json', timeoutMs = 8000, proxyUrl, route } = params
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const started = Date.now()
+  try {
+    const response = await undiciFetch(testUrl, {
+      method: 'GET',
+      dispatcher: safeCreateProxyAgent(proxyUrl) || undefined,
+      signal: controller.signal,
+      headers: { 'User-Agent': 'KiroAccountManager-NetworkValidator/1.0' }
+    } as UndiciRequestInit)
+    const latencyMs = Date.now() - started
+    if (response.status < 200 || response.status >= 400) {
+      return { success: false, latencyMs, route, error: `HTTP ${response.status}` }
+    }
+    const text = await response.text().catch(() => '')
+    const externalIp = extractExternalIp(response.headers.get('content-type') || '', text)
+    return externalIp
+      ? { success: true, latencyMs, externalIp, route }
+      : { success: false, latencyMs, route, error: 'The network check succeeded but no exit IP was returned' }
+  } catch (error) {
+    return {
+      success: false,
+      latencyMs: Date.now() - started,
+      route,
+      error: controller.signal.aborted ? `Request timed out (${timeoutMs}ms)` : error instanceof Error ? error.message : String(error)
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 /**
  * 通过指定代理 URL 请求测试地址，返回延迟与出口 IP。
@@ -56,20 +106,7 @@ function registerValidateHandler(): void {
         try {
           const ct = resp.headers.get('content-type') || ''
           const text = await resp.text()
-          if (ct.includes('json') || text.trimStart().startsWith('{')) {
-            try {
-              const body = JSON.parse(text) as Record<string, unknown>
-              // 常见字段名：ip(ipify/ipinfo/ip2location/ipapi.co) / query(ip-api) / origin(httpbin) / ipAddress
-              const raw = body.ip ?? body.query ?? body.origin ?? body.ipAddress ?? ''
-              const ipStr = String(raw).trim()
-              const m = ipStr.match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/)
-              if (m) externalIp = m[0]
-            } catch { /* JSON 解析失败走下面纯文本 */ }
-          }
-          if (!externalIp) {
-            const m = text.match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/)
-            if (m) externalIp = m[0]
-          }
+          externalIp = extractExternalIp(ct, text)
         } catch { /* 出口 IP 提取失败不影响验活成功 */ }
         return { success: true, latencyMs, externalIp }
       }
@@ -86,6 +123,21 @@ function registerValidateHandler(): void {
       clearTimeout(timer)
       if (chainRelay) await chainRelay.stop()
     }
+  })
+}
+
+function registerNetworkRouteValidateHandler(): void {
+  ipcMain.handle('network-route:validate', async (_event, params?: {
+    testUrl?: string
+    timeoutMs?: number
+  }) => {
+    const proxyUrl = getSystemProxy()
+    return validateNetworkRequest({
+      testUrl: params?.testUrl,
+      timeoutMs: params?.timeoutMs,
+      proxyUrl,
+      route: proxyUrl ? 'system-proxy' : 'direct-or-vpn'
+    })
   })
 }
 
@@ -119,5 +171,6 @@ function registerDiagnoseChainHandler(): void {
 /** 注册"代理池"模块下的全部 IPC handler */
 export function registerProxyPoolIpcHandlers(): void {
   registerValidateHandler()
+  registerNetworkRouteValidateHandler()
   registerDiagnoseChainHandler()
 }

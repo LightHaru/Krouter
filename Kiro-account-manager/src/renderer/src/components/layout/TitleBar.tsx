@@ -3,6 +3,8 @@ import { Minus, Square, X, Copy as RestoreIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
 import { TaskCenterButton } from './TaskCenter'
+import krouterMark from '@/assets/krouter-mark.svg'
+import { APP_NAME } from '@/brand'
 
 /**
  * 跨平台自定义 titlebar
@@ -13,8 +15,7 @@ import { TaskCenterButton } from './TaskCenter'
  * 按钮区：使用 no-drag 让点击生效
  */
 export function TitleBar(): React.ReactNode {
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
+  useTranslation()
   const [platform, setPlatform] = useState<NodeJS.Platform>('win32')
   const [isMaximized, setIsMaximized] = useState(false)
   const [appVersion, setAppVersion] = useState('')
@@ -69,10 +70,10 @@ export function TitleBar(): React.ReactNode {
         )}
       >
         {!isMac && (
-          <img src="./icon.png" alt="" className="h-4 w-4 opacity-90" onError={(e) => ((e.target as HTMLImageElement).style.display = 'none')} />
+          <img src={krouterMark} alt="" className="h-4 w-4 opacity-90" onError={(e) => ((e.target as HTMLImageElement).style.display = 'none')} />
         )}
         <span className="font-medium tracking-wide text-foreground/70">
-          Kiro 账号管理器{appVersion && ` v${appVersion}`}
+          {APP_NAME}{appVersion && ` v${appVersion}`}
         </span>
       </div>
 
@@ -87,17 +88,17 @@ export function TitleBar(): React.ReactNode {
           className="flex items-stretch h-full"
           style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
         >
-          <TitleBarButton onClick={() => window.api.window.minimize()} title={isEn ? 'Minimize' : '最小化'}>
+          <TitleBarButton onClick={() => window.api.window.minimize()} title="Thu nhỏ">
             <Minus className="h-3.5 w-3.5" strokeWidth={2} />
           </TitleBarButton>
-          <TitleBarButton onClick={() => window.api.window.maximizeToggle()} title={isMaximized ? (isEn ? 'Restore' : '还原') : (isEn ? 'Maximize' : '最大化')}>
+          <TitleBarButton onClick={() => window.api.window.maximizeToggle()} title={isMaximized ? 'Khôi phục' : 'Phóng to'}>
             {isMaximized ? (
               <RestoreIcon className="h-3 w-3" strokeWidth={2} />
             ) : (
               <Square className="h-3 w-3" strokeWidth={2} />
             )}
           </TitleBarButton>
-          <TitleBarButton onClick={() => window.api.window.close()} title={isEn ? 'Close' : '关闭'} variant="close">
+          <TitleBarButton onClick={() => window.api.window.close()} title="Đóng" variant="close">
             <X className="h-3.5 w-3.5" strokeWidth={2} />
           </TitleBarButton>
         </div>

@@ -2,6 +2,8 @@ import { ElectronAPI } from '@electron-toolkit/preload'
 
 interface AccountData {
   accounts: Record<string, unknown>
+  /** Web multi-session tombstones for explicitly deleted accounts. */
+  _deletedAccountIds?: string[]
   groups: Record<string, unknown>
   tags: Record<string, unknown>
   activeAccountId: string | null
@@ -96,6 +98,7 @@ interface StatusResult {
     email?: string
     userId?: string
     idp?: string // 身份提供商：BuilderId, Google, Github 等
+    profileArn?: string
     userStatus?: string // 用户状态：Active 等
     featureFlags?: string[] // 特性开关
     subscriptionTitle?: string
@@ -259,6 +262,9 @@ interface KiroApi {
     region?: string
     authMethod?: string  // 'IdC' 或 'social'
     provider?: string    // 'BuilderId', 'Github', 'Google'
+    profileArn?: string
+    machineId?: string
+    startUrl?: string
   }) => Promise<{
     success: boolean
     data?: {
@@ -269,6 +275,7 @@ interface KiroApi {
       expiresIn?: number
       subscriptionType: string
       subscriptionTitle: string
+      profileArn?: string
       subscription?: {
         rawType?: string
         managementTarget?: string
@@ -325,6 +332,9 @@ interface KiroApi {
       region: string
       authMethod: string  // 'IdC' 或 'social'
       provider: string    // 'BuilderId', 'Github', 'Google'
+      profileArn?: string
+      startUrl?: string
+      machineId?: string
     }
     error?: string
   }>
@@ -405,11 +415,14 @@ interface KiroApi {
   // 取消 Builder ID 登录
   cancelBuilderIdLogin: () => Promise<{ success: boolean }>
 
-  // 启动 IAM Identity Center SSO 登录 (Authorization Code flow)
+  // 启动 IAM Identity Center SSO 登录
   startIamSsoLogin: (startUrl: string, region?: string) => Promise<{
     success: boolean
     authorizeUrl?: string
+    userCode?: string
+    verificationUri?: string
     expiresIn?: number
+    interval?: number
     error?: string
   }>
 
@@ -519,11 +532,30 @@ interface KiroApi {
     releaseName?: string
     releaseUrl?: string
     publishedAt?: string
+    source?: string
+    packageName?: string
     assets?: Array<{
       name: string
       downloadUrl: string
       size: number
     }>
+    error?: string
+  }>
+
+  applyKrouterUpdate: () => Promise<{
+    success: boolean
+    updated?: boolean
+    inProgress?: boolean
+    restartScheduled?: boolean
+    currentVersion?: string
+    latestVersion?: string
+    releaseNotes?: string
+    releaseName?: string
+    releaseUrl?: string
+    publishedAt?: string
+    source?: string
+    packageName?: string
+    output?: string
     error?: string
   }>
 
@@ -595,7 +627,7 @@ interface KiroApi {
   // ============ Kiro API 反代服务器 ============
 
   // 启动反代服务器
-  proxyStart: (config?: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; logRequests?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think' }) => Promise<{ success: boolean; port?: number; error?: string }>
+  proxyStart: (config?: { port?: number; host?: string; apiKey?: string; enabled?: boolean; autoStart?: boolean; enableMultiAccount?: boolean; accountSelectionStrategy?: 'smart' | 'round-robin' | 'sticky' | 'least-used'; sessionAffinityEnabled?: boolean; logRequests?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think' }) => Promise<{ success: boolean; port?: number; error?: string }>
 
   // 停止反代服务器
   proxyStop: () => Promise<{ success: boolean; error?: string }>
@@ -604,6 +636,10 @@ interface KiroApi {
   proxyGetStatus: () => Promise<{ running: boolean; config: unknown; stats: unknown; sessionStats?: { totalRequests: number; successRequests: number; failedRequests: number; startTime: number } }>
 
   // 重置累计 credits
+  dashboardTunnelGetStatus: () => Promise<{ running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }>
+  dashboardTunnelStart: (input?: { localUrl?: string; binary?: string }) => Promise<{ success: boolean; status: { running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }; error?: string }>
+  dashboardTunnelStop: () => Promise<{ success: boolean; status: { running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }; error?: string }>
+
   proxyResetCredits: () => Promise<{ success: boolean }>
 
   // 重置累计 tokens
@@ -656,7 +692,7 @@ interface KiroApi {
   // 获取可用模型列表
   proxyGetModels: () => Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }>; fromCache?: boolean }>
 
-  proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null }> }) => Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }>
+  proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null }> }) => Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; apiKey?: { id?: string; name?: string; key: string }; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }>
 
   // 获取账户可用模型列表
   accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }> }>
@@ -690,6 +726,8 @@ interface KiroApi {
 
   // 监听反代状态变化事件
   onProxyStatusChange: (callback: (status: { running: boolean; port: number }) => void) => () => void
+
+  onProxyAccountUpdate: (callback: (account: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string; quotaUsed?: number; quotaUsedDelta?: number; quotaLimit?: number; quotaResetAt?: number; requestCount?: number; lastUsed?: number }) => void) => () => void
 
   // 监听反代账号被封禁事件（TEMPORARILY_SUSPENDED / AccountSuspendedException）
   onProxyAccountSuspended: (callback: (info: { id: string; email?: string; reason: string; message: string; suspendedAt: number }) => void) => () => void
@@ -911,6 +949,11 @@ interface KiroApi {
     upstreamProxy?: string
   }) => Promise<{ success: boolean; latencyMs?: number; externalIp?: string; error?: string }>
 
+  networkRouteValidate: (params?: {
+    testUrl?: string
+    timeoutMs?: number
+  }) => Promise<{ success: boolean; latencyMs?: number; externalIp?: string; route: string; error?: string }>
+
   proxyPoolDiagnoseChain: (params: {
     targetUrl: string
     upstreamProxy: string
@@ -968,6 +1011,7 @@ interface KiroApi {
     latencyMs: number
     model?: string
     content?: string
+    profileArn?: string
     usage?: { inputTokens: number; outputTokens: number; credits: number }
     error?: string
   }>

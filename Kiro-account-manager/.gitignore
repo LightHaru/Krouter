@@ -1,6 +1,16 @@
 node_modules
 dist
 out
+dist-web
+out-server
+.web-data
+.web-data-*
 .DS_Store
 .eslintcache
 *.log*
+*.tar.gz
+*.tgz
+.deploy-*
+krouter-*.png
+test-openclaw-import.cjs
+docs/codex-thread-summary.md

@@ -38,8 +38,8 @@ export function CloseConfirmDialog() {
                 <XCircle className="h-6 w-6 text-primary" />
               </div>
               <div>
-                <h2 className="text-lg font-bold">{isEn ? 'Close Window' : '关闭窗口'}</h2>
-                <p className="text-sm text-muted-foreground">{isEn ? 'Choose an action' : '请选择关闭行为'}</p>
+                <h2 className="text-lg font-bold">{isEn ? 'Close Window' : 'Đóng cửa sổ'}</h2>
+                <p className="text-sm text-muted-foreground">{isEn ? 'Choose an action' : 'Chọn thao tác'}</p>
               </div>
             </div>
             <button
@@ -54,11 +54,11 @@ export function CloseConfirmDialog() {
         {/* 内容 */}
         <div className="p-6 space-y-4">
           <p className="text-sm text-muted-foreground">
-            {isEn ? 'Would you like to minimize to system tray or exit the application?' : '您想要最小化到系统托盘还是退出程序？'}
+            {isEn ? 'Would you like to minimize to system tray or exit the application?' : 'Anh muốn thu nhỏ xuống khay hệ thống hay thoát hẳn ứng dụng?'}
           </p>
           
           <p className="text-xs text-muted-foreground bg-muted/50 rounded-lg p-3">
-            {isEn ? 'When minimized to tray, the app will continue running in the background and the proxy service will remain available. You can reopen the window by clicking the tray icon.' : '最小化到托盘后，程序将在后台继续运行，代理服务保持可用。您可以通过点击托盘图标重新打开窗口。'}
+            {isEn ? 'When minimized to tray, the app will continue running in the background and the proxy service will remain available. You can reopen the window by clicking the tray icon.' : 'Khi thu nhỏ xuống khay, ứng dụng vẫn chạy nền và dịch vụ proxy vẫn hoạt động. Có thể mở lại bằng cách bấm biểu tượng ở khay hệ thống.'}
           </p>
 
           {/* 操作按钮 */}
@@ -72,8 +72,8 @@ export function CloseConfirmDialog() {
                 <Minimize2 className="h-4 w-4 text-blue-500" />
               </div>
               <div className="text-left">
-                <div className="font-medium">{isEn ? 'Minimize to Tray' : '最小化到托盘'}</div>
-                <div className="text-xs text-muted-foreground">{isEn ? 'Continue running in background' : '在后台继续运行'}</div>
+                <div className="font-medium">{isEn ? 'Minimize to Tray' : 'Thu nhỏ xuống khay'}</div>
+                <div className="text-xs text-muted-foreground">{isEn ? 'Continue running in background' : 'Tiếp tục chạy nền'}</div>
               </div>
             </Button>
             
@@ -86,8 +86,8 @@ export function CloseConfirmDialog() {
                 <LogOut className="h-4 w-4 text-red-500" />
               </div>
               <div className="text-left">
-                <div className="font-medium">{isEn ? 'Exit Application' : '退出程序'}</div>
-                <div className="text-xs text-muted-foreground">{isEn ? 'Close the app completely' : '完全关闭应用'}</div>
+                <div className="font-medium">{isEn ? 'Exit Application' : 'Thoát ứng dụng'}</div>
+                <div className="text-xs text-muted-foreground">{isEn ? 'Close the app completely' : 'Đóng hoàn toàn ứng dụng'}</div>
               </div>
             </Button>
           </div>
@@ -110,7 +110,7 @@ export function CloseConfirmDialog() {
               onClick={() => setRememberChoice(!rememberChoice)}
               className="text-sm text-muted-foreground cursor-pointer select-none"
             >
-              {isEn ? 'Remember my choice' : '记住我的选择'}
+              {isEn ? 'Remember my choice' : 'Ghi nhớ lựa chọn'}
             </button>
           </div>
 
@@ -120,7 +120,7 @@ export function CloseConfirmDialog() {
             className="w-full"
             onClick={() => handleAction('cancel')}
           >
-            {isEn ? 'Cancel' : '取消'}
+            {isEn ? 'Cancel' : 'Hủy'}
           </Button>
         </div>
       </div>

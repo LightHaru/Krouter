@@ -9,6 +9,7 @@
 
 import requests
 import json
+import os
 import uuid
 import sys
 
@@ -21,7 +22,7 @@ except ImportError:
     print("安装: pip install cbor2")
 
 # 配置
-ACCESS_TOKEN = "aoaAAAAAGl60C4ZNCC4CG_Dj5B21gx4OFvwTIoQhzF72839W08oG094YZYTVO5myKV735QugrLbC7MjeyZKeE0xGsBkc0:MGQCMANcDlPni1127DuN7uJ5g/8mSIvgmkLWFz3ylYAaSiCMjl9QIILBUBCkgV1S5r/kXgIwCdJAevOKCrOQ+ijLwPib+76+w7Q6oOWaU8k967p9olP6pdkF/fw55FU34BGrcSq7"  # 填写你的 access token，或使用环境变量
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
 IDP = "BuilderId"  # BuilderId, Github, Google
 PROFILE_ARN = ""  # 可选，格式: arn:aws:codewhisperer:us-east-1:123456789:profile/xxx
 
@@ -272,8 +273,6 @@ def compare_responses(rest_data, cbor_data):
 
 
 def main():
-    import os
-    
     # 获取 access token
     token = ACCESS_TOKEN or os.environ.get("ACCESS_TOKEN")
     if not token:

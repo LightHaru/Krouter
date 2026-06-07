@@ -1,280 +1,238 @@
-# Kiro Account Manager
+<div align="center">
+  <img src="./src/renderer/src/assets/krouter-logo.svg" alt="Krouter" width="460"/>
 
-<p align="center">
-  <img src="resources/icon.png" width="128" height="128" alt="Kiro Logo">
-</p>
+  # Krouter - Kiro Account Router & API Proxy
 
-<p align="center">
-  <strong>A powerful multi-account management tool for Kiro IDE</strong>
-</p>
+  **One local web dashboard to manage Kiro accounts, balance quota, expose a compatible API proxy, and connect OpenClaw or other dev tools through one endpoint.**
 
-<p align="center">
-  Quick account switching, auto token refresh, group/tag management, machine ID management and more
-</p>
+  **Run the dashboard on localhost, publish it through a tunnel when needed, and let the backend/CLI keep the proxy service alive.**
 
-<p align="center">
-  <strong>English</strong> | <a href="README_CN.md">简体中文</a>
-</p>
+  [![Version](https://img.shields.io/badge/version-1.8.4-blue)](./package.json)
+  [![License](https://img.shields.io/badge/license-AGPL--3.0-green)](./LICENSE)
+  [![OpenClaw](https://img.shields.io/badge/OpenClaw-provider%3A%20krouter-purple)](#openclaw-and-client-tools)
+  [![Runtime](https://img.shields.io/badge/runtime-web%20%2B%20CLI-black)](#quick-start)
 
----
-
-## ✨ Features
-
-### 🔐 Multi-Account Management
-- Add, edit, and delete multiple Kiro accounts
-- One-click quick account switching
-- Support Builder ID and Social (Google/GitHub) login methods
-- Batch import/export account data
-
-### 🔄 Auto Refresh
-- Auto refresh tokens before expiration
-- Auto update account usage and subscription info after refresh
-- Periodically check all account balances when auto-switch is enabled
-
-### 📁 Groups & Tags
-- Flexibly organize accounts with groups and tags
-- Batch set groups/tags for multiple accounts
-
-### 🔑 Machine ID Management
-- Modify device identifier to prevent account association bans
-- Auto switch machine ID when switching accounts
-- Assign unique bound machine ID to each account
-
-### 🔄 Auto Account Switch
-- Auto switch to available account when balance is low
-- Configurable balance threshold and check interval
-
-### ⚙️ Kiro IDE Settings Sync
-- Sync Kiro IDE settings (Agent mode, Model, MCP servers, etc.)
-- Edit MCP server configurations
-- Manage user rules (Steering files)
-
-### 🌐 Multi-Language Support
-- Full English/Chinese bilingual interface
-- Auto-detect system language or manual selection
-
-### 🎨 Personalization
-- 21 theme colors available
-- Dark/Light mode toggle
-- Privacy mode to hide sensitive information
-
-### 📝 Account Registration
-- Built-in Kiro Builder ID registration
-- Four modes: Manual, Outlook IMAP, Custom Domain (TempMail.Plus), Mixed (weighted round-robin)
-- Concurrent batch registration + rate limit + backoff + risk control auto-pause
-- Failure retry queue (bucketed by error category)
-- Pause/Resume + progress persistence
-- Scheduled launch + daily quota + weekday mask
-- Strategy templates (save/load/import/export)
-- Analytics report (donut chart, 24h curves, 7-day trend, failure breakdown, CSV export)
-- Email used blacklist + empirical pre-validation
-- Full i18n support
-
-### 🌐 Proxy Support
-- Built-in proxy pool (http/https/socks5/socks4) with 4 dispatch strategies + auto-validate + scheduled refresh
-- Reverse proxy account-to-IP bucketing (mitigates risk control association)
-- Once an account is bound to a proxy, ALL its requests (token refresh, batch operations, etc.) route through it
-
-### 🔔 Notifications & Ops
-- Webhook notifications (DingTalk/WeCom/Feishu/Telegram/Discord/custom), 7 event types
-- Unified task center (global progress panel)
-- One-click diagnostics panel (Network/Kiro/AWS/Email/Proxy connectivity)
-- Config import/export (with optional AES-GCM encryption)
+  [Quick Start](#quick-start) - [API Proxy Guide](./docs/API-Proxy-Guide.md) - [How It Works](#how-it-works) - [Features](#key-features) - [OpenClaw](#openclaw-and-client-tools) - [Deploy](#server-deployment) - [Changelog](./CHANGELOG.md)
+</div>
 
 ---
 
-## 📸 Screenshots
+## Why Krouter?
 
-### Home
-![Home](resources/主页.png)
+Krouter is built for a Kiro-heavy workflow where many accounts, quota states, API keys, model choices, and client configs need to stay organized.
 
-### Account Management
-![Account Management](resources/账户管理.png)
+Common pain points:
 
-### Machine ID Management
-![Machine ID Management](resources/机器码管理.png)
+- Kiro accounts are hard to compare when quota, subscription, profile ARN, and liveness are scattered.
+- A web dashboard is convenient, but the API proxy should run as a backend/CLI service instead of depending on a browser tab.
+- OpenClaw and other clients need one stable OpenAI-compatible endpoint.
+- Premium models can fail when an account is suspended, out of quota, rate-limited, or missing a usable streaming profile.
+- Manual account switching wastes time and makes failures harder to diagnose.
 
-### Settings
-![Settings](resources/设置.png)
+Krouter solves this with:
 
-### Kiro IDE Settings
-![Kiro Settings](resources/Kiro%20设置.png)
-
-### Theme Colors
-![Theme Colors](resources/主题色.png)
-
-### About
-![About](resources/关于.png)
+- A local-first web dashboard for account operations.
+- A backend API proxy that can stay running independently.
+- Multi-account routing with round-robin/sticky strategies.
+- API key generation for client tools.
+- OpenClaw import using the `krouter` provider.
+- Diagnostics for quota, credentials, model liveness, request logs, and tunnel status.
 
 ---
 
-## 🛠️ Tech Stack
+## How It Works
 
-- **Frontend**: React 18 + TypeScript
-- **Desktop**: Electron
-- **State Management**: Zustand
-- **UI Components**: Radix UI + Tailwind CSS
-- **Icons**: Lucide React
-- **Build Tool**: Vite
+```text
+Developer tools
+OpenClaw / Aira / Codex / Claude-compatible clients
+        |
+        |  http://localhost:5580/v1
+        v
+Krouter API Proxy
+  - validates client API keys
+  - maps requested models
+  - rotates healthy Kiro accounts
+  - retries or skips accounts with bad quota/liveness
+  - streams responses back to the client
+        |
+        v
+Kiro accounts
+  - Builder ID / social login credentials
+  - quota and plan tracking
+  - profile ARN hydration
+  - account health and request logs
+```
+
+The dashboard is the control surface. The backend and `krouter` CLI are the runtime layer.
 
 ---
 
-## 🚀 Development
+## Key Features
+
+### Dashboard
+
+- Account list, import/export, groups, tags, privacy mode, and quick status cards.
+- Registration workflows and diagnostics for email service, Kiro API, proxy, quota, and model liveness.
+- API proxy page for service start/stop, model refresh, key management, request logs, and client config import.
+- Tunnel controls for localhost-first usage with optional public access.
+- Responsive layout for desktop and mobile dashboards.
+
+### API Proxy
+
+- OpenAI-compatible `/v1` endpoint.
+- Multi-account mode with round-robin and sticky routing.
+- Per-account health checks, quota checks, and request logging.
+- Model catalog refresh and model mapping for client tools.
+- API keys in `sk-*` format or custom token formats.
+
+### CLI
+
+- `krouter` opens the clean terminal dashboard.
+- `krouter setup` performs first-run admin setup.
+- `krouter status` checks backend/dashboard/proxy state.
+- `krouter tunnel start` exposes the dashboard when remote access is needed.
+- `krouter openclaw import` writes the Krouter provider into OpenClaw config.
+
+### First-Run Setup
+
+On a fresh install, Krouter does not create a default `admin/admin` login.
+
+You choose one of two setup modes:
+
+- **Krouter generated password**: Krouter creates a strong password and shows it once.
+- **Custom password**: you set your own admin password.
+
+---
+
+## Quick Start
+
+Install or update with one command:
 
 ```bash
-# Install dependencies
+npm install -g @lightharu/krouter
+```
+
+Run Krouter:
+
+```bash
+krouter
+```
+
+The CLI starts the local backend, opens the dashboard, and stores runtime data in `~/.krouter`.
+
+To update later:
+
+```bash
+npm update -g @lightharu/krouter
+```
+
+Source/development mode:
+
+```bash
 npm install
+npm run build:fullstack
+npm run start:backend
+```
 
-# Start development server
-npm run dev
+Open the dashboard URL printed by the backend.
 
-# Build for production
-npm run build
+For first-run setup from terminal:
 
-# Type check
-npm run typecheck
+```bash
+npm run cli -- setup
+```
+
+After installing globally or linking the package, use:
+
+```bash
+krouter
+krouter status
+krouter tunnel start
+krouter openclaw import
 ```
 
 ---
 
-## 📋 Changelog
+## OpenClaw And Client Tools
 
-### v1.7.0 (Current)
+Create a client API key in the dashboard:
 
-#### 🔥 Major Features (4 phases, 19 new features)
+```text
+Dashboard -> API Proxy Service -> Configure Clients / API Keys
+```
 
-##### Registration Reliability
-- **Proxy Pool** — Standalone page for IP rotation during registration. 4 dispatch strategies (round-robin/random/least-used/fastest), auto-validate + auto-disable dead proxies, supports http/https/socks5/socks4 + multiple formats (user:pass@host:port, host:port:user:pass)
-- **Failure Retry Queue** — Auto-classify errors (network/OTP timeout/email used/rate limit/AWS risk control/auth/unknown), selectively retry by bucket
-- **Batch Pause/Resume** — One-click pause new task launches, seamless resume
-- **Unified Task Center** — TitleBar real-time badge + side drawer. All batch tasks (register, subscription, overage, token refresh, proxy validation) centralized, supports "Cancel All"
+Then import Krouter into OpenClaw:
 
-##### Operations Efficiency
-- **Rate Limiting + Backoff** — Token bucket (max-per-minute starts) + consecutive failure exponential backoff (configurable base/max) + risk-control auto-pause
-- **Risk Signal Detection** — Live panel: throughput, success rate, window failures, consecutive failures, backoff remaining. Webhook + optional auto-pause on trigger
-- **Subscription Pre-flight Check** — Auto-classify blocked accounts (already subscribed/no token/banned/can't upgrade/unknown status)
-- **Subscription Cancel/Downgrade** — New "Manage" tab: bulk open portals, bulk disable overage, card-view management
-- **Fingerprint Snapshot** — Save chromeVer/UA/GPU/CanvasHash/Screen + masked proxy URL after registration. History shows badges
+```bash
+krouter openclaw import
+```
 
-##### Automation
-- **Mixed Email Source Concurrency** — New Mixed mode with Outlook + TempMail.Plus smooth weighted round-robin (SWRR)
-- **Email Pre-validation** — Empirical blacklist auto-populated from `email_used` failures, visualized management UI
-- **Cron + Daily Quota** — Auto-launch at configurable time + weekday mask (Mon-Sun any combo) + daily quota cap (manual reset)
-- **Webhook Notifications** — Dedicated config page, supports DingTalk/WeCom/Feishu/Telegram/Discord/custom JSON template, 7 event types subscription (batch completed, risk warning, account banned, register success/fail, token expired, etc.), auto-retry + rate limiting
+OpenClaw will use provider:
 
-##### UX Enhancements
-- **Registration Strategy Templates** — Save current full config as named template, one-click load, supports JSON import/export
-- **Registration Analytics Report** — Donut chart (success rate) + 24-hour smooth curves (Catmull-Rom dual-line) + 7-day stacked trend bars + colorful error category cards + auth method comparison + CSV export
-- **Subscription Link Expiry Detection** — 15-minute threshold + HTTP HEAD live probe, one-click regenerate expired links
-- **Diagnostics Panel** — Check public/Kiro/AWS/email service/proxy pool connectivity, with report export
-- **Config Sync** — Multi-device sync of proxy pool/webhooks/register templates/rate limit settings/app preferences, supports AES-GCM + PBKDF2 password encryption
+```text
+krouter
+```
 
-#### 🌐 Reverse Proxy: Account-to-IP Bucketing (new end-to-end feature)
+Typical client settings:
 
-- Accounts can be bound to any active proxy IP, with "N accounts per proxy" auto-distribution
-- Reverse proxy Kiro API calls strictly follow [account-bound proxy > global proxy] priority
-- Quick bind via toolbar / account card / list row / detail dialog (4 access points)
-- **All outbound requests for the account** (including token refresh, background batch refresh/check, Subscription/SetOverage API) route through the bound proxy
-- Auto-sync to main process account pool on proxy URL/status/disable changes, deletion auto-clears bindings
-- One-click auto-distribute (only-unbound mode or re-distribute-all)
+```text
+Base URL: http://localhost:5580/v1
+API Key:  sk-...
+Model:    claude-sonnet-4.5 or another model shown by Krouter
+```
 
-#### 🔌 Network Layer
-- **SOCKS5/SOCKS4 proxy support** — Via socks library + undici Agent.connect hook, HTTPS auto TLS upgrade
-- **Registration response Chinese decoding fix** — tls-client's latin1 byte stream auto re-decoded as UTF-8
-- **AWS risk control error recognition** — `AWS-RISK-CONTROL` auto-classified, error message includes fix suggestions
-- **Invalid URL protocol fix** — Windows multi-protocol proxy string parsing, macOS HTTPS proxy detection, unified safeCreateProxyAgent factory
-
-#### ⚡ Performance Optimizations (4 deep rounds)
-- saveToStorage 500ms debounce (1000-account scenario: 1000 writes → 1)
-- createBackup 5-minute throttle (eliminates double-write)
-- Background refresh result 120ms buffer batching (N Map copies → 1)
-- ProxyLogStore async write + 50K cap (no more 1-5s main process freeze)
-- Proxy suspended callback uses memory snapshot (eliminates full-DB AES cycle)
-- Tray IPC 400ms debounce
-- getFilteredAccounts / getStats reference cache (O(n) → O(1) hit)
-- importAccounts/importFromExportData O(n²) → O(n) batched
-
-#### 🗑️ Removed
-- MoEmail email mode removed from UI (service code retained as recoverable implementation)
-
-#### 🔧 Edge Cases (22 fixes)
-- Auto-sync bound accounts to main process pool on proxy URL/status/disable changes
-- Auto-clear bindings on proxy deletion
-- 6 Webhook event types fully wired
-- Task center persistence (200 finished tasks to localStorage)
-- Config export with PBKDF2 + AES-GCM encryption option
-- Cron supports weekday mask (workdays/daily/custom)
-- Smooth weighted round-robin (SWRR) for mixed email sources
-- Report SVG donut chart + Catmull-Rom smooth curves + 7-day stacked bar trend
+When `/models` is called, Krouter exposes the model list currently available through the proxy catalog.
 
 ---
 
-### v1.6.x
+## Server Deployment
 
-#### Proxy API Enhancements
-- **New**: Gemini v1beta API compatibility (`/v1beta/models`, `/v1beta/models/{model}:generateContent`, `/v1beta/models/{model}:streamGenerateContent`)
-- **New**: One-click client configuration now supports 6 clients: Claude Code, OpenCode, Codex CLI, Gemini CLI, Hermes, OpenClaw
-- **New**: AmazonQ CLI endpoint isolation — `amazonq-cli` preferred endpoint uses only SendMessageStreaming, no fallback
-- **New**: Smart account rotation with Circuit Breaker + Sticky behavior + Exponential backoff + Probabilistic retry (inspired by Kiro Gateway)
-- **New**: Error classification system — `FATAL` (bad request, return immediately) vs `RECOVERABLE` (account issue, try next)
-- **New**: Proactive quota filtering — exhausted accounts are excluded before selection, not just after 429 errors
-- **New**: `onPoolEmpty` lazy-sync callback — proxy auto-loads accounts from store on first request (fixes Mac cold-start 503)
-- **New**: Retry mechanism for account pool sync on cold boot (5 retries, 2s/4s/6s/8s/10s)
-- **New**: Model capability badges — Thinking/Caching/Effort labels from ListAvailableModels response
-- **New**: Hidden model support — Claude 3.7 Sonnet and other models not in official list but supported by backend
-- **Optimization**: Request headers/UA/versions fully match official Kiro IDE 0.12.155 capture (SDK 1.0.34, dynamic OS/Node fingerprint)
-- **Optimization**: Request body now includes agentContinuationId/agentTaskType fields matching official protocol
-- **Optimization**: All outbound requests routed through app-level HTTP proxy (Token refresh, SSO login, image download, etc.)
-- **Optimization**: machineId fallback (SHA-256 hash), Token refresh jitter (0-3s), IDC UA dynamic OS
-- **Optimization**: K-Proxy MITM now replaces machineId in body + intercepts telemetry domain kiro.dev
-- **Optimization**: Tool call token estimation covers all exit paths (tool name + argument JSON)
-- **Optimization**: Detailed 503 error messages now include quota status (`All accounts quota exhausted (X/Y exhausted, Z in cooldown)`)
-- **Optimization**: Extended quota error detection patterns (402, 429, ThrottlingException, ServiceQuotaExceededException, rate limit, limit exceeded)
-- **New**: Stream events toggle — off by default, shows detailed JSON for each stream event (assistantResponseEvent/toolUseEvent etc.) when enabled
-- **Optimization**: Thinking mode simplified — removed legacy `<thinking>` tag detection, directly passes through native reasoningContentEvent as OpenAI `reasoning_content` / Claude thinking block
-- **New**: `additionalModelRequestFields` support — client `thinking` parameter is passed through to Kiro API
+Copy the example environment file:
 
-#### Account Switching
-- **New**: Kiro CLI account switching support — writes credentials to `~/.local/share/kiro-cli/data.sqlite3` SQLite database
-- **New**: Configurable switch target in Settings: "Kiro IDE" / "Kiro CLI" / "Both (IDE + CLI)" (default: IDE)
-- **New**: Auto-switch and manual switch both respect `switchTarget` setting
-- **New**: CLI switch uses Read-Merge-Write strategy, preserves unknown fields, clears stale priority keys
+```bash
+cp .env.web.example .env.web
+```
 
-#### Subscription & Overage
-- **New**: Batch overage settings page with "Enable Overage" (unset only) and "Set All" (all subscribed) buttons
-- **New**: Account overage status overview table (subscription type, overage capability, overage status)
-- **Fix**: `overageStatus` field detection — correctly maps REST API `"ENABLED"`/`"DISABLED"` strings to boolean
-- **Fix**: Batch check and batch refresh now return `resourceDetail` and `overageCapability` to frontend
+Set at least:
 
-#### UI & UX
-- **New**: RegisterPage fully redesigned with Card/Button/Input/Label/Progress/Badge/Switch components
-- **New**: SubscriptionPage header redesigned with gradient banner
-- **New**: Both pages support theme color switching and dark mode
-- **Fix**: Batch registration progress/history now survives page navigation (module-level React setter refs)
-- **Fix**: Console encoding on Windows (`chcp 65001` in dev script for proper UTF-8 Chinese output)
+```env
+SESSION_SECRET=replace-with-a-long-random-secret
+```
 
-#### Registration
-- **New**: Account registration feature (Manual / MoEmail / Outlook / Custom Domain modes)
-- **New**: Custom Domain mode — user provides domain with catch-all forwarding to TempMail.Plus, system generates realistic random English name email prefixes for registration
-- **New**: Concurrent batch registration — configurable parallelism (1-10 simultaneous tasks)
-- **New**: Batch registration with auto-import, retry on failure, per-item status tracking
-- **New**: Manual mode step progress indicator
-- **New**: Auto-import after registration (all modes: manual, MoEmail, Outlook, Custom Domain)
-- **New**: Session-persistent registration state (logs, phase, history survive page navigation)
-- **New**: Mid-registration cancel support for manual mode
-- **New**: Full i18n for registration page (en/zh)
+Then run:
 
-#### Bug Fixes
-- **Fix**: Model alias mapping now uses exact matches only, so dynamic models such as `claude-opus-4.7` are no longer downgraded to static Claude aliases
-- **Fix**: Proxy test page now loads real `/v1/models` results and avoids defaulting to unavailable static Claude aliases
-- **Fix**: Unknown model IDs are now passed through instead of being remapped to a static Claude default
-- **Fix**: Default proxy endpoint order now prioritizes AmazonQ with CodeWhisperer as fallback
-- **Fix**: Proxy API stream requests now route through app-level HTTP proxy settings
-- **Fix**: CodeWhisperer requests resolve short model aliases to official `ListAvailableModels` IDs
-- **Fix**: CodeWhisperer requests include official `x-amzn-kiro-agent-mode` header
-- **Fix**: Resolved white screen on registration page (TDZ error)
-- **Fix**: Fixed duplicate account import after manual mode registration
-- **Fix**: Upgraded TLS profile from `chrome_131` to `chrome_144`
-- **Fix**: Corrected `tlsclientwrapper` API usage — body as 2nd arg, options as 3rd arg
+```bash
+npm run build:fullstack
+npm run start:backend
+```
 
-See [root README](../README.md#-changelog) for full changelog.
+Krouter can run as:
+
+- localhost-only dashboard plus Cloudflare tunnel.
+- VPS service behind Nginx.
+- Docker service using `docker-compose.web.yml`.
+
+For detailed server notes, see [docs/web-port.md](./docs/web-port.md).
+
+---
+
+## Development
+
+```bash
+npm run dev:web
+npm run dev:api
+npm run build:fullstack
+npm run test:e2e
+```
+
+---
+
+## Repository
+
+GitHub: [LightHaru/Krouter](https://github.com/LightHaru/Krouter)
+
+---
+
+## License
+
+AGPL-3.0.

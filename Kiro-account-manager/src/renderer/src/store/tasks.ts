@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { randomUuid } from '@/lib/utils'
 
 /**
  * 全局任务中心
@@ -125,7 +126,7 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
   tasks: loadPersistedTasks(),
 
   createTask: (input) => {
-    const id = input.fixedId || crypto.randomUUID()
+    const id = input.fixedId || randomUuid()
     const now = Date.now()
     const entry: TaskEntry = {
       id,

@@ -25,6 +25,9 @@ export function EditAccountDialog({
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [region, setRegion] = useState('us-east-1')
+  const [profileArn, setProfileArn] = useState('')
+  const [machineId, setMachineId] = useState('')
+  const [startUrl, setStartUrl] = useState('')
 
   // 可编辑字段
   const [nickname, setNickname] = useState('')
@@ -34,6 +37,7 @@ export function EditAccountDialog({
     email: string
     userId: string
     accessToken: string
+    profileArn?: string
     subscriptionType: string
     subscriptionTitle: string
     usage: { 
@@ -71,6 +75,9 @@ export function EditAccountDialog({
       setClientId(account.credentials.clientId || '')
       setClientSecret(account.credentials.clientSecret || '')
       setRegion(account.credentials.region || 'us-east-1')
+      setProfileArn(account.profileArn || '')
+      setMachineId(account.machineId || '')
+      setStartUrl(account.credentials.startUrl || '')
       setNickname(account.nickname || '')
       
       // 设置当前账号信息
@@ -78,6 +85,7 @@ export function EditAccountDialog({
         email: account.email,
         userId: account.userId || '',
         accessToken: account.credentials.accessToken,
+        profileArn: account.profileArn,
         subscriptionType: account.subscription.type,
         subscriptionTitle: account.subscription.title || account.subscription.type,
         usage: {
@@ -100,6 +108,9 @@ export function EditAccountDialog({
         setClientId(result.data.clientId)
         setClientSecret(result.data.clientSecret)
         setRegion(result.data.region)
+        setProfileArn(result.data.profileArn || '')
+        setMachineId(result.data.machineId || '')
+        setStartUrl(result.data.startUrl || '')
         setError(null)
       } else {
         setError(result.error || '导入失败')
@@ -131,7 +142,10 @@ export function EditAccountDialog({
         clientSecret,
         region,
         authMethod: account?.credentials.authMethod,
-        provider: account?.credentials.provider || account?.idp
+        provider: account?.credentials.provider || account?.idp,
+        profileArn: profileArn.trim() || undefined,
+        machineId: machineId.trim() || undefined,
+        startUrl: startUrl.trim() || undefined
       })
 
       if (result.success && result.data) {
@@ -139,6 +153,7 @@ export function EditAccountDialog({
           email: result.data.email,
           userId: result.data.userId,
           accessToken: result.data.accessToken,
+          profileArn: result.data.profileArn || profileArn.trim() || undefined,
           subscriptionType: result.data.subscriptionType,
           subscriptionTitle: result.data.subscriptionTitle,
           usage: result.data.usage,
@@ -169,6 +184,8 @@ export function EditAccountDialog({
       email: accountInfo.email,
       userId: accountInfo.userId,
       nickname: nickname || undefined,
+      profileArn: accountInfo.profileArn || profileArn.trim() || undefined,
+      machineId: machineId.trim() || undefined,
       credentials: {
         ...account.credentials,
         accessToken: accountInfo.accessToken,
@@ -177,6 +194,7 @@ export function EditAccountDialog({
         clientId,
         clientSecret,
         region,
+        startUrl: startUrl.trim() || undefined,
         expiresAt: now + 3600 * 1000
       },
       subscription: {
@@ -379,6 +397,43 @@ export function EditAccountDialog({
                       <option value="us-west-2">us-west-2 (Oregon)</option>
                       <option value="eu-west-1">eu-west-1 (Ireland)</option>
                     </select>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Profile ARN</label>
+                    <input
+                      type="text"
+                      value={profileArn}
+                      onChange={(e) => setProfileArn(e.target.value)}
+                      placeholder="arn:aws:codewhisperer:us-east-1:..."
+                      className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {isEn ? 'Required for Kiro Power/Enterprise model chat.' : 'Kiro Power/Enterprise cần ARN thật để chat model.'}
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Start URL</label>
+                      <input
+                        type="text"
+                        value={startUrl}
+                        onChange={(e) => setStartUrl(e.target.value)}
+                        placeholder="https://view.awsapps.com/start"
+                        className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Machine ID</label>
+                      <input
+                        type="text"
+                        value={machineId}
+                        onChange={(e) => setMachineId(e.target.value)}
+                        placeholder="optional"
+                        className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                      />
+                    </div>
                   </div>
                 </>
               )}

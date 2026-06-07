@@ -1,0 +1,15 @@
+services:
+  krouter:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    env_file:
+      - .env.web
+    ports:
+      - "${PORT:-4010}:4010"
+    volumes:
+      - krouter-data:/app/.web-data
+    restart: unless-stopped
+
+volumes:
+  krouter-data:

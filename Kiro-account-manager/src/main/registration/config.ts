@@ -20,7 +20,7 @@ export interface RegistrationConfig {
   upstreamProxy: string
   /**
    * 严格代理模式：开启后任何「代理缺失/代理链失败/回退环境变量」情况都立即抛错中止注册，
-   * 杜绝静默回退到本机真实 IP 直连。批量注册启用代理池时由前端强制开启。
+   * 杜绝代理配置失效后静默回退到未配置网络路径。批量注册启用代理池时由前端强制开启。
    */
   strictProxy: boolean
 
@@ -37,6 +37,10 @@ export interface RegistrationConfig {
   tempMailPlusEmail: string  // tempmail.plus 用户名（不含 @mailto.plus）
   tempMailPlusEpin: string
   tempMailPlusDomain: string // 自建域名
+  useTingamefiMail: boolean
+  tingamefiMailApiUrl: string
+  tingamefiMailAdminPassword: string
+  tingamefiMailDomain: string
 
   // Proton 点号别名（webview 借壳官方网页取码，需先在应用内登录 Proton）
   useProton: boolean
@@ -88,6 +92,10 @@ export function newConfig(overrides?: Partial<RegistrationConfig>): Registration
     tempMailPlusEmail: '',
     tempMailPlusEpin: '',
     tempMailPlusDomain: '',
+    useTingamefiMail: false,
+    tingamefiMailApiUrl: 'https://temp-email-worker.thienp1301.workers.dev',
+    tingamefiMailAdminPassword: '',
+    tingamefiMailDomain: 'mail.tingamefi.com',
     useProton: false,
     protonEmail: '',
     manualMode: false,

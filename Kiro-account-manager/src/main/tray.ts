@@ -92,7 +92,6 @@ interface TrayAccountInfo {
 
 let currentAccount: TrayAccountInfo | null = null
 let accountList: TrayAccountInfo[] = []
-let currentLanguage: 'en' | 'zh' = 'zh'
 
 // 回调函数
 interface TrayCallbacks {
@@ -138,11 +137,11 @@ function getTrayIconPath(): string {
 function buildTrayMenu(): Menu {
   const menuTemplate: MenuItemConstructorOptions[] = []
 
-  const isEn = currentLanguage === 'en'
-  
+  const isEn = true
+
   // 应用标题
   menuTemplate.push({
-    label: `Kiro ${isEn ? 'Account Manager' : '账号管理器'} v${app.getVersion()}`,
+    label: `Krouter v${app.getVersion()}`,
     icon: getMenuIcon('app'),
     enabled: false
   })
@@ -307,7 +306,7 @@ export function updateAccountList(accounts: TrayAccountInfo[]): void {
 
 // 更新语言设置
 export function updateTrayLanguage(language: 'en' | 'zh'): void {
-  currentLanguage = language
+  void language
   updateTrayMenu()
 }
 
@@ -340,7 +339,7 @@ export function createTray(cbs: TrayCallbacks): Tray | null {
     }
 
     tray = new Tray(icon)
-    tray.setToolTip(currentLanguage === 'en' ? 'Kiro Account Manager' : 'Kiro 账号管理器')
+    tray.setToolTip('Krouter')
     tray.setContextMenu(buildTrayMenu())
 
     // 双击托盘图标显示主窗口

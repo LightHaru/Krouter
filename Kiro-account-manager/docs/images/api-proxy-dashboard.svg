@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="620" viewBox="0 0 1120 620" role="img" aria-label="API Proxy dashboard settings">
+  <rect width="1120" height="620" rx="28" fill="#eaf1ff"/>
+  <rect x="56" y="48" width="1008" height="98" rx="24" fill="#ffffff" stroke="#cbd5e1"/>
+  <rect x="82" y="76" width="54" height="54" rx="16" fill="#3b82f6"/>
+  <text x="158" y="98" fill="#2563eb" font-family="Inter,Segoe UI,Arial" font-size="28" font-weight="800">API Proxy Service</text>
+  <text x="158" y="126" fill="#64748b" font-family="Inter,Segoe UI,Arial" font-size="16">OpenAI, Claude and Gemini compatible endpoint with multi-account rotation</text>
+  <rect x="56" y="176" width="1008" height="380" rx="24" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="88" y="220" fill="#0f172a" font-family="Inter,Segoe UI,Arial" font-size="21" font-weight="800">Recommended setup</text>
+  <g font-family="Inter,Segoe UI,Arial" font-size="16">
+    <text x="96" y="274" fill="#334155">Port</text>
+    <rect x="96" y="290" width="210" height="44" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="116" y="318" fill="#0f172a">5580</text>
+    <text x="342" y="274" fill="#334155">Host</text>
+    <rect x="342" y="290" width="260" height="44" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="362" y="318" fill="#0f172a">127.0.0.1</text>
+    <text x="638" y="274" fill="#334155">API Key</text>
+    <rect x="638" y="290" width="330" height="44" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="658" y="318" fill="#0f172a">sk-...</text>
+  </g>
+  <g font-family="Inter,Segoe UI,Arial" font-size="15" font-weight="700">
+    <rect x="96" y="370" width="128" height="38" rx="19" fill="#dbeafe"/>
+    <circle cx="118" cy="389" r="11" fill="#2563eb"/>
+    <text x="140" y="394" fill="#1e40af">Auto Start</text>
+    <rect x="252" y="370" width="168" height="38" rx="19" fill="#dcfce7"/>
+    <circle cx="274" cy="389" r="11" fill="#16a34a"/>
+    <text x="296" y="394" fill="#166534">Multi-Account</text>
+    <rect x="448" y="370" width="116" height="38" rx="19" fill="#fef3c7"/>
+    <text x="482" y="394" fill="#92400e">Smart</text>
+    <rect x="592" y="370" width="146" height="38" rx="19" fill="#ede9fe"/>
+    <circle cx="614" cy="389" r="11" fill="#7c3aed"/>
+    <text x="636" y="394" fill="#5b21b6">Log Requests</text>
+  </g>
+  <rect x="96" y="450" width="872" height="72" rx="18" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="126" y="482" fill="#0f172a" font-family="Inter,Segoe UI,Arial" font-size="17" font-weight="800">Smart rotation</text>
+  <text x="126" y="510" fill="#475569" font-family="Inter,Segoe UI,Arial" font-size="15">Scores quota, errors, latency, request count and token freshness before selecting an account.</text>
+</svg>
+

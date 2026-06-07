@@ -1,0 +1,9 @@
+<svg width="96" height="96" viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Krouter">
+  <rect x="8" y="8" width="80" height="80" rx="22" fill="#0B1220"/>
+  <path d="M28 68V28h10v16.8L54.2 28H67L49.8 45.5 68.5 68H55.4L42.9 52.7 38 57.7V68H28Z" fill="#FFFFFF"/>
+  <path d="M63 28h5v5h-5v-5Z" fill="#22C55E"/>
+  <path d="M69 34h5v5h-5v-5Z" fill="#38BDF8"/>
+  <path d="M63 40h5v5h-5v-5Z" fill="#F59E0B"/>
+  <path d="M62.5 32.5 49.5 45.5M68.5 36.5 52 52M62.5 42.5 55.5 56" stroke="#94A3B8" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="48" cy="48" r="5" fill="#38BDF8"/>
+</svg>

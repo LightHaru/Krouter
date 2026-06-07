@@ -2,8 +2,8 @@
 
 # Electron deb 包卸载后清理脚本
 
-APP_NAME="Kiro Account Manager"
-APP_DIR_NOSPACE="kiro-account-manager"
+APP_NAME="Krouter"
+APP_DIR_NOSPACE="krouter"
 OPT_DIR="/opt/${APP_NAME}"
 OPT_DIR_NOSPACE="/opt/${APP_DIR_NOSPACE}"
 

@@ -1206,7 +1206,7 @@ function ConfigSyncCard({ isEn }: { isEn: boolean }): React.ReactNode {
     }
     const payload = {
       version: 1,
-      type: 'kiro-account-manager-config',
+      type: 'krouter-config',
       exportedAt: Date.now(),
       // 代理池条目（不含敏感账号）
       proxyPool: Object.fromEntries(proxyPool),
@@ -1218,7 +1218,7 @@ function ConfigSyncCard({ isEn }: { isEn: boolean }): React.ReactNode {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `kiro-config-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+    a.download = `krouter-config-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
     a.click()
     URL.revokeObjectURL(url)
   }
@@ -1231,7 +1231,7 @@ function ConfigSyncCard({ isEn }: { isEn: boolean }): React.ReactNode {
     }
     try {
       const payload = JSON.parse(fileData.content)
-      if (payload.type !== 'kiro-account-manager-config') {
+      if (payload.type !== 'krouter-config' && payload.type !== 'kiro-account-manager-config') {
         alert(isEn ? 'Not a valid config file' : '不是有效的配置文件')
         return
       }
@@ -1301,3 +1301,4 @@ function ConfigSyncCard({ isEn }: { isEn: boolean }): React.ReactNode {
     </Card>
   )
 }
+

@@ -1,27 +1,81 @@
 {
-  "name": "kiro-account-manager",
-  "version": "1.7.4",
-  "description": "Kiro Account Manager - Manage your Kiro accounts, usage and subscriptions",
-  "main": "./out/main/index.js",
-  "author": "Kiro",
+  "name": "@lightharu/krouter",
+  "version": "1.8.5",
+  "description": "Krouter - Web dashboard and CLI router for Kiro accounts, quota balancing, and API proxy",
+  "main": "./out-server/server/index.js",
+  "bin": {
+    "krouter": "scripts/krouter-cli.cjs"
+  },
+  "author": "LightHaru",
   "license": "AGPL-3.0",
-  "homepage": "https://kiro.dev",
+  "homepage": "https://github.com/LightHaru/Krouter",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LightHaru/Krouter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LightHaru/Krouter/issues"
+  },
+  "keywords": [
+    "krouter",
+    "kiro",
+    "openclaw",
+    "api-proxy",
+    "openai-compatible",
+    "cli"
+  ],
+  "files": [
+    "dist-web/",
+    "docs/API-Proxy-Guide.md",
+    "docs/API-Proxy-Guide.en.md",
+    "docs/API-Proxy-Guide.vi.md",
+    "docs/CHANGELOG-v1.2.5.md",
+    "docs/CHANGELOG-v1.2.7.md",
+    "docs/CHANGELOG-v1.3.7.md",
+    "docs/CHANGELOG-v1.3.8.md",
+    "docs/K-Proxy-MITM-Plan.md",
+    "docs/images/",
+    "docs/web-port.md",
+    "out-server/",
+    "scripts/krouter-cli.cjs",
+    "scripts/kiro-manager-cli.cjs",
+    "resources/tls-client-xgo-1.14.0-windows-amd64.dll",
+    "src/renderer/src/assets/krouter-logo.svg",
+    "src/renderer/src/assets/krouter-mark.svg",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "format": "prettier --write .",
     "lint": "eslint --cache .",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
+    "typecheck:server": "tsc --noEmit -p tsconfig.server.json",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "start": "electron-vite preview",
     "dev": "chcp 65001 >nul && electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
-    "postinstall": "electron-builder install-app-deps",
+    "dev:web": "vite --config vite.web.config.ts",
+    "dev:api": "tsc -w -p tsconfig.server.json",
+    "build:web": "vite build --config vite.web.config.ts",
+    "build:api": "tsc -p tsconfig.server.json",
+    "clean:fullstack": "node -e \"const fs=require('fs'); for (const p of ['dist-web','out-server']) fs.rmSync(p,{recursive:true,force:true})\"",
+    "build:fullstack": "npm run clean:fullstack && npm run typecheck:web && npm run typecheck:server && npm run build:web && npm run build:api",
+    "start:api": "node out-server/server/index.js --api-only",
+    "start:backend": "node out-server/server/index.js --api-only",
+    "start:fullstack": "node out-server/server/index.js",
+    "cli": "node scripts/krouter-cli.cjs",
+    "prepack": "npm run build:fullstack",
     "build:unpack": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
     "build:mac": "electron-vite build && electron-builder --mac",
     "build:linux": "electron-vite build && electron-builder --linux",
     "test:e2e": "node test/e2e-fullsuite/run.mjs",
-    "test:e2e:only": "node test/e2e-fullsuite/run.mjs --only"
+    "test:e2e:only": "node test/e2e-fullsuite/run.mjs --only",
+    "test:e2e:install": "playwright install chromium",
+    "test:unit": "vitest run",
+    "test:unit:watch": "vitest"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
@@ -62,10 +116,13 @@
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.20",
+    "fast-check": "^3.23.2",
+    "playwright": "^1.60.0",
     "prettier": "^3.6.2",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "typescript": "^5.9.2",
-    "vite": "^7.1.6"
+    "vite": "^7.1.6",
+    "vitest": "^3.2.4"
   }
 }

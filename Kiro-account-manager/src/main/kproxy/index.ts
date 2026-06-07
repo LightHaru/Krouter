@@ -1,8 +1,8 @@
 // K-Proxy 模块入口
-import { app } from 'electron'
 import * as path from 'path'
 import { CertManager, createCertManager } from './certManager'
 import { MitmProxy } from './mitmProxy'
+import { getRuntimeUserDataPath } from '../runtimePaths'
 import type { 
   KProxyConfig, 
   KProxyStats, 
@@ -33,7 +33,7 @@ export class KProxyService {
   constructor(config: Partial<KProxyConfig> = {}, events: KProxyEvents = {}) {
     this.config = { ...DEFAULT_KPROXY_CONFIG, ...config }
     this.events = events
-    this.dataPath = path.join(app.getPath('userData'), 'kproxy')
+    this.dataPath = path.join(getRuntimeUserDataPath(), 'kproxy')
   }
 
   /**

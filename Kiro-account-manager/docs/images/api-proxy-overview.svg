@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="520" viewBox="0 0 1120 520" role="img" aria-label="Krouter API Proxy overview">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#172554"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" x2="1">
+      <stop offset="0" stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="16" stdDeviation="18" flood-color="#020617" flood-opacity=".35"/>
+    </filter>
+  </defs>
+  <rect width="1120" height="520" rx="28" fill="url(#bg)"/>
+  <text x="56" y="72" fill="#f8fafc" font-family="Inter,Segoe UI,Arial" font-size="36" font-weight="800">Krouter API Proxy</text>
+  <text x="56" y="108" fill="#bfdbfe" font-family="Inter,Segoe UI,Arial" font-size="17">One endpoint for OpenAI, Claude, Gemini compatible AI tools</text>
+  <g filter="url(#shadow)">
+    <rect x="56" y="168" width="250" height="170" rx="18" fill="url(#card)" stroke="#334155"/>
+    <text x="84" y="214" fill="#e0f2fe" font-family="Inter,Segoe UI,Arial" font-size="22" font-weight="700">AI Clients</text>
+    <text x="84" y="252" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial" font-size="16">OpenClaw / Aira</text>
+    <text x="84" y="282" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial" font-size="16">Codex-compatible tools</text>
+    <text x="84" y="312" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial" font-size="16">Cursor / Cline / custom apps</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="410" y="138" width="300" height="230" rx="22" fill="#0f766e" stroke="#5eead4"/>
+    <text x="448" y="194" fill="#ecfeff" font-family="Inter,Segoe UI,Arial" font-size="25" font-weight="800">Krouter Proxy</text>
+    <text x="448" y="236" fill="#ccfbf1" font-family="Inter,Segoe UI,Arial" font-size="16">/v1/chat/completions</text>
+    <text x="448" y="266" fill="#ccfbf1" font-family="Inter,Segoe UI,Arial" font-size="16">/v1/messages</text>
+    <text x="448" y="296" fill="#ccfbf1" font-family="Inter,Segoe UI,Arial" font-size="16">/v1beta/models/*</text>
+    <rect x="448" y="322" width="214" height="34" rx="17" fill="#134e4a"/>
+    <text x="472" y="344" fill="#99f6e4" font-family="Inter,Segoe UI,Arial" font-size="14" font-weight="700">Smart account rotation</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="816" y="140" width="248" height="228" rx="18" fill="url(#card)" stroke="#334155"/>
+    <text x="846" y="194" fill="#fef3c7" font-family="Inter,Segoe UI,Arial" font-size="22" font-weight="800">Kiro Accounts</text>
+    <text x="846" y="236" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial" font-size="16">Quota and plan checks</text>
+    <text x="846" y="266" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial" font-size="16">Token auto refresh</text>
+    <text x="846" y="296" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial" font-size="16">Profile ARN routing</text>
+    <text x="846" y="326" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial" font-size="16">Model capability cache</text>
+  </g>
+  <path d="M318 253 H396" stroke="#93c5fd" stroke-width="5" stroke-linecap="round"/>
+  <path d="M386 239 L410 253 L386 267" fill="none" stroke="#93c5fd" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M724 253 H800" stroke="#5eead4" stroke-width="5" stroke-linecap="round"/>
+  <path d="M790 239 L814 253 L790 267" fill="none" stroke="#5eead4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="342" y="224" fill="#dbeafe" font-family="Inter,Segoe UI,Arial" font-size="14">Bearer sk-...</text>
+  <text x="742" y="224" fill="#ccfbf1" font-family="Inter,Segoe UI,Arial" font-size="14">Best account</text>
+  <rect x="56" y="422" width="1008" height="52" rx="16" fill="#020617" opacity=".45"/>
+  <text x="84" y="454" fill="#c7d2fe" font-family="Inter,Segoe UI,Arial" font-size="16">Recommended: local host 127.0.0.1, API key enabled, Multi-Account on, Strategy Smart, dashboard tunnel for VPS access.</text>
+</svg>
+

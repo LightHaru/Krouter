@@ -2,6 +2,7 @@ import { constants, existsSync } from 'fs'
 import { access, copyFile, mkdir, readFile, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import { homedir } from 'os'
+import { KIRO_PROXY_PREFERRED_MODEL_IDS, isAutoKiroModelId, normalizeKiroModelIdForCompare } from './modelCatalog'
 
 export type ProxyClientTarget = 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'
 type OpenCodeInputModality = 'text' | 'image' | 'pdf'
@@ -33,12 +34,115 @@ export interface ProxyClientConfigResult {
   error?: string
 }
 
+export interface ConfigureProxyClientsApiKey {
+  id?: string
+  name?: string
+  key: string
+}
+
 interface ProxyClientContext {
   proxyOrigin: string
   openaiBaseUrl: string
   apiKey: string
   modelId: string
   models: ProxyClientModel[]
+}
+
+function dedupeClientModels(models: ProxyClientModel[]): ProxyClientModel[] {
+  const modelMap = new Map<string, ProxyClientModel>()
+  for (const model of models) {
+    const id = model.id?.trim()
+    if (!id) continue
+    const key = normalizeKiroModelIdForCompare(id)
+    if (!modelMap.has(key)) {
+      modelMap.set(key, { ...model, id })
+      continue
+    }
+    const existing = modelMap.get(key)!
+    modelMap.set(key, {
+      ...model,
+      ...existing,
+      id: existing.id,
+      name: existing.name || model.name,
+      inputTypes: existing.inputTypes?.length ? existing.inputTypes : model.inputTypes,
+      maxInputTokens: existing.maxInputTokens || model.maxInputTokens,
+      maxOutputTokens: existing.maxOutputTokens || model.maxOutputTokens
+    })
+  }
+  return Array.from(modelMap.values())
+}
+
+function buildOpenClawModels(context: ProxyClientContext): ProxyClientModel[] {
+  return dedupeClientModels(context.models).filter(model => !isAutoKiroModelId(model.id))
+}
+
+function openClawModelsToClientModels(value: unknown): ProxyClientModel[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item): ProxyClientModel | null => {
+      if (!isRecord(item)) return null
+      const id = typeof item.id === 'string' ? item.id.trim() : ''
+      if (!id) return null
+      const input = Array.isArray(item.input)
+        ? item.input.filter((entry): entry is string => typeof entry === 'string').map(entry => entry.toUpperCase())
+        : undefined
+      return {
+        id,
+        name: typeof item.name === 'string' ? item.name : id,
+        inputTypes: input,
+        maxInputTokens: typeof item.contextWindow === 'number'
+          ? item.contextWindow
+          : typeof item.contextTokens === 'number' ? item.contextTokens : undefined,
+        maxOutputTokens: typeof item.maxTokens === 'number' ? item.maxTokens : undefined
+      }
+    })
+    .filter((item): item is ProxyClientModel => Boolean(item))
+}
+
+function pickOpenClawPrimaryModel(context: ProxyClientContext, models: ProxyClientModel[]): string {
+  const selected = context.modelId.trim()
+  if (selected && !isAutoKiroModelId(selected)) {
+    const match = models.find(model => normalizeKiroModelIdForCompare(model.id) === normalizeKiroModelIdForCompare(selected))
+    if (match) return match.id
+  }
+  for (const preferredId of KIRO_PROXY_PREFERRED_MODEL_IDS) {
+    const match = models.find(model => normalizeKiroModelIdForCompare(model.id) === normalizeKiroModelIdForCompare(preferredId))
+    if (match) return match.id
+  }
+  return models[0]?.id || (selected && !isAutoKiroModelId(selected) ? selected : 'claude-sonnet-4.5')
+}
+
+function buildOpenClawFallbackRefs(providerId: string, primaryModelId: string, models: ProxyClientModel[]): string[] {
+  const byNormalizedId = new Map<string, string>()
+  for (const model of models) {
+    const id = model.id?.trim()
+    if (!id || isAutoKiroModelId(id)) continue
+    byNormalizedId.set(normalizeKiroModelIdForCompare(id), id)
+  }
+
+  const preferredFallbackOrder = [
+    'claude-opus-4.8',
+    'claude-opus-4.7',
+    'claude-opus-4.5',
+    'claude-sonnet-4.5',
+    'claude-sonnet-4',
+    'claude-haiku-4.5',
+    ...KIRO_PROXY_PREFERRED_MODEL_IDS
+  ]
+  const primaryKey = normalizeKiroModelIdForCompare(primaryModelId)
+  const refs: string[] = []
+  const seen = new Set<string>()
+
+  for (const modelId of preferredFallbackOrder) {
+    const match = byNormalizedId.get(normalizeKiroModelIdForCompare(modelId))
+    if (!match) continue
+    const key = normalizeKiroModelIdForCompare(match)
+    if (key === primaryKey || seen.has(key)) continue
+    seen.add(key)
+    refs.push(`${providerId}/${match}`)
+  }
+
+  return refs
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -268,6 +372,20 @@ function openCodeModelConfig(model: ProxyClientModel): Record<string, unknown> {
   }
 }
 
+function openClawModelConfig(model: ProxyClientModel): Record<string, unknown> {
+  const input = inputModalities(model)
+  return {
+    id: model.id,
+    name: model.name || model.id,
+    reasoning: false,
+    input,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: contextLimit(model),
+    contextTokens: contextLimit(model),
+    maxTokens: outputLimit(model)
+  }
+}
+
 async function configureOpenCode(context: ProxyClientContext): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
   const path = getOpenCodeConfigPath()
   const config = await readJsonObject(path)
@@ -460,22 +578,51 @@ function getOpenClawConfigPath(): string {
 async function configureOpenClaw(context: ProxyClientContext): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
   const configPath = getOpenClawConfigPath()
   const config = await readJsonObject(configPath)
+  const providerId = 'krouter'
+  const legacyProviderId = ['kiro', 'manager'].join('-')
 
   // models.providers.kiro
   const models = ensureObjectField(config, 'models')
   if (typeof models.mode !== 'string') models.mode = 'merge'
   const providers = ensureObjectField(models, 'providers')
-  providers.kiro = {
-    base_url: context.openaiBaseUrl,
-    api_key: context.apiKey,
-    api: 'openai-chat',
-    models: context.models.map(m => ({ id: m.id, name: m.name || m.id, context_window: typeof m.maxInputTokens === 'number' && m.maxInputTokens > 0 ? m.maxInputTokens : 200000 }))
+
+  if (isRecord(providers.kiro) && (providers.kiro.base_url || providers.kiro.api_key || providers.kiro.api === 'openai-chat')) {
+    delete providers.kiro
   }
+
+  const existingProvider = isRecord(providers[providerId])
+    ? providers[providerId] as Record<string, unknown>
+    : isRecord(providers[legacyProviderId])
+      ? providers[legacyProviderId] as Record<string, unknown>
+      : {}
+  const existingModels = openClawModelsToClientModels(existingProvider.models)
+  const openClawModels = dedupeClientModels([
+    ...existingModels,
+    ...buildOpenClawModels(context)
+  ]).filter(model => !isAutoKiroModelId(model.id))
+  const primaryModelId = pickOpenClawPrimaryModel(context, openClawModels)
+
+  providers[providerId] = {
+    baseUrl: context.openaiBaseUrl,
+    apiKey: context.apiKey,
+    auth: 'api-key',
+    api: 'openai-completions',
+    models: openClawModels.map(openClawModelConfig)
+  }
+  delete providers[legacyProviderId]
 
   // agents.defaults.model
   const agents = ensureObjectField(config, 'agents')
   const defaults = ensureObjectField(agents, 'defaults')
-  defaults.model = { primary: `kiro/${context.modelId}`, fallbacks: [] }
+  defaults.model = {
+    primary: `${providerId}/${primaryModelId}`,
+    fallbacks: buildOpenClawFallbackRefs(providerId, primaryModelId, openClawModels)
+  }
+  const defaultsModels = ensureObjectField(defaults, 'models')
+  for (const model of openClawModels) {
+    const ref = `${providerId}/${model.id}`
+    defaultsModels[ref] = isRecord(defaultsModels[ref]) ? defaultsModels[ref] : {}
+  }
 
   const backups = await writeJsonObject(configPath, config)
   return { paths: [configPath], backupPaths: backups }
@@ -497,7 +644,7 @@ async function configureClient(client: ProxyClientTarget, context: ProxyClientCo
   }
 }
 
-export async function configureProxyClients(input: ConfigureProxyClientsInput): Promise<{ success: boolean; proxyOrigin: string; openaiBaseUrl: string; results: ProxyClientConfigResult[] }> {
+export async function configureProxyClients(input: ConfigureProxyClientsInput): Promise<{ success: boolean; proxyOrigin: string; openaiBaseUrl: string; apiKey: ConfigureProxyClientsApiKey; results: ProxyClientConfigResult[] }> {
   const modelId = input.modelId.trim()
   const apiKey = input.apiKey?.trim()
   if (!Array.isArray(input.clients)) throw new Error('Client targets are required')
@@ -521,5 +668,11 @@ export async function configureProxyClients(input: ConfigureProxyClientsInput): 
   for (const client of clients) {
     results.push(await configureClient(client, context))
   }
-  return { success: results.every(result => result.success), proxyOrigin, openaiBaseUrl: context.openaiBaseUrl, results }
+  return {
+    success: results.every(result => result.success),
+    proxyOrigin,
+    openaiBaseUrl: context.openaiBaseUrl,
+    apiKey: { key: apiKey },
+    results
+  }
 }

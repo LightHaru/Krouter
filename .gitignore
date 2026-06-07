@@ -40,5 +40,11 @@ Kiro.code-workspace
 Kiro register.code-workspace
 test
 Kiro-account-manager/test
+!Kiro-account-manager/test/
+Kiro-account-manager/test/*
+!Kiro-account-manager/test/e2e-fullsuite/
+!Kiro-account-manager/test/e2e-fullsuite/run.mjs
+!Kiro-account-manager/test/proxy/
+!Kiro-account-manager/test/proxy/*.test.ts
 Kiro-account-manager/.kiro
 Kiro register

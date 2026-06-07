@@ -34,11 +34,36 @@ export function generatePKCE(): { codeVerifier: string; codeChallenge: string } 
   return { codeVerifier, codeChallenge }
 }
 
+export function randomUuid(): string {
+  const cryptoObj = globalThis.crypto
+  if (typeof cryptoObj?.randomUUID === 'function') {
+    return cryptoObj.randomUUID()
+  }
+
+  const bytes = randomBytes(16)
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0'))
+  return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10, 16).join('')}`
+}
+
 function generateRandomString(length: number): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'
-  const array = new Uint8Array(length)
-  crypto.getRandomValues(array)
+  const array = randomBytes(length)
   return Array.from(array, (byte) => chars[byte % chars.length]).join('')
+}
+
+function randomBytes(length: number): Uint8Array {
+  const array = new Uint8Array(length)
+  const cryptoObj = globalThis.crypto
+  if (typeof cryptoObj?.getRandomValues === 'function') {
+    cryptoObj.getRandomValues(array)
+    return array
+  }
+  for (let i = 0; i < array.length; i++) {
+    array[i] = Math.floor(Math.random() * 256)
+  }
+  return array
 }
 
 function sha256(str: string): Uint8Array {

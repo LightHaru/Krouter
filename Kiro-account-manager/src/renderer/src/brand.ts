@@ -1,0 +1,5 @@
+export const APP_NAME = 'Krouter'
+export const APP_OWNER = 'LightHaru'
+export const APP_GITHUB_URL = 'https://github.com/LightHaru/Krouter'
+export const APP_TAGLINE = 'Kiro account routing, quota balancing, and API proxy control from one web dashboard.'
+export const APP_TAGLINE_VI = 'Dashboard web cho tai khoan Kiro, can bang quota va Kiro API proxy.'

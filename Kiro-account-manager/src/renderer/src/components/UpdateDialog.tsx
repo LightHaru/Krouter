@@ -1,213 +1,247 @@
-import { useState, useEffect } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { X, Download, RefreshCw, Sparkles, CheckCircle } from 'lucide-react'
+import { AlertCircle, CheckCircle, Clock, ExternalLink, RefreshCw, Sparkles, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Progress } from '@/components/ui/progress'
+import { cn } from '@/lib/utils'
 
-interface UpdateInfo {
-  version: string
-  releaseDate?: string
+interface UpdateCheckResult {
+  hasUpdate: boolean
+  currentVersion?: string
+  latestVersion?: string
+  releaseName?: string
   releaseNotes?: string
+  releaseUrl?: string
+  publishedAt?: string
+  source?: string
+  packageName?: string
+  error?: string
 }
 
-interface DownloadProgress {
-  percent: number
-  bytesPerSecond: number
-  transferred: number
-  total: number
+interface ApplyUpdateResult extends UpdateCheckResult {
+  success: boolean
+  updated?: boolean
+  inProgress?: boolean
+  restartScheduled?: boolean
+  output?: string
 }
 
-type UpdateStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'error'
+type UpdateStatus = 'checking' | 'available' | 'updating' | 'updated' | 'error'
 
-export function UpdateDialog() {
+const SNOOZE_KEY = 'krouter.update.snoozeUntil'
+const DISMISSED_VERSION_KEY = 'krouter.update.dismissedVersion'
+
+function stripNotes(notes?: string): string {
+  return String(notes || '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/[`*_#>~-]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function formatDate(value?: string): string {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString()
+}
+
+export function UpdateDialog(): React.JSX.Element | null {
   const [open, setOpen] = useState(false)
-  const [status, setStatus] = useState<UpdateStatus>('idle')
-  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
-  const [progress, setProgress] = useState<DownloadProgress | null>(null)
+  const [status, setStatus] = useState<UpdateStatus>('checking')
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    // 监听更新事件
-    const unsubChecking = window.api.onUpdateChecking(() => {
-      setStatus('checking')
-    })
-
-    const unsubAvailable = window.api.onUpdateAvailable((info) => {
-      setUpdateInfo(info)
-      setStatus('available')
-      setOpen(true) // 有更新时自动打开弹窗
-    })
-
-    const unsubNotAvailable = window.api.onUpdateNotAvailable(() => {
-      setStatus('idle')
-    })
-
-    const unsubProgress = window.api.onUpdateDownloadProgress((prog) => {
-      setProgress(prog)
-      setStatus('downloading')
-    })
-
-    const unsubDownloaded = window.api.onUpdateDownloaded((info) => {
-      setUpdateInfo(info)
-      setStatus('downloaded')
-    })
-
-    const unsubError = window.api.onUpdateError((err) => {
-      setError(err)
-      setStatus('error')
-    })
+    let cancelled = false
+    const timer = setTimeout(async () => {
+      const snoozeUntil = Number(localStorage.getItem(SNOOZE_KEY) || '0')
+      if (snoozeUntil > Date.now()) return
+      try {
+        setStatus('checking')
+        const result = await window.api.checkForUpdatesManual()
+        if (cancelled) return
+        const latestVersion = result.latestVersion || ''
+        const dismissedVersion = localStorage.getItem(DISMISSED_VERSION_KEY)
+        if (result.hasUpdate && latestVersion && dismissedVersion !== latestVersion) {
+          setUpdateInfo(result)
+          setStatus('available')
+          setOpen(true)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : String(err))
+          setStatus('error')
+        }
+      }
+    }, 1200)
 
     return () => {
-      unsubChecking()
-      unsubAvailable()
-      unsubNotAvailable()
-      unsubProgress()
-      unsubDownloaded()
-      unsubError()
+      cancelled = true
+      clearTimeout(timer)
     }
   }, [])
 
-  const handleDownload = async () => {
-    setStatus('downloading')
-    setProgress(null)
-    await window.api.downloadUpdate()
+  const notes = useMemo(() => stripNotes(updateInfo?.releaseNotes), [updateInfo?.releaseNotes])
+  const publishedAt = useMemo(() => formatDate(updateInfo?.publishedAt), [updateInfo?.publishedAt])
+
+  const closeForSession = (): void => {
+    if (status !== 'updating') setOpen(false)
   }
 
-  const handleInstall = () => {
-    window.api.installUpdate()
+  const dismissVersion = (): void => {
+    if (updateInfo?.latestVersion) {
+      localStorage.setItem(DISMISSED_VERSION_KEY, updateInfo.latestVersion)
+    }
+    setOpen(false)
   }
 
-  const handleClose = () => {
-    if (status !== 'downloading') {
-      setOpen(false)
+  const snoozeOneDay = (): void => {
+    localStorage.setItem(SNOOZE_KEY, String(Date.now() + 24 * 60 * 60 * 1000))
+    setOpen(false)
+  }
+
+  const applyUpdate = async (): Promise<void> => {
+    setStatus('updating')
+    setError(null)
+    try {
+      const result = await window.api.applyKrouterUpdate() as ApplyUpdateResult
+      if (!result.success) {
+        setError(result.error || 'Update failed.')
+        setStatus('error')
+        return
+      }
+      setUpdateInfo((current) => ({ ...current, ...result }))
+      if (result.latestVersion) localStorage.setItem(DISMISSED_VERSION_KEY, result.latestVersion)
+      setStatus('updated')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setStatus('error')
     }
   }
 
-  const formatBytes = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} B`
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-    return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  const openRelease = (): void => {
+    if (updateInfo?.releaseUrl) window.api.openExternal(updateInfo.releaseUrl)
   }
 
-  const formatSpeed = (bytesPerSecond: number) => {
-    return `${formatBytes(bytesPerSecond)}/s`
-  }
-
-  if (!open) return null
+  if (!open || !updateInfo) return null
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50" onClick={handleClose} />
-      
-      <div className="relative glass-card-strong rounded-2xl shadow-2xl w-full max-w-md m-4 animate-in zoom-in-95 duration-200 overflow-hidden">
-        {/* 头部 */}
-        <div className="bg-gradient-to-r from-primary/10 to-primary/5 p-6 border-b">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-12 h-12 rounded-xl bg-primary/20 flex items-center justify-center">
-                <Sparkles className="h-6 w-6 text-primary" />
-              </div>
-              <div>
-                <h2 className="text-lg font-bold">发现新版本</h2>
-                {updateInfo && (
-                  <p className="text-sm text-muted-foreground">v{updateInfo.version}</p>
-                )}
-              </div>
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-4">
+      <button className="absolute inset-0 bg-black/45" onClick={closeForSession} aria-label="Close update dialog" />
+      <div className="relative w-full max-w-lg overflow-hidden rounded-xl border border-border bg-background shadow-2xl">
+        <div className="flex items-start justify-between gap-4 border-b bg-primary/5 p-5">
+          <div className="flex min-w-0 items-start gap-3">
+            <div className={cn(
+              'flex h-11 w-11 shrink-0 items-center justify-center rounded-lg',
+              status === 'error' ? 'bg-destructive/15 text-destructive' : 'bg-primary/15 text-primary'
+            )}>
+              {status === 'error' ? <AlertCircle className="h-5 w-5" /> : <Sparkles className="h-5 w-5" />}
             </div>
-            {status !== 'downloading' && (
-              <button
-                onClick={handleClose}
-                className="p-2 hover:bg-red-500 hover:text-white rounded-lg transition-colors"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            )}
+            <div className="min-w-0">
+              <h2 className="text-base font-semibold">
+                {status === 'updated' ? 'Krouter da duoc cap nhat' : 'Co ban Krouter moi'}
+              </h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                v{updateInfo.currentVersion || 'unknown'} {'->'} v{updateInfo.latestVersion || 'latest'}
+              </p>
+            </div>
           </div>
+          {status !== 'updating' && (
+            <Button variant="ghost" size="icon" onClick={closeForSession} aria-label="Close">
+              <X className="h-4 w-4" />
+            </Button>
+          )}
         </div>
 
-        {/* 内容 */}
-        <div className="p-6 space-y-4">
-          {status === 'available' && (
-            <>
-              <p className="text-sm text-muted-foreground">
-                新版本已发布，建议立即更新以获得最新功能和修复。
-              </p>
-              {updateInfo?.releaseNotes && (
-                <div 
-                  className="bg-muted/50 rounded-lg p-3 max-h-32 overflow-y-auto text-xs text-muted-foreground prose prose-sm prose-neutral dark:prose-invert max-w-none [&_ul]:list-disc [&_ul]:pl-4 [&_li]:my-0.5 [&_h1]:text-sm [&_h2]:text-xs [&_h3]:text-xs [&_p]:my-1 [&_hr]:my-2"
-                  dangerouslySetInnerHTML={{ __html: updateInfo.releaseNotes }}
-                />
-              )}
-              <div className="flex gap-3">
-                <Button variant="outline" className="flex-1" onClick={handleClose}>
-                  稍后提醒
-                </Button>
-                <Button className="flex-1" onClick={handleDownload}>
-                  <Download className="h-4 w-4 mr-2" />
-                  立即下载
-                </Button>
-              </div>
-            </>
+        <div className="space-y-4 p-5">
+          <div className="grid grid-cols-2 gap-3 text-sm">
+            <div className="rounded-lg border bg-muted/30 p-3">
+              <div className="text-xs text-muted-foreground">Nguon cap nhat</div>
+              <div className="mt-1 font-medium">{updateInfo.source || 'npm'}</div>
+            </div>
+            <div className="rounded-lg border bg-muted/30 p-3">
+              <div className="text-xs text-muted-foreground">Package</div>
+              <div className="mt-1 truncate font-medium">{updateInfo.packageName || '@lightharu/krouter'}</div>
+            </div>
+          </div>
+
+          {updateInfo.releaseName && (
+            <div>
+              <div className="text-xs font-medium uppercase text-muted-foreground">Phien ban</div>
+              <div className="mt-1 text-sm font-medium">{updateInfo.releaseName}</div>
+            </div>
           )}
 
-          {status === 'downloading' && (
-            <>
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-sm">
-                  <span className="text-muted-foreground">正在下载更新...</span>
-                  <span className="font-mono">{progress ? `${progress.percent.toFixed(1)}%` : '0%'}</span>
-                </div>
-                <Progress value={progress?.percent ?? 0} className="h-2" />
-                {progress && (
-                  <div className="flex justify-between text-xs text-muted-foreground">
-                    <span>{formatBytes(progress.transferred)} / {formatBytes(progress.total)}</span>
-                    <span>{formatSpeed(progress.bytesPerSecond)}</span>
-                  </div>
-                )}
-              </div>
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <RefreshCw className="h-4 w-4 animate-spin" />
-                <span>请勿关闭应用...</span>
-              </div>
-            </>
+          {publishedAt && (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Clock className="h-4 w-4" />
+              <span>{publishedAt}</span>
+            </div>
           )}
 
-          {status === 'downloaded' && (
-            <>
-              <div className="flex items-center gap-3 text-success">
-                <CheckCircle className="h-6 w-6" />
-                <span className="font-medium">下载完成！</span>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                更新已下载完成，点击下方按钮重启应用以完成安装。
-              </p>
-              <div className="flex gap-3">
-                <Button variant="outline" className="flex-1" onClick={handleClose}>
-                  稍后安装
-                </Button>
-                <Button className="flex-1" onClick={handleInstall}>
-                  <RefreshCw className="h-4 w-4 mr-2" />
-                  立即重启
-                </Button>
-              </div>
-            </>
+          {notes && (
+            <div className="max-h-28 overflow-y-auto rounded-lg border bg-muted/30 p-3 text-sm text-muted-foreground">
+              {notes}
+            </div>
+          )}
+
+          {status === 'updating' && (
+            <div className="flex items-center gap-2 rounded-lg border border-primary/25 bg-primary/5 p-3 text-sm text-primary">
+              <RefreshCw className="h-4 w-4 animate-spin" />
+              <span>Dang cap nhat Krouter, vui long doi...</span>
+            </div>
+          )}
+
+          {status === 'updated' && (
+            <div className="flex items-start gap-2 rounded-lg border border-green-500/25 bg-green-500/10 p-3 text-sm text-green-700 dark:text-green-300">
+              <CheckCircle className="mt-0.5 h-4 w-4" />
+              <span>
+                {Boolean((updateInfo as ApplyUpdateResult).restartScheduled)
+                  ? 'Da cai ban moi. Backend se tu khoi dong lai sau vai giay.'
+                  : 'Da cai ban moi. Neu trang chua doi version, hay restart backend/CLI de nap code moi.'}
+              </span>
+            </div>
           )}
 
           {status === 'error' && (
-            <>
-              <p className="text-sm text-destructive">
-                更新检查失败: {error}
-              </p>
-              <Button variant="outline" className="w-full" onClick={handleClose}>
-                关闭
-              </Button>
-            </>
+            <div className="rounded-lg border border-destructive/25 bg-destructive/10 p-3 text-sm text-destructive">
+              {error || updateInfo.error || 'Update failed.'}
+            </div>
           )}
+
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+            <div className="flex gap-2">
+              {updateInfo.releaseUrl && (
+                <Button variant="outline" onClick={openRelease}>
+                  <ExternalLink className="mr-2 h-4 w-4" />
+                  Chi tiet
+                </Button>
+              )}
+              {status === 'available' && (
+                <Button variant="outline" onClick={snoozeOneDay}>
+                  Tat 1 ngay
+                </Button>
+              )}
+            </div>
+            <div className="flex gap-2">
+              {status === 'available' && (
+                <Button variant="ghost" onClick={dismissVersion}>
+                  Tat
+                </Button>
+              )}
+              {status === 'available' || status === 'error' ? (
+                <Button onClick={applyUpdate}>
+                  <RefreshCw className="mr-2 h-4 w-4" />
+                  Cap nhat
+                </Button>
+              ) : (
+                <Button onClick={closeForSession}>Dong</Button>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>,
     document.body
   )
 }
-
-

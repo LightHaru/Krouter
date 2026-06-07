@@ -390,10 +390,13 @@ export interface ProxyAccount {
   lastUsed?: number
   requestCount?: number
   errorCount?: number
+  lastErrorStatus?: number
   isAvailable?: boolean
   cooldownUntil?: number
   // 配额追踪
   quotaUsed?: number
+  /** Credits consumed by the most recent successful request. Used to merge stale pool state with fresher persisted usage. */
+  quotaUsedDelta?: number
   quotaLimit?: number
   quotaExhaustedAt?: number // 配额耗尽时间戳
   quotaResetAt?: number // 下次配额重置时间
@@ -463,7 +466,7 @@ export interface ModelMappingRule {
   type: 'replace' | 'alias' | 'loadbalance'
   // 源模型（用户请求的模型名，支持通配符 *）
   sourceModel: string
-  // 目标模型列表（负载均衡时随机选择）
+  // 目标模型列表（负载均衡时按权重轮询）
   targetModels: string[]
   // 负载均衡权重（可选，默认平均）
   weights?: number[]
@@ -512,7 +515,7 @@ export interface ProxyConfig {
   // 多账号选择策略 (仅 enableMultiAccount=true 时生效)
   // - round-robin: 每次请求成功后切到下一个账号 (默认, 负载均衡)
   // - sticky: 一个账号成功就粘住, 直到失败才切换 (保留 prompt cache, 牺牲均衡)
-  accountSelectionStrategy?: 'round-robin' | 'sticky'
+  accountSelectionStrategy?: 'smart' | 'round-robin' | 'sticky' | 'least-used'
   // 多账号轮询范围 (仅 enableMultiAccount=true 时生效)
   // - 'all': 使用所有 active 账号（默认）
   // - 'groups': 仅使用 multiAccountGroupIds 选中分组的账号；可包含特殊值 '__ungrouped__' 表示未分组账号
@@ -554,6 +557,12 @@ export interface ProxyConfig {
   fallbackPort?: number
   /** 启用审计日志（管理 API 操作、config 变更） */
   enableAuditLog?: boolean
+  /**
+   * Khi true: với model cần chọn theo năng lực (requiresModelCapabilitySelection),
+   * chỉ xét tài khoản đúng tier (vd Opus → chỉ Power_Account). Mặc định không đặt:
+   * giữ hành vi hiện tại dựa trên accountSupportsModel.
+   */
+  strictTierRouting?: boolean
 }
 
 export interface TlsConfig {
