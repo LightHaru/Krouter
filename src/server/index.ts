@@ -1,4 +1,5 @@
 import http, { IncomingMessage, ServerResponse } from 'http'
+import { execFile, spawn } from 'child_process'
 import { promises as fs } from 'fs'
 import path from 'path'
 import { WebStore, verifyPassword, type UserRecord } from './store'
@@ -101,6 +102,10 @@ const TOKEN_REFRESH_BEFORE_EXPIRY_MS = 5 * 60 * 1000
 const BACKEND_AUTO_REFRESH_MIN_INTERVAL_MS = 60 * 1000
 const backendAutoRefreshTimers = new Map<string, ReturnType<typeof setInterval>>()
 const backendAutoRefreshRunning = new Set<string>()
+const KROUTER_NPM_PACKAGE = '@lightharu/krouter'
+const KROUTER_NPM_LATEST_URL = 'https://registry.npmjs.org/@lightharu%2Fkrouter/latest'
+const KROUTER_NPM_PACKAGE_URL = 'https://registry.npmjs.org/@lightharu%2Fkrouter'
+let krouterUpdatePromise: Promise<Record<string, unknown>> | null = null
 
 function envFlag(name: string): boolean | undefined {
   const raw = process.env[name]
@@ -215,6 +220,18 @@ async function startAutoProxyRuntimes(): Promise<void> {
     const result = await runtime.ensureAutoStarted('server-boot')
     if (!result.success) {
       console.error(`[Server] Proxy auto-start skipped for ${user.email}: ${result.error}`)
+    }
+  }
+}
+
+async function startAutoKProxyRuntimes(): Promise<void> {
+  for (const user of store.getUsers()) {
+    const config = store.getUserSetting<Record<string, unknown>>(user.id, 'kproxyConfig', {})
+    if (!config.autoStart) continue
+    const runtime = getKProxyRuntime(store, user.id, emit)
+    const result = await runtime.start(config)
+    if (!result.success) {
+      console.error(`[Server] K-Proxy auto-start skipped for ${user.email}: ${result.error}`)
     }
   }
 }
@@ -337,30 +354,194 @@ async function httpProbe(params: { url: string; method?: 'GET' | 'HEAD'; timeout
   }
 }
 
+function compareVersions(a: string, b: string): number {
+  const normalize = (value: string): number[] => String(value || '0')
+    .replace(/^v/i, '')
+    .split(/[.+-]/)
+    .map((part) => {
+      const match = part.match(/\d+/)
+      return match ? Number(match[0]) : 0
+    })
+  const left = normalize(a)
+  const right = normalize(b)
+  const length = Math.max(left.length, right.length)
+  for (let i = 0; i < length; i++) {
+    const diff = (left[i] || 0) - (right[i] || 0)
+    if (diff !== 0) return diff > 0 ? 1 : -1
+  }
+  return 0
+}
+
 async function checkForUpdatesManual(): Promise<Record<string, unknown>> {
+  const currentVersion = packageVersion()
   try {
-    const response = await fetch('https://api.github.com/repos/LightHaru/Krouter/releases/latest')
-    const release = await response.json() as Record<string, any>
-    const currentVersion = packageVersion()
-    const latestVersion = String(release.tag_name || '').replace(/^v/, '')
+    const latestResponse = await fetch(KROUTER_NPM_LATEST_URL, {
+      headers: { 'Accept': 'application/json' }
+    })
+    if (!latestResponse.ok) throw new Error(`npm registry returned ${latestResponse.status}`)
+    const latest = await latestResponse.json() as Record<string, any>
+    const latestVersion = String(latest.version || currentVersion).replace(/^v/i, '')
+    let publishedAt: string | undefined
+    try {
+      const packageResponse = await fetch(KROUTER_NPM_PACKAGE_URL, {
+        headers: { 'Accept': 'application/json' }
+      })
+      if (packageResponse.ok) {
+        const metadata = await packageResponse.json() as Record<string, any>
+        publishedAt = metadata.time?.[latestVersion]
+      }
+    } catch {
+      // Package time is optional; the latest endpoint is enough for update checks.
+    }
     return {
-      hasUpdate: latestVersion !== currentVersion,
+      hasUpdate: compareVersions(latestVersion, currentVersion) > 0,
       currentVersion,
       latestVersion,
-      releaseName: release.name,
-      releaseNotes: release.body,
-      releaseUrl: release.html_url,
-      publishedAt: release.published_at,
-      assets: Array.isArray(release.assets)
-        ? release.assets.map((asset) => ({
-            name: asset.name,
-            downloadUrl: asset.browser_download_url,
-            size: asset.size
-          }))
-        : []
+      releaseName: `Krouter v${latestVersion}`,
+      releaseNotes: latest.description || 'Krouter package update from npm.',
+      releaseUrl: `https://www.npmjs.com/package/${KROUTER_NPM_PACKAGE}/v/${latestVersion}`,
+      publishedAt,
+      source: 'npm',
+      packageName: KROUTER_NPM_PACKAGE,
+      assets: latest.dist?.tarball ? [{
+        name: `${KROUTER_NPM_PACKAGE}-${latestVersion}.tgz`,
+        downloadUrl: latest.dist.tarball,
+        size: latest.dist.unpackedSize || 0
+      }] : []
     }
   } catch (error) {
-    return { hasUpdate: false, currentVersion: packageVersion(), error: error instanceof Error ? error.message : String(error) }
+    try {
+      const response = await fetch('https://api.github.com/repos/LightHaru/Krouter/releases/latest')
+      if (!response.ok) throw new Error(`GitHub returned ${response.status}`)
+      const release = await response.json() as Record<string, any>
+      const latestVersion = String(release.tag_name || currentVersion).replace(/^v/i, '')
+      return {
+        hasUpdate: compareVersions(latestVersion, currentVersion) > 0,
+        currentVersion,
+        latestVersion,
+        releaseName: release.name || `Krouter v${latestVersion}`,
+        releaseNotes: release.body,
+        releaseUrl: release.html_url,
+        publishedAt: release.published_at,
+        source: 'github',
+        packageName: KROUTER_NPM_PACKAGE,
+        assets: Array.isArray(release.assets)
+          ? release.assets.map((asset) => ({
+              name: asset.name,
+              downloadUrl: asset.browser_download_url,
+              size: asset.size
+            }))
+          : []
+      }
+    } catch (fallbackError) {
+      return {
+        hasUpdate: false,
+        currentVersion,
+        latestVersion: currentVersion,
+        error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+      }
+    }
+  }
+}
+
+function npmCommand(): string {
+  return process.env.KROUTER_NPM_COMMAND || process.env.NPM_COMMAND || (process.platform === 'win32' ? 'npm.cmd' : 'npm')
+}
+
+function runUpdateCommand(): Promise<{ code: number; stdout: string; stderr: string }> {
+  const override = process.env.KROUTER_UPDATE_COMMAND || process.env.KAM_UPDATE_COMMAND
+  if (override?.trim()) {
+    return new Promise((resolve) => {
+      const child = spawn(override, {
+        shell: true,
+        windowsHide: true
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout?.on('data', (chunk) => { stdout += chunk.toString() })
+      child.stderr?.on('data', (chunk) => { stderr += chunk.toString() })
+      child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }))
+      child.on('error', (error) => resolve({ code: 1, stdout, stderr: error.message }))
+    })
+  }
+
+  return new Promise((resolve) => {
+    execFile(
+      npmCommand(),
+      ['install', '-g', `${KROUTER_NPM_PACKAGE}@latest`, '--registry', 'https://registry.npmjs.org/', '--no-audit', '--no-fund'],
+      { windowsHide: true, timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024 * 8 },
+      (error, stdout, stderr) => {
+        if (error) {
+          const code = typeof (error as NodeJS.ErrnoException & { code?: number | string }).code === 'number'
+            ? Number((error as NodeJS.ErrnoException & { code?: number }).code)
+            : 1
+          resolve({ code, stdout, stderr: stderr || error.message })
+          return
+        }
+        resolve({ code: 0, stdout, stderr })
+      }
+    )
+  })
+}
+
+function scheduleRestartAfterUpdate(): { scheduled: boolean; command?: string } {
+  const command = process.env.KROUTER_RESTART_COMMAND || process.env.KAM_RESTART_COMMAND
+  if (!command?.trim()) return { scheduled: false }
+  setTimeout(() => {
+    const child = spawn(command, {
+      shell: true,
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true
+    })
+    child.unref()
+  }, 1200)
+  return { scheduled: true, command }
+}
+
+async function applyKrouterUpdate(): Promise<Record<string, unknown>> {
+  if (krouterUpdatePromise) {
+    return {
+      success: false,
+      inProgress: true,
+      error: 'Krouter update is already running.'
+    }
+  }
+
+  krouterUpdatePromise = (async () => {
+    const check = await checkForUpdatesManual()
+    if (check.error) return { success: false, ...check }
+    if (!check.hasUpdate) return { success: true, updated: false, ...check }
+
+    const startedAt = Date.now()
+    const result = await runUpdateCommand()
+    if (result.code !== 0) {
+      return {
+        success: false,
+        updated: false,
+        ...check,
+        exitCode: result.code,
+        output: result.stdout.slice(-4000),
+        error: (result.stderr || result.stdout || 'Update command failed').slice(-4000)
+      }
+    }
+
+    const restart = scheduleRestartAfterUpdate()
+    return {
+      success: true,
+      updated: true,
+      restartScheduled: restart.scheduled,
+      restartCommandConfigured: restart.scheduled,
+      durationMs: Date.now() - startedAt,
+      output: result.stdout.slice(-4000),
+      ...check
+    }
+  })()
+
+  try {
+    return await krouterUpdatePromise
+  } finally {
+    krouterUpdatePromise = null
   }
 }
 
@@ -847,6 +1028,9 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
       return checkForUpdatesManual()
     case 'checkForUpdatesManual':
       return checkForUpdatesManual()
+    case 'applyKrouterUpdate':
+    case 'installKrouterUpdate':
+      return applyKrouterUpdate()
     case 'proxyGetStatus':
       return proxyRuntime.getStatus()
     case 'proxyStart':
@@ -1433,6 +1617,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
 async function main(): Promise<void> {
   await store.load()
   void startAutoProxyRuntimes()
+  void startAutoKProxyRuntimes()
   void startBackendAutoRefreshRuntimes()
   const port = Number(process.env.PORT || 4010)
   const host = process.env.HOST || '127.0.0.1'

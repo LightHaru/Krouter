@@ -2,6 +2,20 @@
 
 All notable Krouter changes are tracked here.
 
+## 1.8.3 - 2026-06-07
+
+### Added
+
+- Added dashboard update popup for npm/web installs with update, dismiss, and one-day snooze actions.
+- Added backend self-update support through `@lightharu/krouter@latest`, with optional restart via `KROUTER_RESTART_COMMAND`.
+- Added K-Proxy MITM roadmap documentation.
+
+### Changed
+
+- K-Proxy MITM now auto-starts on web backend restart when its saved `autoStart` setting is enabled.
+- K-Proxy dashboard now shows daemon state, auto-start state, API routing state, and CA trust state in one place.
+- Web update checks now prefer npm package metadata and only fall back to GitHub releases.
+
 ## 1.8.2 - 2026-06-06
 
 ### Added

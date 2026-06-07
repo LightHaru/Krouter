@@ -141,8 +141,8 @@ const browserOverrides: Record<string, unknown> = {
     }
     return result
   },
-  downloadUpdate: async () => ({ success: false, error: 'Web deployments are updated on the server.' }),
-  installUpdate: () => undefined,
+  downloadUpdate: async () => callBackend('applyKrouterUpdate', []),
+  installUpdate: async () => callBackend('applyKrouterUpdate', []),
   getProactiveRenewalEnabled: async () => ({ success: true, enabled: false, leadTimeMinutes: 15 }),
   setProactiveRenewalEnabled: async () => ({
     success: false,

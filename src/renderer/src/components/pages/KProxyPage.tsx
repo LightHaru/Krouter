@@ -9,19 +9,16 @@ export function KProxyPage() {
   return (
     <div className="flex-1 p-6 space-y-6 overflow-auto">
       <div className="page-hero p-6">
-        <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-purple-500/20 to-transparent rounded-full blur-2xl" />
-        <div className="absolute bottom-0 left-0 w-24 h-24 bg-gradient-to-tr from-purple-500/20 to-transparent rounded-full blur-2xl" />
         <div className="relative flex items-center gap-4">
-          <div className="p-3 rounded-xl bg-purple-500 shadow-lg shadow-purple-500/25">
+          <div className="p-3 rounded-xl bg-primary shadow-lg shadow-primary/25">
             <Shield className="h-6 w-6 text-white" />
           </div>
           <div>
-            <h1 className="text-2xl font-bold text-purple-600 dark:text-purple-400">K-Proxy MITM</h1>
+            <h1 className="text-2xl font-bold text-primary">K-Proxy MITM</h1>
             <p className="text-muted-foreground">
-              {isEn 
-                ? 'MITM proxy for Machine ID replacement, reduces ban risk'
-                : 'MITM 代理，替换 Machine ID，降低封禁风险'
-              }
+              {isEn
+                ? 'Local MITM proxy for Kiro request device ID replacement and request auditing.'
+                : 'Proxy MITM cuc bo de thay device ID trong request Kiro va theo doi request.'}
             </p>
           </div>
         </div>

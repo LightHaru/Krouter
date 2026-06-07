@@ -486,6 +486,8 @@ const api = {
     releaseName?: string
     releaseUrl?: string
     publishedAt?: string
+    source?: string
+    packageName?: string
     assets?: Array<{
       name: string
       downloadUrl: string
@@ -505,6 +507,16 @@ const api = {
   installUpdate: (): Promise<void> => {
     return ipcRenderer.invoke('install-update')
   },
+
+  applyKrouterUpdate: async (): Promise<{
+    success: boolean
+    updated?: boolean
+    error?: string
+  }> => ({
+    success: false,
+    updated: false,
+    error: 'Dashboard self-update is available in the web/npm backend.'
+  }),
 
   // 监听更新事件
   onUpdateChecking: (callback: () => void): (() => void) => {

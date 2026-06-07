@@ -532,11 +532,30 @@ interface KiroApi {
     releaseName?: string
     releaseUrl?: string
     publishedAt?: string
+    source?: string
+    packageName?: string
     assets?: Array<{
       name: string
       downloadUrl: string
       size: number
     }>
+    error?: string
+  }>
+
+  applyKrouterUpdate: () => Promise<{
+    success: boolean
+    updated?: boolean
+    inProgress?: boolean
+    restartScheduled?: boolean
+    currentVersion?: string
+    latestVersion?: string
+    releaseNotes?: string
+    releaseName?: string
+    releaseUrl?: string
+    publishedAt?: string
+    source?: string
+    packageName?: string
+    output?: string
     error?: string
   }>
 
