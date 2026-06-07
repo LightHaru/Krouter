@@ -47,6 +47,8 @@ function isEndpointRateLimitError(message: string): boolean {
 
 export interface AccountPoolConfig {
   baseCooldownMs: number      // 基础冷却时间（指数退避的基数）
+  throttleCooldownMs: number
+  maxThrottleCooldownMs: number
   maxBackoffMultiplier: number // 最大退避倍数
   quotaResetMs: number        // 配额耗尽冷却时间
   probabilisticRetryChance: number // 概率重试几率（0-1）
@@ -54,9 +56,19 @@ export interface AccountPoolConfig {
 
 const DEFAULT_CONFIG: AccountPoolConfig = {
   baseCooldownMs: 60000,        // 60s 基础冷却
+  throttleCooldownMs: 60000,
+  maxThrottleCooldownMs: 15 * 60_000,
   maxBackoffMultiplier: 1440,   // 最大 1440 倍 = 24h
   quotaResetMs: 3600000,        // 1h 配额重置
   probabilisticRetryChance: 0.1 // 10% 概率重试
+}
+
+function getCooldownMs(config: AccountPoolConfig, statusCode: number | undefined, errorCount: number): number {
+  const backoffMultiplier = Math.min(Math.pow(2, Math.max(0, errorCount - 1)), config.maxBackoffMultiplier)
+  if (statusCode === 429) {
+    return Math.min(config.throttleCooldownMs * backoffMultiplier, config.maxThrottleCooldownMs)
+  }
+  return config.baseCooldownMs * backoffMultiplier
 }
 
 export type AccountSelectionStrategy = 'smart' | 'round-robin' | 'sticky' | 'least-used'
@@ -253,10 +265,7 @@ export class AccountPool {
     if (failures > 0 && account.lastUsed) {
       const timeSinceFailure = now - account.lastUsed
       // 指数退避：base * 2^(failures-1)，封顶为 maxBackoffMultiplier
-      const backoffMultiplier = Math.min(Math.pow(2, failures - 1), this.config.maxBackoffMultiplier)
-      const effectiveCooldown = account.lastErrorStatus === 429
-        ? Math.min(2_000 * backoffMultiplier, 5 * 60_000)
-        : this.config.baseCooldownMs * backoffMultiplier
+      const effectiveCooldown = getCooldownMs(this.config, account.lastErrorStatus, failures)
 
       if (timeSinceFailure < effectiveCooldown) {
         // 未超出冷却期，用概率重试
@@ -499,10 +508,7 @@ export class AccountPool {
     }
 
     // 计算当前退避时间用于日志
-    const backoffMultiplier = Math.min(Math.pow(2, errorCount - 1), this.config.maxBackoffMultiplier)
-    const effectiveCooldown = statusCode === 429
-      ? Math.min(2_000 * backoffMultiplier, 5 * 60_000)
-      : this.config.baseCooldownMs * backoffMultiplier
+    const effectiveCooldown = getCooldownMs(this.config, statusCode, errorCount)
     const cooldownStr = effectiveCooldown < 60000 ? `${Math.round(effectiveCooldown / 1000)}s`
       : effectiveCooldown < 3600000 ? `${Math.round(effectiveCooldown / 60000)}m`
       : `${Math.round(effectiveCooldown / 3600000)}h`

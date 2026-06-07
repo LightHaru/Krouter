@@ -2,6 +2,13 @@
 
 All notable Krouter changes are tracked here.
 
+## 1.8.4 - 2026-06-07
+
+### Changed
+
+- Increased account cooldown for AmazonQ/Kiro `429` throttling from a short 2 second retry window to a 60 second exponential cooldown capped at 15 minutes, so power accounts are not retried immediately while rate-limited.
+- Reordered the VPS OpenClaw default fallback chain to prefer stable Kiro Sonnet/Haiku models before retrying Opus models when a selected model is unavailable.
+
 ## 1.8.3 - 2026-06-07
 
 ### Added
