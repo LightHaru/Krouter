@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from 'react'
+import { FormEvent, useCallback, useEffect, useState } from 'react'
 import { Check, KeyRound, Loader2, Lock, Shuffle } from 'lucide-react'
 import { getSession, login, setupAdmin, type AuthUser } from '@/api/authClient'
 import krouterMark from '@/assets/krouter-mark.svg'
@@ -24,15 +24,38 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
+  const refreshSession = useCallback(async (): Promise<void> => {
+    const session = await getSession()
+    setSetupRequired(Boolean(session.setupRequired))
+    setUser(session.user || null)
+  }, [])
+
   useEffect(() => {
-    getSession()
-      .then((session) => {
-        setSetupRequired(Boolean(session.setupRequired))
-        setUser(session.user || null)
-      })
+    refreshSession()
       .catch(() => setUser(null))
       .finally(() => setLoading(false))
-  }, [])
+  }, [refreshSession])
+
+  useEffect(() => {
+    if (!setupRequired || user) return
+    const timer = window.setInterval(() => {
+      refreshSession()
+        .then(() => setError(''))
+        .catch(() => undefined)
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [refreshSession, setupRequired, user])
+
+  const recheckSetup = async (): Promise<boolean> => {
+    try {
+      const session = await getSession()
+      setSetupRequired(Boolean(session.setupRequired))
+      setUser(session.user || null)
+      return !session.setupRequired
+    } catch {
+      return false
+    }
+  }
 
   const onLogin = async (event: FormEvent): Promise<void> => {
     event.preventDefault()
@@ -43,7 +66,7 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
       setSetupRequired(Boolean(session.setupRequired))
       setUser(session.user || null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Dang nhap that bai')
+      setError(err instanceof Error ? err.message : 'Đăng nhập thất bại')
     } finally {
       setSubmitting(false)
     }
@@ -54,13 +77,17 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
     setError('')
     if (setupMode === 'custom') {
       if (setupPassword.length < 8) {
-        setError('Mat khau can it nhat 8 ky tu')
+        setError('Mật khẩu cần ít nhất 8 ký tự')
         return
       }
       if (setupPassword !== setupPasswordConfirm) {
-        setError('Hai mat khau khong khop')
+        setError('Hai mật khẩu không khớp')
         return
       }
+    }
+    if (await recheckSetup()) {
+      setError('Krouter đã có mật khẩu admin, vui lòng đăng nhập.')
+      return
     }
 
     setSubmitting(true)
@@ -77,7 +104,7 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
         setUser(session.user || null)
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Thiet lap Krouter that bai')
+      setError(err instanceof Error ? err.message : 'Thiết lập Krouter thất bại')
     } finally {
       setSubmitting(false)
     }
@@ -99,12 +126,12 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
         <div className="mb-5 flex items-center gap-3">
           <BrandIcon />
           <div>
-            <h1 className="text-base font-semibold text-foreground">Krouter da san sang</h1>
-            <p className="text-xs text-muted-foreground">Mat khau admin chi hien thi mot lan.</p>
+            <h1 className="text-base font-semibold text-foreground">Krouter đã sẵn sàng</h1>
+            <p className="text-xs text-muted-foreground">Mật khẩu admin chỉ hiển thị một lần.</p>
           </div>
         </div>
         <div className="rounded-xl border border-primary/20 bg-primary/5 p-3">
-          <div className="mb-1 text-xs font-medium text-muted-foreground">Mat khau admin</div>
+          <div className="mb-1 text-xs font-medium text-muted-foreground">Mật khẩu admin</div>
           <div className="select-all break-all rounded-lg bg-background/80 px-3 py-2 font-mono text-sm text-foreground">
             {generatedPassword}
           </div>
@@ -115,7 +142,7 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
           className="mt-4 flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition hover:bg-primary/90"
         >
           <Check className="h-4 w-4" />
-          Vao dashboard
+          Vào dashboard
         </button>
       </AuthShell>
     )
@@ -127,8 +154,8 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
         <div className="mb-5 flex items-center gap-3">
           <BrandIcon />
           <div>
-            <h1 className="text-base font-semibold text-foreground">Thiet lap {APP_NAME}</h1>
-            <p className="text-xs text-muted-foreground">Tao mat khau admin cho lan cai dat dau tien.</p>
+            <h1 className="text-base font-semibold text-foreground">Thiết lập {APP_NAME}</h1>
+            <p className="text-xs text-muted-foreground">Tạo mật khẩu admin cho lần cài đặt đầu tiên.</p>
           </div>
         </div>
 
@@ -136,15 +163,15 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
           <ModeButton
             active={setupMode === 'random'}
             icon={<Shuffle className="h-4 w-4" />}
-            title="Krouter tao"
-            description="Random an toan"
+            title="Krouter tạo"
+            description="Random an toàn"
             onClick={() => setSetupMode('random')}
           />
           <ModeButton
             active={setupMode === 'custom'}
             icon={<KeyRound className="h-4 w-4" />}
-            title="Tu dat"
-            description="Nhap mat khau rieng"
+            title="Tự đặt"
+            description="Nhập mật khẩu riêng"
             onClick={() => setSetupMode('custom')}
           />
         </div>
@@ -153,14 +180,14 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
           <div className="space-y-3">
             <PasswordField
               id="setup-password"
-              label="Mat khau moi"
+              label="Mật khẩu mới"
               value={setupPassword}
               onChange={setSetupPassword}
               autoComplete="new-password"
             />
             <PasswordField
               id="setup-password-confirm"
-              label="Nhap lai mat khau"
+              label="Nhập lại mật khẩu"
               value={setupPasswordConfirm}
               onChange={setSetupPasswordConfirm}
               autoComplete="new-password"
@@ -170,7 +197,7 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
 
         {setupMode === 'random' && (
           <div className="rounded-xl border border-border/80 bg-background/60 p-3 text-xs leading-relaxed text-muted-foreground">
-            Krouter se tao mat khau manh va hien thi mot lan de anh luu lai.
+            Krouter sẽ tạo mật khẩu mạnh và hiển thị một lần để anh lưu lại.
           </div>
         )}
 
@@ -182,7 +209,7 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
           className="mt-4 flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition hover:bg-primary/90 disabled:opacity-60"
         >
           {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Lock className="h-4 w-4" />}
-          {setupMode === 'random' ? 'Tao mat khau random' : 'Luu mat khau'}
+          {setupMode === 'random' ? 'Tạo mật khẩu random' : 'Lưu mật khẩu'}
         </button>
       </AuthShell>
     )
@@ -194,13 +221,13 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
         <BrandIcon />
         <div>
           <h1 className="text-base font-semibold text-foreground">{APP_NAME}</h1>
-          <p className="text-xs text-muted-foreground">Dang nhap vao may chu quan tri.</p>
+          <p className="text-xs text-muted-foreground">Đăng nhập vào máy chủ quản trị.</p>
         </div>
       </div>
 
       <PasswordField
         id="password"
-        label="Mat khau"
+        label="Mật khẩu"
         value={password}
         onChange={setPassword}
         autoComplete="current-password"
@@ -213,7 +240,7 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
         disabled={submitting}
         className="mt-4 flex h-10 w-full items-center justify-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition hover:bg-primary/90 disabled:opacity-60"
       >
-        {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Dang nhap'}
+        {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Đăng nhập'}
       </button>
     </AuthShell>
   )

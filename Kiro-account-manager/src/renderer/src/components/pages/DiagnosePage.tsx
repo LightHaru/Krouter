@@ -221,18 +221,21 @@ export function DiagnosePage(): React.ReactNode {
   /** 对单个账号执行测活（复用 IPC） */
   const testOneAccount = useCallback(async (account: typeof accountList[number]): Promise<LivenessResult> => {
     const cred = account.credentials
+    const accessToken = cred.accessToken
+    const inferredKiroApiKey = cred.kiroApiKey || (accessToken?.trim().startsWith('ksk_') ? accessToken.trim() : undefined)
     try {
       const result = await window.api.diagnoseAccountLiveness({
         account: {
           id: account.id,
           email: account.email,
-          accessToken: cred.accessToken,
+          accessToken,
+          kiroApiKey: inferredKiroApiKey,
           refreshToken: cred.refreshToken,
           clientId: cred.clientId,
           clientSecret: cred.clientSecret,
           region: cred.region,
-          authMethod: cred.authMethod,
-          provider: cred.provider || account.idp,
+          authMethod: inferredKiroApiKey ? 'api_key' : cred.authMethod,
+          provider: inferredKiroApiKey ? 'KiroApiKey' : cred.provider || account.idp,
           profileArn: account.profileArn,
           machineId: account.machineId,
           expiresAt: cred.expiresAt,

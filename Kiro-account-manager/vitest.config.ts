@@ -6,7 +6,7 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   test: {
     environment: 'node',
-    include: ['test/proxy/**/*.test.ts'],
+    include: ['test/proxy/**/*.test.ts', 'test/docs/**/*.test.ts'],
     globals: true
   }
 })

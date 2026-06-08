@@ -55,6 +55,7 @@ const en = {
     register: 'Đăng ký',
     subscription: 'Gói dịch vụ',
     logs: 'Nhật ký',
+    docs: 'Hướng dẫn',
     settings: 'Cài đặt',
     about: 'Giới thiệu'
   },

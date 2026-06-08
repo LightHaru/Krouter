@@ -185,10 +185,10 @@ export function LogsPage() {
   }
 
   return (
-    <div className="h-full flex flex-col p-4 gap-2">
+    <div className="flex h-full min-w-0 flex-col gap-2 p-3 sm:p-4">
       {/* 工具栏 */}
-      <div className="flex items-center gap-2 flex-shrink-0">
-        <div className="flex items-center gap-2 flex-1">
+      <div className="flex flex-shrink-0 flex-wrap items-center gap-2">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
           <div className="p-1.5 rounded-lg bg-primary/10">
             <Bug className="h-4 w-4 text-primary" />
           </div>
@@ -208,8 +208,8 @@ export function LogsPage() {
       </div>
 
       {/* 搜索 + 筛选 */}
-      <div className="flex items-center gap-2 flex-shrink-0">
-        <div className="relative flex-1 max-w-sm">
+      <div className="flex flex-shrink-0 flex-wrap items-center gap-2">
+        <div className="relative w-full min-w-0 sm:flex-1 sm:max-w-sm">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
           <Input
             className="h-7 pl-8 pr-7 text-xs bg-muted/30 border-0 focus-visible:ring-1"
@@ -261,7 +261,7 @@ export function LogsPage() {
         </select>
 
         {/* 级别筛选 */}
-        <div className="flex items-center gap-0.5 bg-muted/30 rounded-lg p-0.5">
+        <div className="flex max-w-full flex-wrap items-center gap-0.5 rounded-lg bg-muted/30 p-0.5">
           {(['ALL', 'DEBUG', 'INFO', 'WARN', 'ERROR'] as LogLevel[]).map(level => (
             <button
               key={level}

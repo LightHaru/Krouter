@@ -198,7 +198,26 @@ export const isPlaceholderProfileArn = _isPlaceholderProfileArn
  * some deployments and reject it on others. callKiroApiStream handles the
  * compatibility retry.
  */
-export function resolveProfileArn(account: Pick<ProxyAccount, 'profileArn' | 'authMethod' | 'provider'>): string | undefined {
+function isApiKeyProxyAccount(account: Pick<ProxyAccount, 'authMethod' | 'provider' | 'kiroApiKey'> & { accessToken?: string }): boolean {
+  const authMethod = account.authMethod?.toLowerCase()
+  const provider = account.provider?.toLowerCase().replace(/[\s_-]/g, '')
+  return Boolean(account.kiroApiKey) || Boolean(account.accessToken?.trim().startsWith('ksk_')) || authMethod === 'api_key' || authMethod === 'apikey' || provider === 'kiroapikey' || provider === 'apikey'
+}
+
+function getProxyBearerToken(account: ProxyAccount): string {
+  return isApiKeyProxyAccount(account) ? (account.kiroApiKey || account.accessToken) : account.accessToken
+}
+
+function applyProxyCredentialHeaders(headers: Record<string, string>, account: ProxyAccount): void {
+  headers.Authorization = `Bearer ${getProxyBearerToken(account)}`
+  if (isApiKeyProxyAccount(account)) {
+    headers.tokentype = 'API_KEY'
+  } else if (account.authMethod === 'external_idp') {
+    headers.TokenType = 'EXTERNAL_IDP'
+  }
+}
+
+export function resolveProfileArn(account: Pick<ProxyAccount, 'profileArn' | 'authMethod' | 'provider' | 'kiroApiKey'> & { accessToken?: string }): string | undefined {
   const explicit = account.profileArn?.trim()
   if (explicit && !isPlaceholderProfileArn(explicit)) {
     return explicit
@@ -206,6 +225,9 @@ export function resolveProfileArn(account: Pick<ProxyAccount, 'profileArn' | 'au
 
   const authMethod = account.authMethod?.toLowerCase()
   const provider = account.provider?.toLowerCase()
+  if (isApiKeyProxyAccount(account)) {
+    return undefined
+  }
   if (authMethod === 'social' || provider === 'github' || provider === 'google') {
     return KIRO_SOCIAL_PROFILE_ARN
   }
@@ -1176,9 +1198,9 @@ function getAuthHeaders(
     'user-agent': getKiroUserAgent(machineId),
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=3',
-    'Authorization': `Bearer ${account.accessToken}`
+    'Authorization': `Bearer ${getProxyBearerToken(account)}`
   }
-  if (account.authMethod === 'external_idp') headers.TokenType = 'EXTERNAL_IDP'
+  applyProxyCredentialHeaders(headers, account)
   return headers
 }
 
@@ -2034,13 +2056,14 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
   const machineId = getAccountMachineId(account.id, account.machineId)
   
   const headers: Record<string, string> = {
-    'Authorization': `Bearer ${account.accessToken}`,
+    'Authorization': `Bearer ${getProxyBearerToken(account)}`,
     'Content-Type': 'application/json',
     'Accept': 'application/json',
     'User-Agent': getKiroUserAgent(machineId),
     'x-amz-user-agent': getKiroAmzUserAgent(machineId),
     'x-amzn-codewhisperer-optout': 'true'
   }
+  applyProxyCredentialHeaders(headers, account)
 
   const allModels: KiroModel[] = []
   let nextToken: string | undefined
@@ -2117,13 +2140,14 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
   const machineId = getAccountMachineId(account.id, account.machineId)
   
   const headers: Record<string, string> = {
-    'Authorization': `Bearer ${account.accessToken}`,
+    'Authorization': `Bearer ${getProxyBearerToken(account)}`,
     'content-type': 'application/json',
     'user-agent': getSubscriptionUserAgent(machineId),
     'x-amz-user-agent': getSubscriptionAmzUserAgent(machineId),
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
   }
+  applyProxyCredentialHeaders(headers, account)
 
   const profileArn = resolveProfileArn(account)
   const body = JSON.stringify(profileArn ? { profileArn } : {})
@@ -2167,13 +2191,14 @@ export async function fetchSubscriptionToken(
   const machineId = getAccountMachineId(account.id, account.machineId)
   
   const headers: Record<string, string> = {
-    'Authorization': `Bearer ${account.accessToken}`,
+    'Authorization': `Bearer ${getProxyBearerToken(account)}`,
     'content-type': 'application/json',
     'user-agent': getSubscriptionUserAgent(machineId),
     'x-amz-user-agent': getSubscriptionAmzUserAgent(machineId),
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
   }
+  applyProxyCredentialHeaders(headers, account)
 
   const profileArn = resolveProfileArn(account)
 
@@ -2216,13 +2241,14 @@ export async function setUserPreference(
   const machineId = getAccountMachineId(account.id, account.machineId)
 
   const headers: Record<string, string> = {
-    'Authorization': `Bearer ${account.accessToken}`,
+    'Authorization': `Bearer ${getProxyBearerToken(account)}`,
     'content-type': 'application/json',
     'user-agent': getSubscriptionUserAgent(machineId),
     'x-amz-user-agent': getSubscriptionAmzUserAgent(machineId),
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
   }
+  applyProxyCredentialHeaders(headers, account)
 
   const profileArn = resolveProfileArn(account)
   const bodyPayload: Record<string, unknown> = {

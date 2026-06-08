@@ -71,6 +71,12 @@ function getCooldownMs(config: AccountPoolConfig, statusCode: number | undefined
   return config.baseCooldownMs * backoffMultiplier
 }
 
+function isApiKeyAccount(account: ProxyAccount): boolean {
+  const authMethod = account.authMethod?.toLowerCase()
+  const provider = account.provider?.toLowerCase().replace(/[\s_-]/g, '')
+  return Boolean(account.kiroApiKey) || Boolean(account.accessToken?.trim().startsWith('ksk_')) || authMethod === 'api_key' || authMethod === 'apikey' || provider === 'kiroapikey' || provider === 'apikey'
+}
+
 export type AccountSelectionStrategy = 'smart' | 'round-robin' | 'sticky' | 'least-used'
 
 export class AccountPool {
@@ -248,7 +254,7 @@ export class AccountPool {
     // - 有 refreshToken 时让账号通过 —— proxyServer.getAvailableAccount 会检测
     //   isTokenExpiringSoon 并主动调用 refreshToken；若刷新失败会通过 markNeedsRefresh
     //   设置 isAvailable=false，下次循环再被本函数 line 210 跳过，形成闭环
-    if (account.expiresAt && account.expiresAt < now && !account.refreshToken) {
+    if (account.expiresAt && account.expiresAt < now && !account.refreshToken && !isApiKeyAccount(account)) {
       return false
     }
 

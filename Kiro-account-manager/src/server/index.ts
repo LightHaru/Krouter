@@ -203,6 +203,27 @@ function getUser(request: IncomingMessage): UserRecord | undefined {
   return store.findUserBySession(cookies[SESSION_COOKIE_NAME] || cookies[LEGACY_SESSION_COOKIE_NAME])
 }
 
+function isLoopbackRequest(request: IncomingMessage): boolean {
+  const address = request.socket.remoteAddress || ''
+  return address === '127.0.0.1' ||
+    address === '::1' ||
+    address === '::ffff:127.0.0.1' ||
+    address === 'localhost'
+}
+
+function getCliUser(request: IncomingMessage): UserRecord | undefined {
+  if (!isLoopbackRequest(request)) return undefined
+  const expected = String(process.env.KROUTER_CLI_TOKEN || process.env.KAM_CLI_TOKEN || '').trim()
+  if (!expected) return undefined
+  const provided = String(request.headers['x-krouter-cli-token'] || request.headers['x-kam-cli-token'] || '').trim()
+  if (provided !== expected) return undefined
+  return store.getUsers().find(item => item.role === 'admin') || store.getUsers()[0]
+}
+
+function getApiUser(request: IncomingMessage): UserRecord | undefined {
+  return getUser(request) || getCliUser(request)
+}
+
 function publicUser(user: UserRecord): { id: string; email: string; name?: string; role: 'admin' | 'user' } {
   return { id: user.id, email: user.email, name: user.name, role: user.role }
 }
@@ -586,10 +607,16 @@ function isBannedAccountError(error?: string): boolean {
     lowerError.includes('accountsuspendedexception') ||
     lowerError.includes('account suspended') ||
     lowerError.includes('temporarily_suspended') ||
+    lowerError.includes('permanently_suspended') ||
     lowerError.includes('temporarily suspended') ||
+    lowerError.includes('permanently suspended') ||
     (lowerError.includes('user id is') && lowerError.includes('suspended')) ||
+    lowerError.includes('user id is temporarily suspended') ||
     lowerError.includes('account is locked') ||
+    lowerError.includes('locked it as a security precaution') ||
     lowerError.includes('security precaution') ||
+    lowerError.includes('unusual user activity') ||
+    lowerError.includes('restricted your ability to use kiro') ||
     lowerError.includes('账户已封禁') ||
     lowerError.includes('已封禁') ||
     /\b423\b/.test(lowerError)
@@ -717,8 +744,11 @@ function applyRefreshDataToStoredAccount(
   }
 
   const userInfo = isPlainRecord(data?.userInfo) ? data.userInfo : {}
-  const status = data?.status === 'error' ? 'error' : 'active'
   const errorMessage = typeof data?.errorMessage === 'string' && data.errorMessage ? data.errorMessage : undefined
+  const currentBanned = isBannedAccountError(account.lastError)
+  const incomingBanned = isBannedAccountError(errorMessage)
+  const status = currentBanned || incomingBanned || data?.status === 'error' ? 'error' : 'active'
+  const lastError = incomingBanned ? errorMessage : currentBanned ? account.lastError : errorMessage
 
   return {
     ...account,
@@ -730,17 +760,19 @@ function applyRefreshDataToStoredAccount(
     usage,
     subscription,
     status,
-    lastError: errorMessage,
+    lastError,
     lastCheckedAt: now
   }
 }
 
 function applyBackendRefreshFailure(id: string, account: StoredAccount, error: string, now: number): StoredAccount {
+  const currentBanned = isBannedAccountError(account.lastError)
+  const incomingBanned = isBannedAccountError(error)
   return {
     ...account,
     id: account.id || id,
     status: 'error',
-    lastError: error,
+    lastError: currentBanned && !incomingBanned ? account.lastError : error,
     lastCheckedAt: now
   }
 }
@@ -1580,7 +1612,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   }
 
   if (url.pathname === '/api/events') {
-    const user = getUser(request)
+    const user = getApiUser(request)
     if (!user) {
       sendJson(response, 401, { error: 'Unauthorized' })
       return
@@ -1597,7 +1629,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   }
 
   if (url.pathname === '/api/ipc' && request.method === 'POST') {
-    const user = getUser(request)
+    const user = getApiUser(request)
     if (!user) {
       sendJson(response, 401, { error: 'Unauthorized' })
       return

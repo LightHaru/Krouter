@@ -3447,7 +3447,21 @@ app.whenReady().then(async () => {
         const errorMsg = apiError instanceof Error ? apiError.message : ''
         
         // 检查是否是明确封禁错误（423 或 AccountSuspendedException）
-        if (errorMsg.includes('AccountSuspendedException') || errorMsg.includes('423')) {
+        const lowerErrorMsg = errorMsg.toLowerCase()
+        if (
+          errorMsg.includes('AccountSuspendedException') ||
+          errorMsg.includes('423') ||
+          lowerErrorMsg.includes('temporarily_suspended') ||
+          lowerErrorMsg.includes('permanently_suspended') ||
+          lowerErrorMsg.includes('temporarily suspended') ||
+          lowerErrorMsg.includes('permanently suspended') ||
+          lowerErrorMsg.includes('account suspended') ||
+          lowerErrorMsg.includes('user id is temporarily suspended') ||
+          lowerErrorMsg.includes('locked it as a security precaution') ||
+          lowerErrorMsg.includes('security precaution') ||
+          lowerErrorMsg.includes('unusual user activity') ||
+          lowerErrorMsg.includes('restricted your ability to use kiro')
+        ) {
           console.log('[IPC] Account suspended/banned')
           return {
             success: false,

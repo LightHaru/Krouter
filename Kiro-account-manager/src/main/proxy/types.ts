@@ -374,10 +374,11 @@ export interface ProxyAccount {
   email?: string
   accessToken: string
   refreshToken?: string
+  kiroApiKey?: string
   clientId?: string
   clientSecret?: string
   region?: string
-  authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
+  authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp' | 'api_key' | 'apikey'
   provider?: string
   profileArn?: string
   expiresAt?: number

@@ -139,7 +139,7 @@ export function UpdateDialog(): React.JSX.Element | null {
             </div>
             <div className="min-w-0">
               <h2 className="text-base font-semibold">
-                {status === 'updated' ? 'Krouter da duoc cap nhat' : 'Co ban Krouter moi'}
+                {status === 'updated' ? 'Krouter đã được cập nhật' : 'Có bản Krouter mới'}
               </h2>
               <p className="mt-1 text-sm text-muted-foreground">
                 v{updateInfo.currentVersion || 'unknown'} {'->'} v{updateInfo.latestVersion || 'latest'}
@@ -156,7 +156,7 @@ export function UpdateDialog(): React.JSX.Element | null {
         <div className="space-y-4 p-5">
           <div className="grid grid-cols-2 gap-3 text-sm">
             <div className="rounded-lg border bg-muted/30 p-3">
-              <div className="text-xs text-muted-foreground">Nguon cap nhat</div>
+              <div className="text-xs text-muted-foreground">Nguồn cập nhật</div>
               <div className="mt-1 font-medium">{updateInfo.source || 'npm'}</div>
             </div>
             <div className="rounded-lg border bg-muted/30 p-3">
@@ -167,7 +167,7 @@ export function UpdateDialog(): React.JSX.Element | null {
 
           {updateInfo.releaseName && (
             <div>
-              <div className="text-xs font-medium uppercase text-muted-foreground">Phien ban</div>
+              <div className="text-xs font-medium uppercase text-muted-foreground">Phiên bản</div>
               <div className="mt-1 text-sm font-medium">{updateInfo.releaseName}</div>
             </div>
           )}
@@ -188,7 +188,7 @@ export function UpdateDialog(): React.JSX.Element | null {
           {status === 'updating' && (
             <div className="flex items-center gap-2 rounded-lg border border-primary/25 bg-primary/5 p-3 text-sm text-primary">
               <RefreshCw className="h-4 w-4 animate-spin" />
-              <span>Dang cap nhat Krouter, vui long doi...</span>
+              <span>Đang cập nhật Krouter, vui lòng đợi...</span>
             </div>
           )}
 
@@ -197,8 +197,8 @@ export function UpdateDialog(): React.JSX.Element | null {
               <CheckCircle className="mt-0.5 h-4 w-4" />
               <span>
                 {Boolean((updateInfo as ApplyUpdateResult).restartScheduled)
-                  ? 'Da cai ban moi. Backend se tu khoi dong lai sau vai giay.'
-                  : 'Da cai ban moi. Neu trang chua doi version, hay restart backend/CLI de nap code moi.'}
+                  ? 'Đã cài bản mới. Backend sẽ tự khởi động lại sau vài giây.'
+                  : 'Đã cài bản mới. Nếu trang chưa đổi version, hãy restart backend/CLI để nạp code mới.'}
               </span>
             </div>
           )}
@@ -214,28 +214,28 @@ export function UpdateDialog(): React.JSX.Element | null {
               {updateInfo.releaseUrl && (
                 <Button variant="outline" onClick={openRelease}>
                   <ExternalLink className="mr-2 h-4 w-4" />
-                  Chi tiet
+                  Chi tiết
                 </Button>
               )}
               {status === 'available' && (
                 <Button variant="outline" onClick={snoozeOneDay}>
-                  Tat 1 ngay
+                  Tắt 1 ngày
                 </Button>
               )}
             </div>
             <div className="flex gap-2">
               {status === 'available' && (
                 <Button variant="ghost" onClick={dismissVersion}>
-                  Tat
+                  Tắt
                 </Button>
               )}
               {status === 'available' || status === 'error' ? (
                 <Button onClick={applyUpdate}>
                   <RefreshCw className="mr-2 h-4 w-4" />
-                  Cap nhat
+                  Cập nhật
                 </Button>
               ) : (
-                <Button onClick={closeForSession}>Dong</Button>
+                <Button onClick={closeForSession}>Đóng</Button>
               )}
             </div>
           </div>

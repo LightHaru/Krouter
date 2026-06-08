@@ -5,7 +5,7 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const readline = require('readline/promises')
-const { spawn } = require('child_process')
+const { execFile, spawn } = require('child_process')
 const { stdin: input, stdout: output } = require('process')
 
 const PACKAGE_ROOT = path.resolve(__dirname, '..')
@@ -16,6 +16,8 @@ const SERVER_OUT = path.join(DATA_DIR, 'server.out.log')
 const SERVER_ERR = path.join(DATA_DIR, 'server.err.log')
 const SERVER_ENTRY = path.join(PACKAGE_ROOT, 'out-server', 'server', 'index.js')
 const STATIC_ENTRY = path.join(PACKAGE_ROOT, 'dist-web', 'index.html')
+const KROUTER_NPM_PACKAGE = '@lightharu/krouter'
+const KROUTER_NPM_LATEST_URL = 'https://registry.npmjs.org/@lightharu%2Fkrouter/latest'
 const DEFAULT_PORT = process.env.PORT || '4010'
 const API_BASE = (process.env.KROUTER_API_BASE || process.env.KAM_API_BASE || `http://127.0.0.1:${DEFAULT_PORT}`).replace(/\/$/, '')
 const DASHBOARD_URL = (
@@ -67,15 +69,114 @@ function writeEnvFile(file, env) {
   fs.writeFileSync(file, `${body}\n`, 'utf8')
 }
 
+function packageVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, 'package.json'), 'utf8')).version || '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+}
+
+function compareVersions(a, b) {
+  const normalize = (value) => String(value || '0')
+    .replace(/^v/i, '')
+    .split(/[.+-]/)
+    .map((part) => {
+      const match = part.match(/\d+/)
+      return match ? Number(match[0]) : 0
+    })
+  const left = normalize(a)
+  const right = normalize(b)
+  const length = Math.max(left.length, right.length)
+  for (let i = 0; i < length; i++) {
+    const diff = (left[i] || 0) - (right[i] || 0)
+    if (diff !== 0) return diff > 0 ? 1 : -1
+  }
+  return 0
+}
+
+function npmCommand() {
+  return process.env.KROUTER_NPM_COMMAND || process.env.NPM_COMMAND || (process.platform === 'win32' ? 'npm.cmd' : 'npm')
+}
+
+async function fetchLatestPackageVersion() {
+  const response = await fetch(KROUTER_NPM_LATEST_URL, {
+    headers: { Accept: 'application/json' }
+  })
+  if (!response.ok) throw new Error(`npm registry returned ${response.status}`)
+  const latest = await response.json()
+  return {
+    version: String(latest.version || '').replace(/^v/i, ''),
+    tarball: latest.dist?.tarball
+  }
+}
+
+function runGlobalPackageUpdate() {
+  return new Promise((resolve) => {
+    execFile(
+      npmCommand(),
+      ['install', '-g', `${KROUTER_NPM_PACKAGE}@latest`, '--registry', 'https://registry.npmjs.org/', '--no-audit', '--no-fund'],
+      { windowsHide: true, timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024 * 8 },
+      (error, stdout, stderr) => {
+        if (error) {
+          const code = typeof error.code === 'number' ? error.code : 1
+          resolve({ code, stdout, stderr: stderr || error.message })
+          return
+        }
+        resolve({ code: 0, stdout, stderr })
+      }
+    )
+  })
+}
+
+async function updateKrouterPackage(options = {}) {
+  const currentVersion = packageVersion()
+  console.log(line('Package', KROUTER_NPM_PACKAGE))
+  console.log(line('Current', currentVersion))
+
+  const latest = await fetchLatestPackageVersion()
+  console.log(line('Latest', latest.version || '-'))
+
+  const hasUpdate = latest.version && compareVersions(latest.version, currentVersion) > 0
+  if (!hasUpdate && !options.force) {
+    console.log(`${COLORS.green}Krouter dang o ban moi nhat.${COLORS.reset}`)
+    return
+  }
+
+  if (options.checkOnly) {
+    console.log(hasUpdate ? `${COLORS.yellow}Co ban moi. Chay: ${COMMAND_NAME} update${COLORS.reset}` : `${COLORS.green}Khong co ban moi.${COLORS.reset}`)
+    return
+  }
+
+  console.log(`${COLORS.cyan}Dang cap nhat qua npm...${COLORS.reset}`)
+  const result = await runGlobalPackageUpdate()
+  const outputText = `${result.stdout || ''}${result.stderr ? `\n${result.stderr}` : ''}`.trim()
+  if (result.code !== 0) {
+    throw new Error(`Cap nhat that bai (exit ${result.code}).${outputText ? `\n${outputText}` : ''}`)
+  }
+  if (outputText) console.log(outputText)
+  console.log(`${COLORS.green}Cap nhat xong.${COLORS.reset} Chay lai: ${COMMAND_NAME}`)
+}
+
 function ensureRuntimeEnv() {
   ensureDir(DATA_DIR)
   const env = parseEnvFile(ENV_FILE)
   if (!env.SESSION_SECRET) env.SESSION_SECRET = randomSecret()
   if (!env.APP_ENCRYPTION_KEY) env.APP_ENCRYPTION_KEY = randomSecret()
+  if (!env.KROUTER_CLI_TOKEN) env.KROUTER_CLI_TOKEN = randomSecret()
   if (!env.KIRO_WEB_DATA_DIR) env.KIRO_WEB_DATA_DIR = DATA_DIR
   if (!env.KIRO_RUNTIME_DATA_DIR) env.KIRO_RUNTIME_DATA_DIR = DATA_DIR
   writeEnvFile(ENV_FILE, env)
   return env
+}
+
+function readCliToken() {
+  const fileEnv = readEnvFile()
+  return process.env.KROUTER_CLI_TOKEN ||
+    process.env.KAM_CLI_TOKEN ||
+    fileEnv.KROUTER_CLI_TOKEN ||
+    fileEnv.KAM_CLI_TOKEN ||
+    ''
 }
 
 function readEnvFile() {
@@ -98,9 +199,11 @@ function readEnvFile() {
 }
 
 async function request(pathname, options = {}) {
+  const cliToken = readCliToken()
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(cookie ? { Cookie: cookie } : {}),
+    ...(cliToken ? { 'X-Krouter-Cli-Token': cliToken } : {}),
     ...(options.headers || {})
   }
   const response = await fetch(`${API_BASE}${pathname}`, { ...options, headers })
@@ -166,8 +269,26 @@ async function waitForHealth(timeoutMs = 15000) {
 }
 
 async function ensureServer() {
+  const runtimeEnv = ensureRuntimeEnv()
   const existing = await getHealth()
-  if (existing?.ok) return existing
+  if (existing?.ok) {
+    const currentVersion = packageVersion()
+    if (!isRemoteApiBase() && existing.version && existing.version !== currentVersion) {
+      const pid = readPid()
+      if (isPidRunning(pid)) {
+        try {
+          process.kill(pid)
+          await sleep(1200)
+        } catch {
+          return existing
+        }
+      } else {
+        return existing
+      }
+    } else {
+      return existing
+    }
+  }
 
   if (isRemoteApiBase()) {
     throw new Error(`Khong ket noi duoc Krouter backend tai ${API_BASE}`)
@@ -185,7 +306,6 @@ async function ensureServer() {
     if (health?.ok) return health
   }
 
-  const runtimeEnv = ensureRuntimeEnv()
   const out = fs.openSync(SERVER_OUT, 'a')
   const err = fs.openSync(SERVER_ERR, 'a')
   const child = spawn(process.execPath, [SERVER_ENTRY], {
@@ -300,25 +420,52 @@ function statusLabel(value) {
   return value ? `${COLORS.green}ON${COLORS.reset}` : `${COLORS.red}OFF${COLORS.reset}`
 }
 
+const BOX_WIDTH = 66
+
+// Visible length ignoring ANSI color codes, so bordered boxes stay aligned
+// whether or not colors are enabled.
+function visibleLength(text) {
+  // eslint-disable-next-line no-control-regex
+  return String(text).replace(/\x1b\[[0-9;]*m/g, '').length
+}
+
 function line(label, value) {
   const padded = `${label}:`.padEnd(16, ' ')
   return `  ${COLORS.dim}${padded}${COLORS.reset}${value || '-'}`
 }
 
-function horizontal(width = 66) {
-  return '+'.padEnd(width - 1, '-') + '+'
+function horizontal(width = BOX_WIDTH) {
+  return `${COLORS.dim}+${'-'.repeat(Math.max(0, width - 2))}+${COLORS.reset}`
+}
+
+// A single bordered row whose content keeps its alignment even with color codes.
+function boxedRow(content, width = BOX_WIDTH) {
+  const inner = width - 4
+  const pad = Math.max(0, inner - visibleLength(content))
+  return `${COLORS.dim}|${COLORS.reset} ${content}${' '.repeat(pad)} ${COLORS.dim}|${COLORS.reset}`
 }
 
 function boxedTitle(title, subtitle) {
-  const width = 66
-  console.log(horizontal(width))
-  console.log(`| ${COLORS.bold}${title}${COLORS.reset}`.padEnd(width - 1, ' ') + '|')
-  console.log(`| ${COLORS.dim}${subtitle}${COLORS.reset}`.padEnd(width - 1, ' ') + '|')
-  console.log(horizontal(width))
+  console.log(horizontal())
+  console.log(boxedRow(`${COLORS.bold}${COLORS.cyan}${title}${COLORS.reset}`))
+  if (subtitle) console.log(boxedRow(`${COLORS.dim}${subtitle}${COLORS.reset}`))
+  console.log(horizontal())
 }
 
 async function getTunnelStatus() {
-  return ipc('dashboardTunnelGetStatus')
+  try {
+    return await ipc('dashboardTunnelGetStatus')
+  } catch (error) {
+    const message = error?.message || String(error)
+    const session = await request('/api/auth/session').catch(() => null)
+    return {
+      running: false,
+      localUrl: DASHBOARD_URL,
+      error: /unauthorized/i.test(message)
+        ? (session?.setupRequired ? `Krouter chua setup. Chay: ${COMMAND_NAME} setup` : 'Backend hien tai chua nhan quyen CLI local. Chay krouter stop roi krouter de khoi dong lai ban moi.')
+        : message
+    }
+  }
 }
 
 async function printLinks() {
@@ -451,6 +598,8 @@ function usage() {
   console.log('Huong dan:')
   console.log(`  npm install -g @lightharu/krouter`)
   console.log(`  ${COMMAND_NAME}`)
+  console.log(`  ${COMMAND_NAME} update`)
+  console.log(`  ${COMMAND_NAME} update check`)
   console.log(`  ${COMMAND_NAME} start`)
   console.log(`  ${COMMAND_NAME} setup`)
   console.log(`  ${COMMAND_NAME} status`)
@@ -467,6 +616,17 @@ async function main() {
     usage()
     return
   }
+  if (command === 'version' || command === '--version' || command === '-v') {
+    console.log(packageVersion())
+    return
+  }
+  if (command === 'update' || command === 'upgrade') {
+    const flags = new Set([subcommand, ...rest].filter(Boolean))
+    return updateKrouterPackage({
+      checkOnly: flags.has('check') || flags.has('--check'),
+      force: flags.has('--force') || flags.has('force')
+    })
+  }
 
   await ensureServer()
 
@@ -481,19 +641,10 @@ async function main() {
   if (!command || command === 'menu') {
     const session = await request('/api/auth/session').catch(() => null)
     if (session?.setupRequired) await setupKrouter()
-    try {
-      await login()
-      openBrowser(DASHBOARD_URL)
-      return menu()
-    } catch (error) {
-      await printBasicStart()
-      console.log(`${COLORS.yellow}${error.message || error}${COLORS.reset}`)
-      openBrowser(DASHBOARD_URL)
-      return
-    }
+    openBrowser(DASHBOARD_URL)
+    return menu()
   }
 
-  await login()
   if (command === 'status') return printStatus()
   if (command === 'links' || command === 'url' || command === 'link') return printLinks()
   if (command === 'tunnel' && subcommand === 'start') return startTunnel(rest[0])

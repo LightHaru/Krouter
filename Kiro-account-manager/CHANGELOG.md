@@ -2,6 +2,36 @@
 
 All notable Krouter changes are tracked here.
 
+## 1.8.7 - 2026-06-08
+
+### Added
+
+- Added API-key account import/login support for `ksk_...` keys so headless Kiro API accounts can be added from the dashboard and used by the API proxy.
+- Added responsive shell coverage for Android, iOS, tablet, and desktop layouts with the sidebar kept as a left rail on narrow screens.
+
+### Changed
+
+- Reworked the web app shell to use `100dvh`, safe-area insets, a persistent left sidebar rail, and responsive wrapping for account, proxy, register, logs, and machine-id controls.
+- Updated dashboard login, setup, update, about, sidebar, and K-Proxy copy to use Vietnamese with proper diacritics.
+- Improved API proxy account handling so stored `ksk_...` API-key accounts are treated as API-key credentials even when older saved records do not have explicit `authMethod` metadata.
+
+### Fixed
+
+- Fixed API-key account liveness checks being skipped with a missing `profileArn` message.
+- Fixed narrow-screen toolbar and filter rows causing horizontal overflow inside the dashboard.
+
+## 1.8.6 - 2026-06-07
+
+### Added
+
+- Added `krouter update` and `krouter update check` so the terminal CLI can update the global npm package without requiring dashboard login.
+- Added a local-only CLI authorization token generated in `~/.krouter/.env`, allowing SSH/admin terminal commands to call the backend without the dashboard password.
+
+### Changed
+
+- `krouter` now opens the dashboard/menu without requiring `KROUTER_ADMIN_PASSWORD`; the dashboard password remains only for browser login.
+- The CLI restarts a local backend when it detects the running backend version is older than the installed package version.
+
 ## 1.8.5 - 2026-06-07
 
 ### Added

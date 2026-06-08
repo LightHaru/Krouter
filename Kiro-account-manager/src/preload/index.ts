@@ -134,8 +134,8 @@ const api = {
     clientSecret: string
     region?: string
     startUrl?: string
-    authMethod?: 'IdC' | 'social'
-    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise'
+    authMethod?: 'IdC' | 'social' | 'api_key'
+    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise' | 'IAM_SSO' | 'KiroApiKey'
     profileArn?: string
     accountId?: string
   }): Promise<{
@@ -196,9 +196,11 @@ const api = {
 
   // 验证凭证并获取账号信息
   verifyAccountCredentials: (credentials: {
-    refreshToken: string
-    clientId: string
-    clientSecret: string
+    refreshToken?: string
+    accessToken?: string
+    kiroApiKey?: string
+    clientId?: string
+    clientSecret?: string
     region?: string
     authMethod?: string  // 'IdC' 或 'social'
     provider?: string    // 'BuilderId', 'Github', 'Google'
@@ -733,7 +735,7 @@ const api = {
   },
 
   // 添加账号到反代池
-  proxyAddAccount: (account: { id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }): Promise<{ success: boolean; accountCount?: number; error?: string }> => {
+  proxyAddAccount: (account: { id: string; email?: string; accessToken: string; kiroApiKey?: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }): Promise<{ success: boolean; accountCount?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-add-account', account)
   },
 
@@ -743,7 +745,7 @@ const api = {
   },
 
   // 同步账号到反代池（批量更新）
-  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }>): Promise<{ success: boolean; accountCount?: number; error?: string }> => {
+  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; kiroApiKey?: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }>): Promise<{ success: boolean; accountCount?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-sync-accounts', accounts)
   },
 
@@ -1310,9 +1312,9 @@ const api = {
    */
   diagnoseAccountLiveness: (params: {
     account: {
-      id?: string; email?: string; accessToken?: string; refreshToken?: string
+      id?: string; email?: string; accessToken?: string; kiroApiKey?: string; refreshToken?: string
       clientId?: string; clientSecret?: string; region?: string
-      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'; provider?: string
+      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp' | 'api_key' | 'apikey'; provider?: string
       profileArn?: string; machineId?: string; expiresAt?: number; proxyUrl?: string
     }
     model?: string

@@ -306,9 +306,9 @@ export function AccountToolbar({
   return (
     <div className="space-y-3">
       {/* 搜索和主要操作 */}
-      <div className="flex items-center gap-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
         {/* 搜索框 */}
-        <div className="relative flex-1 max-w-md">
+        <div className="relative w-full min-w-0 sm:flex-1 sm:max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <input
             type="text"
@@ -320,7 +320,7 @@ export function AccountToolbar({
         </div>
 
         {/* 主要操作按钮 - 右对齐 */}
-        <div className="flex items-center gap-2 ml-auto">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 sm:ml-auto">
           {/* 视图切换 (卡片 / 列表) */}
           <div className="flex items-center rounded-xl border border-[var(--glass-border)] bg-[var(--glass-bg-subtle)] backdrop-blur-md overflow-hidden">
             <button
@@ -364,9 +364,9 @@ export function AccountToolbar({
       </div>
 
       {/* 统计和选择操作 */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         {/* 左侧：统计信息 */}
-        <div className="flex items-center gap-4 text-sm">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 text-sm sm:gap-4">
           <span className="text-muted-foreground">
             {isEn ? '' : '共 '}<span className="font-medium text-foreground">{stats.total}</span> {isEn ? 'accounts' : '个账号'}
             {filteredCount !== stats.total && (
@@ -381,7 +381,7 @@ export function AccountToolbar({
         </div>
 
         {/* 右侧：选择操作和管理 - 缩小间距 */}
-        <div className="flex items-center gap-1">
+        <div className="flex min-w-0 flex-wrap items-center gap-1">
           {/* 分组按钮 — 切换视图 + 批量移动 + 管理 三合一 */}
           <div className="relative" ref={groupMenuRef}>
             <Button

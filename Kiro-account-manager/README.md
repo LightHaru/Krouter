@@ -90,6 +90,7 @@ The dashboard is the control surface. The backend and `krouter` CLI are the runt
 - `krouter` opens the clean terminal dashboard.
 - `krouter setup` performs first-run admin setup.
 - `krouter status` checks backend/dashboard/proxy state.
+- `krouter update` updates the global npm install without requiring the dashboard password.
 - `krouter tunnel start` exposes the dashboard when remote access is needed.
 - `krouter openclaw import` writes the Krouter provider into OpenClaw config.
 
@@ -119,11 +120,18 @@ krouter
 ```
 
 The CLI starts the local backend, opens the dashboard, and stores runtime data in `~/.krouter`.
+Dashboard passwords are only for browser login. SSH/local terminal commands use a private CLI token generated in `~/.krouter/.env`, so `krouter`, `krouter status`, `krouter tunnel ...`, and `krouter update` do not ask for the dashboard password.
 
 To update later:
 
 ```bash
-npm update -g @lightharu/krouter
+krouter update
+```
+
+To only check for an available update:
+
+```bash
+krouter update check
 ```
 
 Source/development mode:

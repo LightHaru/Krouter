@@ -185,7 +185,7 @@ export const AccountCard = memo(function AccountCard({
       const result = await window.api.proxyClearAccountSuspended(account.id)
       if (result.success) {
         // 前端 store 同步：status → active, lastError → undefined
-        updateAccountStatus(account.id, 'active', undefined)
+        updateAccountStatus(account.id, 'active', undefined, { forceClearBanned: true })
         setShowBanDialog(false)
       } else {
         console.error('[AccountCard] Clear suspended failed:', result.error)
@@ -364,8 +364,16 @@ export const AccountCard = memo(function AccountCard({
     lowerError.includes('accountsuspendedexception') ||
     lowerError.includes('account suspended') ||
     lowerError.includes('temporarily_suspended') ||
+    lowerError.includes('permanently_suspended') ||
     lowerError.includes('temporarily suspended') ||
+    lowerError.includes('permanently suspended') ||
     (lowerError.includes('user id is') && lowerError.includes('suspended')) ||
+    lowerError.includes('user id is temporarily suspended') ||
+    lowerError.includes('account is locked') ||
+    lowerError.includes('locked it as a security precaution') ||
+    lowerError.includes('security precaution') ||
+    lowerError.includes('unusual user activity') ||
+    lowerError.includes('restricted your ability to use kiro') ||
     lowerError.includes('账户已封禁') ||
     lowerError.includes('已封禁') ||
     /\b423\b/.test(lowerError)

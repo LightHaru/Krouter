@@ -37,9 +37,12 @@ interface AccountDataShape {
     credentials?: {
       accessToken?: string
       refreshToken?: string
+      kiroApiKey?: string
       clientId?: string
       clientSecret?: string
       region?: string
+      authRegion?: string
+      apiRegion?: string
       authMethod?: string
       provider?: string
       expiresAt?: number
@@ -137,8 +140,17 @@ function resolveProxyProfileArn(account: StoredAccount): string | undefined {
   return resolveProfileArn({
     profileArn: account.profileArn || credentials.profileArn,
     authMethod: credentials.authMethod as ProxyAccount['authMethod'],
-    provider: credentials.provider || account.idp
+    provider: credentials.provider || account.idp,
+    kiroApiKey: credentials.kiroApiKey || (credentials.accessToken?.trim().startsWith('ksk_') ? credentials.accessToken : undefined),
+    accessToken: credentials.accessToken
   })
+}
+
+function isApiKeyStoredAccount(account: StoredAccount): boolean {
+  const credentials = account.credentials || {}
+  const authMethod = String(credentials.authMethod || '').trim().toLowerCase()
+  const provider = String(credentials.provider || account.idp || '').trim().toLowerCase().replace(/[\s_-]/g, '')
+  return Boolean(credentials.kiroApiKey) || Boolean(credentials.accessToken?.trim().startsWith('ksk_')) || authMethod === 'api_key' || authMethod === 'apikey' || provider === 'kiroapikey' || provider === 'apikey'
 }
 
 function newApiKey(input: { name?: string; key?: string; format?: 'sk' | 'simple' | 'token'; creditsLimit?: number }): ApiKey {
@@ -314,22 +326,23 @@ export class ProxyRuntime {
     for (const account of accounts) {
       if (account.status !== 'active' || !account.credentials?.accessToken) continue
       const profileArn = resolveProxyProfileArn(account)
-      if (!profileArn) {
+      if (!profileArn && !isApiKeyStoredAccount(account)) {
         skippedNoProfileArn++
         continue
       }
       const proxyId = bindings[account.id]
       const boundProxy = proxyId ? proxyPool[proxyId] : undefined
       proxyAccounts.push(normalizeProxyAccount({
-        id: account.id,
-        email: account.email,
-        accessToken: account.credentials.accessToken,
-        refreshToken: account.credentials.refreshToken,
+          id: account.id,
+          email: account.email,
+          accessToken: account.credentials.accessToken,
+          kiroApiKey: account.credentials.kiroApiKey || (account.credentials.accessToken.trim().startsWith('ksk_') ? account.credentials.accessToken : undefined),
+          refreshToken: account.credentials.refreshToken,
         profileArn,
         expiresAt: account.credentials.expiresAt,
         clientId: account.credentials.clientId,
         clientSecret: account.credentials.clientSecret,
-        region: account.credentials.region || 'us-east-1',
+        region: account.credentials.apiRegion || account.credentials.region || 'us-east-1',
         authMethod: account.credentials.authMethod as ProxyAccount['authMethod'],
         provider: account.credentials.provider || account.idp,
         machineId: account.machineId,

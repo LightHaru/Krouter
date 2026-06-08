@@ -247,7 +247,7 @@ function AccountListRowComponent({
     try {
       const result = await window.api.proxyClearAccountSuspended(account.id)
       if (result.success) {
-        updateAccountStatus(account.id, 'active', undefined)
+        updateAccountStatus(account.id, 'active', undefined, { forceClearBanned: true })
       }
     } finally {
       setIsClearingSuspended(false)

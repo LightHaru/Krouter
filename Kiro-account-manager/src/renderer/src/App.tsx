@@ -2,11 +2,12 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { AccountManager } from './components/accounts'
 import { Sidebar, TitleBar, type PageType } from './components/layout'
-import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, ProxyPage, KProxyPage, ProxyPoolPage, WebhooksPage, DiagnosePage, ConfigSyncPage, RegisterPage, SubscriptionPage, LogsPage } from './components/pages'
+import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, ProxyPage, KProxyPage, ProxyPoolPage, WebhooksPage, DiagnosePage, ConfigSyncPage, RegisterPage, SubscriptionPage, LogsPage, DocsPage } from './components/pages'
 import { useWebhookStore } from './store/webhooks'
 import { UpdateDialog } from './components/UpdateDialog'
 import { CloseConfirmDialog } from './components/CloseConfirmDialog'
 import { useAccountsStore } from './store/accounts'
+import { pageFromPath } from './lib/docsRoute'
 
 // 托盘信息防抖延迟：后台刷新风暴时合并多次跨进程 IPC 为单次
 const TRAY_UPDATE_DEBOUNCE_MS = 400
@@ -144,6 +145,34 @@ function App(): React.JSX.Element {
     })
     return () => { unsubscribe?.() }
   }, [])
+
+  // Đồng bộ URL cho deep-link /docs (không dùng router; chỉ History API).
+  // Mount: nếu vào thẳng /docs thì mở trang docs. popstate: đồng bộ back/forward.
+  useEffect(() => {
+    if (pageFromPath(window.location.pathname) === 'docs') {
+      setCurrentPage('docs')
+    }
+    const onPop = (): void => {
+      const isDocs = pageFromPath(window.location.pathname) === 'docs'
+      setCurrentPage((prev) => (isDocs ? 'docs' : prev === 'docs' ? 'home' : prev))
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+
+  // Khi currentPage đổi: đồng bộ URL /docs <-> /. Giới hạn ở /docs để tránh hồi quy.
+  useEffect(() => {
+    try {
+      const isDocsPath = pageFromPath(window.location.pathname) === 'docs'
+      if (currentPage === 'docs' && !isDocsPath) {
+        window.history.pushState(null, '', '/docs')
+      } else if (currentPage !== 'docs' && isDocsPath) {
+        window.history.pushState(null, '', '/')
+      }
+    } catch {
+      // pushState best-effort; điều hướng state vẫn hoạt động nếu URL không đổi.
+    }
+  }, [currentPage])
 
   // 应用内页面跳转（轻量 CustomEvent，供深层组件无需 prop 钻取即可切页）
   useEffect(() => {
@@ -296,6 +325,8 @@ function App(): React.JSX.Element {
         return <ConfigSyncPage />
       case 'logs':
         return <LogsPage />
+      case 'docs':
+        return <DocsPage />
       case 'settings':
         return <SettingsPage />
       case 'about':
@@ -306,16 +337,16 @@ function App(): React.JSX.Element {
   }
 
   return (
-    <div className="h-screen ambient-bg overflow-hidden flex flex-col">
+    <div className="app-shell ambient-bg">
       <TitleBar />
-      <div className="flex-1 min-h-0 flex gap-2 p-2 max-md:flex-col">
+      <div className="app-workspace">
         <Sidebar
           currentPage={currentPage}
           onPageChange={setCurrentPage}
           collapsed={sidebarCollapsed}
           onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
         />
-        <main className="flex-1 min-w-0 overflow-hidden rounded-3xl page-surface max-md:rounded-2xl">
+        <main className="app-main page-surface">
           <AnimatePresence mode="wait">
             <motion.div
               key={currentPage}
