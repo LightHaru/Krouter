@@ -9,7 +9,7 @@ import { normalizeKiroModelIdForCompare } from '../../src/main/proxy/modelCatalo
 // >=1 eligible (model-supporting, not suspended, not quota-exhausted) account is
 // on cooldown, computes the minimum remaining cooldown via
 // getCompatibleModelCooldownWaitMs:
-//   - if that wait <= MAX_COMPATIBLE_COOLDOWN_WAIT_MS (65000ms) → waitForRetry()
+//   - if that wait <= MAX_COMPATIBLE_COOLDOWN_WAIT_MS (10000ms) → waitForRetry()
 //     then recurse and return the account once its cooldown elapses;
 //   - otherwise → return null (caller surfaces this as 'throttled', R6).
 //
@@ -22,7 +22,7 @@ import { normalizeKiroModelIdForCompare } from '../../src/main/proxy/modelCatalo
 // ---------------------------------------------------------------------------
 
 const OPUS_MODEL = 'claude-opus-4.8'
-const MAX_COMPATIBLE_COOLDOWN_WAIT_MS = 65000
+const MAX_COMPATIBLE_COOLDOWN_WAIT_MS = 10000
 
 function createServer(config?: any): any {
   return new ProxyServer({ enableMultiAccount: true, accountSelectionStrategy: 'smart', ...config }) as any
@@ -56,10 +56,10 @@ describe('ProxyServer — 429 cooldown-wait in getNextAccountForModel (Task 6.2)
   })
 
   // Requirements 4.3, 4.4: short cooldown (<= MAX_COMPATIBLE_COOLDOWN_WAIT_MS) → wait then retry.
-  it('waits for a short cooldown (<= 65s) then returns the account once it elapses', async () => {
+  it('waits for a short cooldown (<= 10s) then returns the account once it elapses', async () => {
     const ps = createServer()
     const now = Date.now()
-    // Both eligible power accounts on cooldown ending in 5s (< 65s).
+    // Both eligible power accounts on cooldown ending in 5s (< 10s).
     addPowerAccount(ps, 'pow-1', now + 5000)
     addPowerAccount(ps, 'pow-2', now + 5000)
 
@@ -75,19 +75,19 @@ describe('ProxyServer — 429 cooldown-wait in getNextAccountForModel (Task 6.2)
   })
 
   // Requirement 4.5: cooldown beyond MAX_COMPATIBLE_COOLDOWN_WAIT_MS → no wait, return null.
-  it('does not wait and returns null when the minimum cooldown exceeds 65s', async () => {
+  it('does not wait and returns null when the minimum cooldown exceeds 10s', async () => {
     const ps = createServer()
     const now = Date.now()
-    // Both eligible power accounts on cooldown ending in 120s (> 65s).
-    addPowerAccount(ps, 'pow-1', now + 120000)
-    addPowerAccount(ps, 'pow-2', now + 120000)
+    // Both eligible power accounts on cooldown ending in 12s (> 10s).
+    addPowerAccount(ps, 'pow-1', now + 12000)
+    addPowerAccount(ps, 'pow-2', now + 12000)
 
     // Should resolve to null without needing a long timer advance.
     const result = await ps.getNextAccountForModel(new Set(), undefined, OPUS_MODEL)
     expect(result).toBeNull()
   })
 
-  // Boundary sanity: exactly at the threshold (65s) is still within the wait window.
+  // Boundary sanity: exactly at the threshold (10s) is still within the wait window.
   it('waits when the cooldown equals exactly MAX_COMPATIBLE_COOLDOWN_WAIT_MS', async () => {
     const ps = createServer()
     const now = Date.now()

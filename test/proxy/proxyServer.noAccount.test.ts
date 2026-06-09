@@ -7,7 +7,7 @@ const FC_RUNS = 200
 
 const OPUS_MODEL = 'claude-opus-4.8'
 const QUOTA_RESET_MS = 60 * 60 * 1000 // 3_600_000
-const COOLDOWN_FAR_MS = 10 * 60 * 1000 // 600_000 > MAX_COMPATIBLE_COOLDOWN_WAIT_MS (65_000)
+const COOLDOWN_FAR_MS = 10 * 60 * 1000 // 600_000 > MAX_COMPATIBLE_COOLDOWN_WAIT_MS (10_000)
 
 // Build a minimal ProxyServer. The constructor only sets up in-memory state
 // (config defaults, AccountPool, stats); it starts no server and makes no network

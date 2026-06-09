@@ -193,8 +193,8 @@ interface KiroApi {
     clientSecret: string
     region?: string
     startUrl?: string
-    authMethod?: 'IdC' | 'social'
-    provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO'
+    authMethod?: 'IdC' | 'social' | 'api_key'
+    provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO' | 'KiroApiKey'
     profileArn?: string
     /** 反代 store 里的 account.id，用于 main 进程记忆 lastSwitchedAccountId 供 watcher 反向同步 */
     accountId?: string
@@ -256,9 +256,11 @@ interface KiroApi {
 
   // 验证凭证并获取账号信息
   verifyAccountCredentials: (credentials: {
-    refreshToken: string
-    clientId: string
-    clientSecret: string
+    refreshToken?: string
+    accessToken?: string
+    kiroApiKey?: string
+    clientId?: string
+    clientSecret?: string
     region?: string
     authMethod?: string  // 'IdC' 或 'social'
     provider?: string    // 'BuilderId', 'Github', 'Google'
@@ -669,13 +671,13 @@ interface KiroApi {
   onProxyWebhookTrigger: (callback: (event: string, payload: Record<string, unknown>) => void) => (() => void)
 
   // 添加账号到反代池
-  proxyAddAccount: (account: { id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }) => Promise<{ success: boolean; accountCount?: number; error?: string }>
+  proxyAddAccount: (account: { id: string; email?: string; accessToken: string; kiroApiKey?: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }) => Promise<{ success: boolean; accountCount?: number; error?: string }>
 
   // 从反代池移除账号
   proxyRemoveAccount: (accountId: string) => Promise<{ success: boolean; accountCount?: number; error?: string }>
 
   // 同步账号到反代池（批量更新）
-  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }>) => Promise<{ success: boolean; accountCount?: number; error?: string }>
+  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; kiroApiKey?: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }>) => Promise<{ success: boolean; accountCount?: number; error?: string }>
 
   // 获取反代池账号列表
   proxyGetAccounts: () => Promise<{ accounts: unknown[]; availableCount: number }>
@@ -998,9 +1000,9 @@ interface KiroApi {
   // 账号测活：指定账号 + 模型走反代逻辑发测试消息
   diagnoseAccountLiveness: (params: {
     account: {
-      id?: string; email?: string; accessToken?: string; refreshToken?: string
+      id?: string; email?: string; accessToken?: string; kiroApiKey?: string; refreshToken?: string
       clientId?: string; clientSecret?: string; region?: string
-      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'; provider?: string
+      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp' | 'api_key' | 'apikey'; provider?: string
       profileArn?: string; machineId?: string; expiresAt?: number; proxyUrl?: string
     }
     model?: string

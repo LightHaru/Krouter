@@ -420,21 +420,36 @@ function statusLabel(value) {
   return value ? `${COLORS.green}ON${COLORS.reset}` : `${COLORS.red}OFF${COLORS.reset}`
 }
 
+const BOX_WIDTH = 66
+
+// Visible length ignoring ANSI color codes, so bordered boxes stay aligned
+// whether or not colors are enabled.
+function visibleLength(text) {
+  // eslint-disable-next-line no-control-regex
+  return String(text).replace(/\x1b\[[0-9;]*m/g, '').length
+}
+
 function line(label, value) {
   const padded = `${label}:`.padEnd(16, ' ')
   return `  ${COLORS.dim}${padded}${COLORS.reset}${value || '-'}`
 }
 
-function horizontal(width = 66) {
-  return '+'.padEnd(width - 1, '-') + '+'
+function horizontal(width = BOX_WIDTH) {
+  return `${COLORS.dim}+${'-'.repeat(Math.max(0, width - 2))}+${COLORS.reset}`
+}
+
+// A single bordered row whose content keeps its alignment even with color codes.
+function boxedRow(content, width = BOX_WIDTH) {
+  const inner = width - 4
+  const pad = Math.max(0, inner - visibleLength(content))
+  return `${COLORS.dim}|${COLORS.reset} ${content}${' '.repeat(pad)} ${COLORS.dim}|${COLORS.reset}`
 }
 
 function boxedTitle(title, subtitle) {
-  const width = 66
-  console.log(horizontal(width))
-  console.log(`| ${COLORS.bold}${title}${COLORS.reset}`.padEnd(width - 1, ' ') + '|')
-  console.log(`| ${COLORS.dim}${subtitle}${COLORS.reset}`.padEnd(width - 1, ' ') + '|')
-  console.log(horizontal(width))
+  console.log(horizontal())
+  console.log(boxedRow(`${COLORS.bold}${COLORS.cyan}${title}${COLORS.reset}`))
+  if (subtitle) console.log(boxedRow(`${COLORS.dim}${subtitle}${COLORS.reset}`))
+  console.log(horizontal())
 }
 
 async function getTunnelStatus() {

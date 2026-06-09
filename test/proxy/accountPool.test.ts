@@ -13,8 +13,8 @@ const FC_RUNS = 200
 
 // DEFAULT_CONFIG values mirrored from accountPool.ts (the module does not export
 // them). These tests rely on the AccountPool default configuration.
-const THROTTLE_COOLDOWN_MS = 60000
-const MAX_THROTTLE_COOLDOWN_MS = 900000
+const THROTTLE_COOLDOWN_MS = 5000
+const MAX_THROTTLE_COOLDOWN_MS = 10000
 const MAX_BACKOFF_MULTIPLIER = 1440
 const QUOTA_RESET_MS = 3600000
 

@@ -128,12 +128,12 @@ describe('ProxyServer capability — tier inference & model id normalization', (
 //
 // Cooldown approach for Property 4 (approach (ii) from the task): every account in a
 // "cooldown" state is given cooldownUntil = now + COOLDOWN_FAR_MS, well beyond
-// MAX_COMPATIBLE_COOLDOWN_WAIT_MS (65s). getCompatibleModelCooldownWaitMs therefore
+// MAX_COMPATIBLE_COOLDOWN_WAIT_MS (10s). getCompatibleModelCooldownWaitMs therefore
 // always reports a wait > the threshold, so getNextAccountForModel returns null
 // instead of sleeping/recursing. No real timer waits occur inside the property loop.
 // ---------------------------------------------------------------------------
 
-const COOLDOWN_FAR_MS = 10 * 60 * 1000 // 600000ms > MAX_COMPATIBLE_COOLDOWN_WAIT_MS (65000ms)
+const COOLDOWN_FAR_MS = 10 * 60 * 1000 // 600000ms > MAX_COMPATIBLE_COOLDOWN_WAIT_MS (10000ms)
 const OPUS_MODEL = 'claude-opus-4.8'
 
 type AvailabilityState = 'available' | 'cooldown' | 'quota' | 'suspended'

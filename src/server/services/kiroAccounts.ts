@@ -19,6 +19,7 @@ export interface AccountLike {
     refreshToken?: string
     clientId?: string
     clientSecret?: string
+    kiroApiKey?: string
     region?: string
     authMethod?: string
     provider?: string
@@ -27,7 +28,9 @@ export interface AccountLike {
 }
 
 export interface CredentialInput {
-  refreshToken: string
+  refreshToken?: string
+  accessToken?: string
+  kiroApiKey?: string
   clientId?: string
   clientSecret?: string
   region?: string
@@ -46,6 +49,69 @@ interface RefreshResult {
   error?: string
 }
 
+export interface KiroAccountErrorInfo {
+  message: string
+  isBanned?: boolean
+  isQuotaExhausted?: boolean
+  isAuthError?: boolean
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error || 'Unknown error')
+}
+
+export function classifyKiroAccountError(error: unknown): KiroAccountErrorInfo {
+  const message = errorMessage(error)
+  const lower = message.toLowerCase()
+  const isBanned =
+    lower.includes('accountsuspendedexception') ||
+    lower.includes('account suspended') ||
+    lower.includes('temporarily_suspended') ||
+    lower.includes('permanently_suspended') ||
+    lower.includes('temporarily suspended') ||
+    lower.includes('permanently suspended') ||
+    (lower.includes('user id is') && lower.includes('suspended')) ||
+    lower.includes('user id is temporarily suspended') ||
+    lower.includes('account is locked') ||
+    lower.includes('locked it as a security precaution') ||
+    lower.includes('security precaution') ||
+    lower.includes('unusual user activity') ||
+    lower.includes('restricted your ability to use kiro') ||
+    /\b423\b/.test(lower)
+  const isQuotaExhausted =
+    /\b402\b/.test(lower) ||
+    lower.includes('quota exhausted') ||
+    lower.includes('quota exceeded') ||
+    lower.includes('quota reached') ||
+    lower.includes('quota exhausted on amazonq') ||
+    lower.includes('servicequotaexceededexception') ||
+    lower.includes('service quota exceeded') ||
+    lower.includes('usage limit reached') ||
+    lower.includes('usage limit exceeded') ||
+    lower.includes('monthly limit reached') ||
+    lower.includes('monthly limit exceeded') ||
+    lower.includes('out of credits') ||
+    lower.includes('run out of credits') ||
+    lower.includes('no remaining credits') ||
+    lower.includes('credit balance') ||
+    lower.includes('insufficient credits')
+  const isAuthError =
+    !isBanned &&
+    !isQuotaExhausted &&
+    (/\b401\b/.test(lower) ||
+      lower.includes('bad credentials') ||
+      lower.includes('unauthorized') ||
+      lower.includes('invalid bearer') ||
+      lower.includes('invalid token') ||
+      lower.includes('token expired'))
+  return {
+    message,
+    isBanned,
+    isQuotaExhausted,
+    isAuthError
+  }
+}
+
 export function normalizeProfileArn(profileArn?: string): string | undefined {
   let value = profileArn?.trim()
   if (!value || value === BUILDER_ID_STREAMING_PROFILE_ARN) return undefined
@@ -53,10 +119,42 @@ export function normalizeProfileArn(profileArn?: string): string | undefined {
   return value
 }
 
+function isApiKeyCredential(input: { authMethod?: string; provider?: string; kiroApiKey?: string; accessToken?: string }): boolean {
+  if (input.kiroApiKey?.trim()) return true
+  if (input.accessToken?.trim().startsWith('ksk_')) return true
+  const authKey = (input.authMethod || '').trim().toLowerCase()
+  const providerKey = (input.provider || '').trim().toLowerCase().replace(/[\s_-]/g, '')
+  return authKey === 'api_key' || authKey === 'apikey' || providerKey === 'kiroapikey' || providerKey === 'apikey'
+}
+
+function getApiKeyCredential(input: { kiroApiKey?: string; accessToken?: string }): string | undefined {
+  const key = input.kiroApiKey?.trim() || input.accessToken?.trim()
+  return key || undefined
+}
+
+function buildKiroRestHeaders(input: {
+  accessToken: string
+  machineId?: string
+  authMethod?: string
+  provider?: string
+  kiroApiKey?: string
+}): Record<string, string> {
+  const token = isApiKeyCredential(input) ? (getApiKeyCredential(input) || input.accessToken) : input.accessToken
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    Authorization: `Bearer ${token}`,
+    'User-Agent': getKiroUserAgent(input.machineId),
+    'x-amz-user-agent': getKiroAmzUserAgent(input.machineId)
+  }
+  if (isApiKeyCredential(input)) headers.tokentype = 'API_KEY'
+  return headers
+}
+
 function fixedProfileArnForProvider(provider?: string, authMethod?: string, profileArn?: string): string | undefined {
   const providerKey = (provider || '').trim().toLowerCase()
   const authKey = (authMethod || '').trim().toLowerCase()
   const explicit = normalizeProfileArn(profileArn)
+  if (authKey === 'api_key' || authKey === 'apikey') return explicit
   if (authKey === 'social' && explicit) return explicit
   if (providerKey === 'github' || providerKey === 'google') return SOCIAL_SIGN_IN_PROFILE_ARN
   if (providerKey === 'builderid' || providerKey === 'builder_id') return BUILDER_ID_STREAMING_PROFILE_ARN
@@ -209,6 +307,16 @@ async function refreshSocialToken(refreshToken: string, machineId?: string): Pro
 
 export async function refreshTokenByMethod(input: CredentialInput & { machineId?: string }): Promise<RefreshResult> {
   const region = input.region || 'us-east-1'
+  if (isApiKeyCredential(input)) {
+    const apiKey = getApiKeyCredential(input)
+    if (!apiKey) return { success: false, error: 'Missing Kiro API key' }
+    return {
+      success: true,
+      accessToken: apiKey,
+      refreshToken: undefined,
+      expiresIn: 0
+    }
+  }
   if (!input.refreshToken) return { success: false, error: 'Missing refresh token' }
   if (input.authMethod === 'social') return refreshSocialToken(input.refreshToken, input.machineId)
   if (!input.clientId || !input.clientSecret) return { success: false, error: 'Missing OIDC clientId/clientSecret' }
@@ -222,9 +330,12 @@ export async function refreshTokenByMethod(input: CredentialInput & { machineId?
 
 async function getUsageLimitsRest(input: {
   accessToken: string
+  kiroApiKey?: string
   profileArn?: string
   machineId?: string
   region?: string
+  authMethod?: string
+  provider?: string
 }): Promise<UsageLimitsResponse> {
   const params = new URLSearchParams({
     origin: 'AI_EDITOR',
@@ -234,12 +345,7 @@ async function getUsageLimitsRest(input: {
   const profileArn = normalizeProfileArn(input.profileArn)
   if (profileArn) params.set('profileArn', profileArn)
   const path = `/getUsageLimits?${params.toString()}`
-  const headers: Record<string, string> = {
-    Accept: 'application/json',
-    Authorization: `Bearer ${input.accessToken}`,
-    'User-Agent': getKiroUserAgent(input.machineId),
-    'x-amz-user-agent': getKiroAmzUserAgent(input.machineId)
-  }
+  const headers = buildKiroRestHeaders(input)
 
   let response = await fetch(`${getRestApiBase(input.region)}${path}`, { method: 'GET', headers })
   if (response.status === 403) {
@@ -259,7 +365,10 @@ function uniqueEndpoints(region?: string): string[] {
 async function postListAvailableProfiles(input: {
   endpoint: string
   accessToken: string
+  kiroApiKey?: string
   machineId?: string
+  authMethod?: string
+  provider?: string
   nextToken?: string
   timeoutMs?: number
 }): Promise<ListAvailableProfilesResponse> {
@@ -270,13 +379,10 @@ async function postListAvailableProfiles(input: {
       method: 'POST',
       signal: controller.signal,
       headers: {
-        Accept: 'application/json',
+        ...buildKiroRestHeaders(input),
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${input.accessToken}`,
-        'User-Agent': getKiroUserAgent(input.machineId),
-        'x-amz-user-agent': getKiroAmzUserAgent(input.machineId)
       },
-      body: JSON.stringify(input.nextToken ? { nextToken: input.nextToken } : {})
+      body: JSON.stringify(input.nextToken ? { maxResults: 10, nextToken: input.nextToken } : { maxResults: 10 })
     })
     const text = await response.text()
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${text}`)
@@ -288,8 +394,11 @@ async function postListAvailableProfiles(input: {
 
 export async function listAvailableProfilesRest(input: {
   accessToken: string
+  kiroApiKey?: string
   machineId?: string
   region?: string
+  authMethod?: string
+  provider?: string
   timeoutMs?: number
 }): Promise<KiroAvailableProfile[]> {
   let lastError: Error | undefined
@@ -303,7 +412,10 @@ export async function listAvailableProfilesRest(input: {
         const data = await postListAvailableProfiles({
           endpoint,
           accessToken: input.accessToken,
+          kiroApiKey: input.kiroApiKey,
           machineId: input.machineId,
+          authMethod: input.authMethod,
+          provider: input.provider,
           nextToken,
           timeoutMs: input.timeoutMs
         })
@@ -348,6 +460,7 @@ function chooseStreamingProfileArn(profiles: KiroAvailableProfile[]): string | u
 
 export async function resolveStreamingProfileArn(input: {
   accessToken?: string
+  kiroApiKey?: string
   profileArn?: string
   machineId?: string
   region?: string
@@ -366,8 +479,11 @@ export async function resolveStreamingProfileArn(input: {
 
   const profiles = await listAvailableProfilesRest({
     accessToken: input.accessToken,
+    kiroApiKey: input.kiroApiKey,
     machineId: input.machineId,
-    region: input.region || 'us-east-1'
+    region: input.region || 'us-east-1',
+    authMethod: input.authMethod,
+    provider: input.provider
   })
   return chooseStreamingProfileArn(profiles)
 }
@@ -444,11 +560,13 @@ function normalizeUsage(usage: UsageLimitsResponse): {
 export async function refreshAccountToken(account: AccountLike): Promise<{
   success: boolean
   data?: { accessToken: string; refreshToken?: string; expiresIn: number }
-  error?: { message: string }
+  error?: KiroAccountErrorInfo
 }> {
   const credentials = account.credentials || {}
   const result = await refreshTokenByMethod({
     refreshToken: credentials.refreshToken || '',
+    accessToken: credentials.accessToken,
+    kiroApiKey: credentials.kiroApiKey,
     clientId: credentials.clientId,
     clientSecret: credentials.clientSecret,
     region: credentials.region,
@@ -456,14 +574,14 @@ export async function refreshAccountToken(account: AccountLike): Promise<{
     machineId: account.machineId
   })
   if (!result.success || !result.accessToken) {
-    return { success: false, error: { message: result.error || 'Token refresh failed' } }
+    return { success: false, error: classifyKiroAccountError(result.error || 'Token refresh failed') }
   }
   return {
     success: true,
     data: {
       accessToken: result.accessToken,
       refreshToken: result.refreshToken || credentials.refreshToken,
-      expiresIn: result.expiresIn || 3600
+      expiresIn: result.expiresIn ?? 3600
     }
   }
 }
@@ -474,14 +592,23 @@ export async function verifyAccountCredentials(credentials: CredentialInput): Pr
     return { success: false, error: `Token refresh failed: ${refresh.error || 'unknown error'}` }
   }
   const profileArn = normalizeProfileArn(credentials.profileArn)
-  const usage = await getUsageLimitsRest({
-    accessToken: refresh.accessToken,
-    profileArn,
-    machineId: credentials.machineId,
-    region: credentials.region || 'us-east-1'
-  })
+  let usage: UsageLimitsResponse
+  try {
+    usage = await getUsageLimitsRest({
+      accessToken: refresh.accessToken,
+      kiroApiKey: credentials.kiroApiKey,
+      profileArn,
+      machineId: credentials.machineId,
+      region: credentials.region || 'us-east-1',
+      authMethod: credentials.authMethod,
+      provider: credentials.provider
+    })
+  } catch (error) {
+    return { success: false, error: classifyKiroAccountError(error).message }
+  }
   const resolvedProfileArn = profileArn || await resolveStreamingProfileArn({
     accessToken: refresh.accessToken,
+    kiroApiKey: credentials.kiroApiKey,
     machineId: credentials.machineId,
     region: credentials.region || 'us-east-1',
     authMethod: credentials.authMethod,
@@ -492,8 +619,8 @@ export async function verifyAccountCredentials(credentials: CredentialInput): Pr
     data: {
       ...normalizeUsage(usage),
       accessToken: refresh.accessToken,
-      refreshToken: refresh.refreshToken || credentials.refreshToken,
-      expiresIn: refresh.expiresIn || 3600,
+      refreshToken: refresh.refreshToken || credentials.refreshToken || '',
+      expiresIn: refresh.expiresIn ?? 3600,
       profileArn: resolvedProfileArn
     }
   }
@@ -521,19 +648,33 @@ export async function checkAccountStatus(account: AccountLike): Promise<unknown>
   const expiresAt = credentials.expiresAt || 0
   if ((!accessToken || expiresAt < Date.now() + 300000) && credentials.refreshToken) {
     refreshResult = await refreshAccountToken(account)
-    if (!refreshResult.success || !refreshResult.data?.accessToken) return refreshResult
+    if (!refreshResult.success || !refreshResult.data?.accessToken) {
+      return {
+        success: false,
+        error: classifyKiroAccountError(refreshResult.error?.message || 'Token refresh failed')
+      }
+    }
     accessToken = refreshResult.data.accessToken
   }
-  if (!accessToken) return { success: false, error: { message: 'Missing access token' } }
-  const usage = await getUsageLimitsRest({
-    accessToken,
-    profileArn: account.profileArn,
-    machineId: account.machineId,
-    region: credentials.region || 'us-east-1'
-  })
+  if (!accessToken) return { success: false, error: classifyKiroAccountError('Missing access token') }
+  let usage: UsageLimitsResponse
+  try {
+    usage = await getUsageLimitsRest({
+      accessToken,
+      kiroApiKey: credentials.kiroApiKey,
+      profileArn: account.profileArn,
+      machineId: account.machineId,
+      region: credentials.region || 'us-east-1',
+      authMethod: credentials.authMethod,
+      provider: credentials.provider || account.idp
+    })
+  } catch (error) {
+    return { success: false, error: classifyKiroAccountError(error) }
+  }
   const normalized = normalizeUsage(usage)
   const resolvedProfileArn = await resolveStreamingProfileArn({
     accessToken,
+    kiroApiKey: credentials.kiroApiKey,
     profileArn: account.profileArn,
     machineId: account.machineId,
     region: credentials.region || 'us-east-1',

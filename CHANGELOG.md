@@ -2,6 +2,43 @@
 
 All notable Krouter changes are tracked here.
 
+## 1.8.8 - 2026-06-09
+
+### Added
+
+- Added Claude 4+ thinking/reasoning metadata for Krouter model lists, including Opus 4.5/4.7/4.8, Sonnet 4/4.5, and Haiku 4.5.
+- Added OpenAI-compatible `reasoning_effort` and Claude-compatible `output_config.effort` forwarding into Kiro model request fields.
+- Added regression tests for thinking effort, thinking budget, Responses API reasoning effort, and Claude 3.x exclusion.
+
+### Changed
+
+- Tuned AmazonQ/Kiro 429 retry pacing to a shorter bounded 5-10 second cooldown so the proxy can continue rotating accounts without hanging for long throttle windows.
+- Improved Kiro Settings and global responsive safeguards so narrow screens no longer crush headers, dialogs, and endpoint rows.
+- Improved Kiro settings JSONC parsing so comments and trailing commas are handled before saving.
+
+### Fixed
+
+- Fixed TES/BLOCKED SendOTP errors being shown as raw 400 bodies instead of classified AWS risk-control failures.
+- Fixed E2E coverage to skip non-refreshable API-key accounts for refresh-only flows and to cover TES/BLOCKED registration stopping behavior.
+
+## 1.8.7 - 2026-06-08
+
+### Added
+
+- Added API-key account import/login support for `ksk_...` keys so headless Kiro API accounts can be added from the dashboard and used by the API proxy.
+- Added responsive shell coverage for Android, iOS, tablet, and desktop layouts with the sidebar kept as a left rail on narrow screens.
+
+### Changed
+
+- Reworked the web app shell to use `100dvh`, safe-area insets, a persistent left sidebar rail, and responsive wrapping for account, proxy, register, logs, and machine-id controls.
+- Updated dashboard login, setup, update, about, sidebar, and K-Proxy copy to use Vietnamese with proper diacritics.
+- Improved API proxy account handling so stored `ksk_...` API-key accounts are treated as API-key credentials even when older saved records do not have explicit `authMethod` metadata.
+
+### Fixed
+
+- Fixed API-key account liveness checks being skipped with a missing `profileArn` message.
+- Fixed narrow-screen toolbar and filter rows causing horizontal overflow inside the dashboard.
+
 ## 1.8.6 - 2026-06-07
 
 ### Added

@@ -607,10 +607,16 @@ function isBannedAccountError(error?: string): boolean {
     lowerError.includes('accountsuspendedexception') ||
     lowerError.includes('account suspended') ||
     lowerError.includes('temporarily_suspended') ||
+    lowerError.includes('permanently_suspended') ||
     lowerError.includes('temporarily suspended') ||
+    lowerError.includes('permanently suspended') ||
     (lowerError.includes('user id is') && lowerError.includes('suspended')) ||
+    lowerError.includes('user id is temporarily suspended') ||
     lowerError.includes('account is locked') ||
+    lowerError.includes('locked it as a security precaution') ||
     lowerError.includes('security precaution') ||
+    lowerError.includes('unusual user activity') ||
+    lowerError.includes('restricted your ability to use kiro') ||
     lowerError.includes('账户已封禁') ||
     lowerError.includes('已封禁') ||
     /\b423\b/.test(lowerError)
@@ -738,8 +744,11 @@ function applyRefreshDataToStoredAccount(
   }
 
   const userInfo = isPlainRecord(data?.userInfo) ? data.userInfo : {}
-  const status = data?.status === 'error' ? 'error' : 'active'
   const errorMessage = typeof data?.errorMessage === 'string' && data.errorMessage ? data.errorMessage : undefined
+  const currentBanned = isBannedAccountError(account.lastError)
+  const incomingBanned = isBannedAccountError(errorMessage)
+  const status = currentBanned || incomingBanned || data?.status === 'error' ? 'error' : 'active'
+  const lastError = incomingBanned ? errorMessage : currentBanned ? account.lastError : errorMessage
 
   return {
     ...account,
@@ -751,17 +760,19 @@ function applyRefreshDataToStoredAccount(
     usage,
     subscription,
     status,
-    lastError: errorMessage,
+    lastError,
     lastCheckedAt: now
   }
 }
 
 function applyBackendRefreshFailure(id: string, account: StoredAccount, error: string, now: number): StoredAccount {
+  const currentBanned = isBannedAccountError(account.lastError)
+  const incomingBanned = isBannedAccountError(error)
   return {
     ...account,
     id: account.id || id,
     status: 'error',
-    lastError: error,
+    lastError: currentBanned && !incomingBanned ? account.lastError : error,
     lastCheckedAt: now
   }
 }

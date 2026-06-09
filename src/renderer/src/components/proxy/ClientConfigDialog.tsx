@@ -534,7 +534,7 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
               )}
             </div>
 
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
               {clientOptions.map(option => {
                 const Icon = option.icon
                 const checked = selectedClients.includes(option.id)

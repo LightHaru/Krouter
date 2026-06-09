@@ -590,7 +590,17 @@ input, textarea, select, [contenteditable="true"] {
   user-select: text;
 }
 
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
 body {
+  margin: 0;
   /* 浅色：100% 实色渐变，跟随主题色染色 */
   background: linear-gradient(
     180deg,
@@ -600,6 +610,7 @@ body {
   );
   color: var(--color-foreground);
   font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  overscroll-behavior: none;
 }
 .dark body {
   /* 深色：实色深空蓝渐变 + 主题色染色 */
@@ -802,6 +813,17 @@ body {
     0 8px 24px -8px rgba(0, 0, 0, 0.4);
 }
 
+/* Responsive safety for modals: many dialogs use fixed pixel widths
+ * (w-[600px]..w-[1200px]). On phones these overflow the viewport, so cap every
+ * strong-glass dialog to the screen on small/medium widths. Desktop keeps its
+ * fixed width because 95vw there is larger than the fixed width. */
+@media (max-width: 1024px) {
+  .glass-card-strong {
+    max-width: 95vw !important;
+    max-height: 90vh !important;
+  }
+}
+
 /* Dialog 遮罩 — 半透明黑罩，无模糊（与 bg-black/50 一致） */
 .dialog-overlay {
   position: fixed;
@@ -825,9 +847,65 @@ body {
   -webkit-backdrop-filter: blur(24px) saturate(180%);
   border: 1px solid var(--glass-border);
   box-shadow: var(--glass-shadow);
+  max-height: 100%;
 }
 
 /* 顶部透明工具栏 */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  min-width: 0;
+  overflow: hidden;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.app-workspace {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  gap: 0.5rem;
+  padding: 0.5rem;
+}
+
+.app-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 2rem;
+}
+
+.app-main code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+@media (max-width: 900px) {
+  .app-workspace {
+    gap: 0.375rem;
+    padding: 0.375rem;
+  }
+
+  .app-main {
+    border-radius: 1rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .app-workspace {
+    gap: 0.25rem;
+    padding: 0.25rem;
+  }
+}
+
 .glass-toolbar {
   background-color: var(--glass-bg-subtle);
   backdrop-filter: blur(16px) saturate(150%);
@@ -959,42 +1037,53 @@ body {
   box-shadow: var(--glass-shadow);
 }
 
+/* ============ Global responsive safety (fluid across every screen size) ============
+ * Many page headers use `flex items-center justify-between` without wrapping,
+ * which on narrow phones crushes the title column to ~0px (text renders one
+ * letter per line). These rules let header rows wrap and prevent text columns
+ * from collapsing, without touching individual pages. */
+@media (max-width: 640px) {
+  /* Header rows inside hero / card titles wrap instead of squeezing. */
+  .page-hero .flex.items-center.justify-between,
+  .page-hero .flex.items-center.gap-4 {
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+  /* Never let a flex child shrink so far its text wraps per-character. */
+  .page-hero h1,
+  .page-hero h2,
+  .page-hero p {
+    min-width: 0;
+    word-break: normal;
+    overflow-wrap: anywhere;
+  }
+  /* Slightly smaller hero title on phones so it fits. */
+  .page-hero h1 { font-size: 1.25rem; line-height: 1.75rem; }
+}
+
+/* Guard: any element should never overflow the viewport horizontally. */
+img, video, canvas, svg, table, pre, code {
+  max-width: 100%;
+}
+
+/* Proxy API endpoint list: keep method + path + label readable on phones by
+ * letting each row wrap and the path code break on word boundaries instead of
+ * being squeezed to one character per line. */
+.proxy-endpoint-list > div {
+  flex-wrap: wrap;
+}
+.proxy-endpoint-list code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
 /* ==================== Page Surface（主页面内容区背景装饰） ==================== */
 /* 给 main 容器内部加微弱的彩色光晕，让玻璃卡片有色彩可穿透 */
 .page-surface {
   position: relative;
   isolation: isolate;
 }
-/* 蓝色 blob 沉到右上角外（不渗透卡片内部） */
-.page-surface::before {
-  content: '';
-  position: absolute;
-  width: 400px;
-  height: 400px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(91, 140, 255, 0.07) 0%, transparent 70%);
-  top: -240px;
-  right: -240px;
-  filter: blur(100px);
-  pointer-events: none;
-  z-index: 0;
-}
-/* 紫色 blob 沉到右下角外（避开左侧卡片网格） */
-.page-surface::after {
-  content: '';
-  position: absolute;
-  width: 360px;
-  height: 360px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(139, 92, 246, 0.05) 0%, transparent 70%);
-  bottom: -220px;
-  right: -180px;
-  filter: blur(100px);
-  pointer-events: none;
-  z-index: 0;
-}
-.dark .page-surface::before { background: radial-gradient(circle, rgba(123, 163, 255, 0.06) 0%, transparent 70%); }
-.dark .page-surface::after { background: radial-gradient(circle, rgba(167, 139, 250, 0.04) 0%, transparent 70%); }
 .page-surface > * {
   position: relative;
   z-index: 1;

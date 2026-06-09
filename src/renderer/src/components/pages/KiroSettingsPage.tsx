@@ -342,31 +342,31 @@ export function KiroSettingsPage() {
   }
 
   return (
-    <div className="flex-1 p-6 space-y-6 overflow-auto">
+    <div className="flex-1 space-y-4 overflow-auto p-4 md:space-y-6 md:p-6">
       {/* 页面头部 */}
-      <div className="page-hero p-6">
+      <div className="page-hero p-4 md:p-6">
         <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-primary/20 to-transparent rounded-full blur-2xl" />
         <div className="absolute bottom-0 left-0 w-24 h-24 bg-gradient-to-tr from-primary/20 to-transparent rounded-full blur-2xl" />
-        <div className="relative flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <div className="p-3 rounded-xl bg-primary shadow-lg shadow-primary/25">
+        <div className="relative flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
+            <div className="w-fit shrink-0 p-3 rounded-xl bg-primary shadow-lg shadow-primary/25">
               <Sparkles className="h-6 w-6 text-primary-foreground" />
             </div>
-            <div>
+            <div className="min-w-0">
               <h1 className="text-2xl font-bold text-primary">{isEn ? 'Kiro Settings' : 'Kiro 设置'}</h1>
               <p className="text-muted-foreground">{isEn ? 'Manage Kiro IDE config, MCP servers and user rules' : '管理 Kiro IDE 的配置、MCP 服务器和用户规则'}</p>
             </div>
           </div>
-          <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={loadKiroSettings} className="bg-background/50 backdrop-blur-sm">
+          <div className="flex w-full flex-wrap gap-2 sm:w-auto lg:justify-end">
+            <Button variant="outline" size="sm" onClick={loadKiroSettings} className="min-w-[7rem] flex-1 bg-background/50 backdrop-blur-sm sm:flex-none">
               <RefreshCw className="h-4 w-4 mr-2" />
               {isEn ? 'Refresh' : '刷新'}
             </Button>
-            <Button variant="outline" size="sm" onClick={openKiroSettingsFile} className="bg-background/50 backdrop-blur-sm">
+            <Button variant="outline" size="sm" onClick={openKiroSettingsFile} className="min-w-[7rem] flex-1 bg-background/50 backdrop-blur-sm sm:flex-none">
               <ExternalLink className="h-4 w-4 mr-2" />
               {isEn ? 'Open File' : '打开设置文件'}
             </Button>
-            <Button size="sm" onClick={saveSettings} disabled={saving}>
+            <Button size="sm" onClick={saveSettings} disabled={saving} className="min-w-[7rem] flex-1 sm:flex-none">
               <Save className="h-4 w-4 mr-2" />
               {saving ? (isEn ? 'Saving...' : '保存中...') : (isEn ? 'Save' : '保存设置')}
             </Button>
@@ -384,8 +384,8 @@ export function KiroSettingsPage() {
       {/* Agent 设置 */}
       <Card className="hover-lift">
         <CardHeader className="pb-2 cursor-pointer hover:bg-muted/30 transition-colors rounded-t-lg" onClick={() => toggleSection('agent')}>
-          <CardTitle className="text-base flex items-center justify-between">
-            <div className="flex items-center gap-3">
+          <CardTitle className="text-base flex items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-3">
               <div className="p-2 rounded-lg bg-primary/10">
                 <Settings2 className="h-4 w-4 text-primary" />
               </div>
@@ -397,8 +397,8 @@ export function KiroSettingsPage() {
         {expandedSections.agent && (
           <CardContent className="space-y-4">
             {/* Agent Autonomy */}
-            <div className="flex items-center justify-between">
-              <div>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
                 <p className="font-medium">{isEn ? 'Agent Autonomy' : 'Agent 自主模式'}</p>
                 <p className="text-sm text-muted-foreground">{isEn ? 'Determines whether the agent will ask for accept/reject at each checkpoint in the workflow.' : '决定 Agent 在工作流的每个检查点是否要求接受/拒绝'}</p>
               </div>
@@ -406,17 +406,17 @@ export function KiroSettingsPage() {
                 value={settings.agentAutonomy}
                 options={autonomyOptions}
                 onChange={(value) => setSettings(prev => ({ ...prev, agentAutonomy: value }))}
-                className="w-[200px]"
+                className="w-full sm:w-[200px]"
               />
             </div>
 
             {/* Model Selection */}
-            <div className="flex items-center justify-between border-t pt-4">
-              <div className="flex-1 mr-4">
+            <div className="flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0 flex-1">
                 <p className="font-medium">{isEn ? 'Model Selection' : '模型选择'}</p>
                 <p className="text-sm text-muted-foreground">{isEn ? 'Select model to use for agent operations.' : '选择 Agent 操作使用的模型'}</p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex min-w-0 items-center gap-2">
                 {availableModels.length > 0 ? (
                   <Select
                     value={settings.modelSelection}
@@ -426,7 +426,7 @@ export function KiroSettingsPage() {
                       description: m.description
                     }))}
                     onChange={(value) => setSettings(prev => ({ ...prev, modelSelection: value }))}
-                    className="w-[240px]"
+                    className="min-w-0 flex-1 sm:w-[240px] sm:flex-none"
                   />
                 ) : (
                   <input
@@ -434,7 +434,7 @@ export function KiroSettingsPage() {
                     value={settings.modelSelection}
                     onChange={(e) => setSettings(prev => ({ ...prev, modelSelection: e.target.value }))}
                     placeholder="claude-haiku-4.5"
-                    className="w-[240px] px-3 py-1.5 rounded-md border bg-background text-sm"
+                    className="min-w-0 flex-1 px-3 py-1.5 rounded-md border bg-background text-sm sm:w-[240px] sm:flex-none"
                   />
                 )}
                 <Button

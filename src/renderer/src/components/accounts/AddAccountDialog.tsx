@@ -72,7 +72,7 @@ interface OidcCredential {
   machineId?: string
 }
 
-type ImportMode = 'oidc' | 'sso' | 'login'
+type ImportMode = 'oidc' | 'sso' | 'login' | 'apiKey'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso'
 
 export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): React.ReactNode {
@@ -106,6 +106,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const [profileArn, setProfileArn] = useState('')
   const [machineId, setMachineId] = useState('')
   const [startUrl, setStartUrl] = useState('')
+  const [kiroApiKey, setKiroApiKey] = useState('')
+  const [apiKeyNickname, setApiKeyNickname] = useState('')
+  const [apiKeyAuthRegion, setApiKeyAuthRegion] = useState('us-east-1')
+  const [apiKeyApiRegion, setApiKeyApiRegion] = useState('us-east-1')
 
   // SSO Token 导入
   const [ssoToken, setSsoToken] = useState('')
@@ -1113,6 +1117,99 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     }
   }
 
+  const handleApiKeyAdd = async () => {
+    const key = kiroApiKey.trim()
+    if (!key) {
+      setError(isEn ? 'Please enter Kiro API key' : 'Vui lòng nhập Kiro API key')
+      return
+    }
+    if (!key.startsWith('ksk_')) {
+      setError(isEn ? 'Kiro API key should start with ksk_' : 'Kiro API key phải bắt đầu bằng ksk_')
+      return
+    }
+
+    setIsSubmitting(true)
+    setError(null)
+
+    try {
+      const result = await window.api.verifyAccountCredentials({
+        accessToken: key,
+        kiroApiKey: key,
+        region: apiKeyApiRegion.trim() || 'us-east-1',
+        authMethod: 'api_key',
+        provider: 'KiroApiKey'
+      })
+
+      if (result.success && result.data) {
+        const now = Date.now()
+        const email = result.data.email || apiKeyNickname.trim() || `kiro-api-key-${key.slice(-6)}`
+        const userId = result.data.userId || `kiro-api-key:${key.slice(-12)}`
+        const providerName = 'KiroApiKey'
+
+        if (isAccountExists(email, userId, providerName)) {
+          setError(isEn ? 'This account already exists' : 'Tài khoản này đã tồn tại')
+          return
+        }
+
+        addAccount({
+          email,
+          userId,
+          nickname: apiKeyNickname.trim() || (email.includes('@') ? email.split('@')[0] : email),
+          idp: providerName as IdpType,
+          profileArn: result.data.profileArn,
+          groupId: selectedGroupId,
+          credentials: {
+            accessToken: key,
+            kiroApiKey: key,
+            csrfToken: '',
+            region: apiKeyApiRegion.trim() || 'us-east-1',
+            authRegion: apiKeyAuthRegion.trim() || 'us-east-1',
+            apiRegion: apiKeyApiRegion.trim() || 'us-east-1',
+            expiresAt: 0,
+            authMethod: 'api_key',
+            provider: 'KiroApiKey'
+          },
+          subscription: {
+            type: result.data.subscriptionType as SubscriptionType,
+            title: result.data.subscriptionTitle,
+            rawType: result.data.subscription?.rawType,
+            daysRemaining: result.data.daysRemaining,
+            expiresAt: result.data.expiresAt,
+            managementTarget: result.data.subscription?.managementTarget,
+            upgradeCapability: result.data.subscription?.upgradeCapability,
+            overageCapability: result.data.subscription?.overageCapability
+          },
+          usage: {
+            current: result.data.usage.current,
+            limit: result.data.usage.limit,
+            percentUsed: result.data.usage.limit > 0 ? result.data.usage.current / result.data.usage.limit : 0,
+            lastUpdated: now,
+            baseLimit: result.data.usage.baseLimit,
+            baseCurrent: result.data.usage.baseCurrent,
+            freeTrialLimit: result.data.usage.freeTrialLimit,
+            freeTrialCurrent: result.data.usage.freeTrialCurrent,
+            freeTrialExpiry: result.data.usage.freeTrialExpiry,
+            bonuses: result.data.usage.bonuses,
+            nextResetDate: result.data.usage.nextResetDate,
+            resourceDetail: result.data.usage.resourceDetail
+          },
+          tags: [],
+          status: 'active',
+          lastUsedAt: now
+        })
+
+        resetForm()
+        onClose()
+      } else {
+        setError(result.error || (isEn ? 'API key verification failed' : 'Xác minh API key thất bại'))
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : (isEn ? 'Failed to add API key account' : 'Thêm tài khoản API key thất bại'))
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
   const resetForm = () => {
     setImportMode('login')
     setRefreshToken('')
@@ -1124,6 +1221,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setProfileArn('')
     setMachineId('')
     setStartUrl('')
+    setKiroApiKey('')
+    setApiKeyNickname('')
+    setApiKeyAuthRegion('us-east-1')
+    setApiKeyApiRegion('us-east-1')
     setSsoToken('')
     setVerifiedData(null)
     setError(null)
@@ -1172,7 +1273,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             </div>
           )}
           {/* 导入模式切换 */}
-          <div className="grid grid-cols-3 gap-1 p-1 bg-muted/50 rounded-xl border">
+          <div className="grid grid-cols-4 gap-1 p-1 bg-muted/50 rounded-xl border">
             <button
               className={`py-2 px-3 text-sm rounded-lg transition-all duration-200 font-medium ${
                 importMode === 'login' 
@@ -1183,6 +1284,17 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               disabled={!!verifiedData || isLoggingIn}
             >
               {isEn ? 'Login' : '在线登录'}
+            </button>
+            <button
+              className={`py-2 px-3 text-sm rounded-lg transition-all duration-200 font-medium ${
+                importMode === 'apiKey'
+                  ? 'bg-background text-foreground shadow-sm ring-1 ring-black/5'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
+              }`}
+              onClick={() => { setImportMode('apiKey'); setError(null) }}
+              disabled={!!verifiedData || isLoggingIn}
+            >
+              API Key
             </button>
             <button
               className={`py-2 px-3 text-sm rounded-lg transition-all duration-200 font-medium ${
@@ -1563,6 +1675,62 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           )}
 
           {/* SSO Token 导入模式 */}
+          {importMode === 'apiKey' && !verifiedData && (
+            <div className="space-y-5">
+              <div className="p-3 bg-muted/60 rounded-xl border text-xs text-muted-foreground">
+                {isEn
+                  ? 'Add account via Kiro API key (ksk_...) for headless integration'
+                  : 'Thêm tài khoản bằng Kiro API key (ksk_...) để dùng headless/API proxy'}
+              </div>
+
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">
+                    API Key <span className="text-destructive">*</span>
+                  </Label>
+                  <Input
+                    type="password"
+                    value={kiroApiKey}
+                    onChange={(e) => setKiroApiKey(e.target.value)}
+                    placeholder="ksk_..."
+                    className="font-mono"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">{isEn ? 'Nickname (optional)' : 'Nickname (tùy chọn)'}</Label>
+                  <Input
+                    value={apiKeyNickname}
+                    onChange={(e) => setApiKeyNickname(e.target.value)}
+                    placeholder={isEn ? 'e.g., My API Key' : 'ví dụ: My API Key'}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">{isEn ? 'Auth Region (optional)' : 'Auth Region (tùy chọn)'}</Label>
+                  <Input
+                    value={apiKeyAuthRegion}
+                    onChange={(e) => setApiKeyAuthRegion(e.target.value)}
+                    placeholder="us-east-1"
+                    className="font-mono"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">{isEn ? 'API Region (optional)' : 'API Region (tùy chọn)'}</Label>
+                  <Input
+                    value={apiKeyApiRegion}
+                    onChange={(e) => setApiKeyApiRegion(e.target.value)}
+                    placeholder="us-east-1"
+                    className="font-mono"
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
           {importMode === 'sso' && !verifiedData && (
             <div className="space-y-5">
               <div className="p-4 bg-primary/[0.04] rounded-xl border border-primary/15">
@@ -2051,6 +2219,22 @@ email----password----refreshToken----clientId----clientSecret`
           )}
 
           {/* 提交按钮 - 只在 OIDC 模式显示 */}
+          {importMode === 'apiKey' && (
+            <div className="flex justify-end gap-3 pt-4 border-t">
+              <Button type="button" variant="outline" onClick={() => setImportMode('login')} className="rounded-xl h-10 px-6">
+                {isEn ? 'Back' : 'Quay lại'}
+              </Button>
+              <Button
+                onClick={handleApiKeyAdd}
+                disabled={isSubmitting || !kiroApiKey.trim()}
+                className="rounded-xl h-10 px-6"
+              >
+                {isSubmitting && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                {isEn ? 'Add' : 'Thêm'}
+              </Button>
+            </div>
+          )}
+
           {importMode === 'oidc' && (
             <div className="flex justify-end gap-3 pt-4 border-t">
               <Button type="button" variant="outline" onClick={onClose} className="rounded-xl h-10 px-6">

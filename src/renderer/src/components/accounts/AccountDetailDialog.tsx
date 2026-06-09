@@ -208,7 +208,7 @@ export function AccountDetailDialog({
                  <Progress value={usage.percentUsed * 100} className="h-3 rounded-full" indicatorClassName={usage.percentUsed > 0.9 ? "bg-red-500" : "bg-primary"} />
                </div>
 
-               <div className="grid grid-cols-3 gap-4 pt-2">
+               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2">
                  {/* 主配额 */}
                  <div className="p-4 bg-background/60 backdrop-blur-sm rounded-xl border border-primary/15 hover:border-primary/30 hover:bg-background/80 hover:shadow-md transition-all shadow-sm">
                    <div className="flex items-center gap-2 text-xs font-semibold text-primary mb-2">

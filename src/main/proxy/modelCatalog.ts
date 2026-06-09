@@ -17,6 +17,8 @@ export const KIRO_PROXY_PREFERRED_MODEL_IDS = [
   'claude-haiku-4.5'
 ]
 
+export const KIRO_PROXY_DEFAULT_THINKING_EFFORTS = ['low', 'medium', 'high', 'max']
+
 export const KIRO_PROXY_MODEL_PRESETS: KiroProxyModelPreset[] = [
   {
     id: 'claude-sonnet-4.5',
@@ -78,7 +80,16 @@ export function normalizeKiroModelIdForCompare(id: string): string {
   return id.trim().toLowerCase().replace(/^(claude-(?:sonnet|haiku|opus)-\d+)-(\d+)(.*)$/u, '$1.$2$3')
 }
 
+export function kiroProxyModelSupportsThinking(modelId: string): boolean {
+  const lower = modelId.trim().toLowerCase().replace(/_/g, '-')
+  if (!lower || lower === 'auto') return false
+  if (!lower.includes('claude')) return false
+  if (lower.includes('claude-3-') || lower.includes('claude-3.')) return false
+
+  const normalized = normalizeKiroModelIdForCompare(lower)
+  return /^claude-(?:sonnet|haiku|opus)-[4-9](?:[.-]|$)/u.test(normalized)
+}
+
 export function isAutoKiroModelId(id: string): boolean {
   return normalizeKiroModelIdForCompare(id) === 'auto'
 }
-

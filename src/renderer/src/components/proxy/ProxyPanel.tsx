@@ -351,6 +351,7 @@ export function ProxyPanel() {
           id: acc.id,
           email: acc.email,
           accessToken: acc.credentials.accessToken,
+          kiroApiKey: acc.credentials.kiroApiKey,
           refreshToken: acc.credentials?.refreshToken,
           profileArn: acc.profileArn,
           expiresAt: acc.credentials?.expiresAt,
@@ -358,7 +359,7 @@ export function ProxyPanel() {
           // Token 刷新所需字段
           clientId: acc.credentials?.clientId,
           clientSecret: acc.credentials?.clientSecret,
-          region: acc.credentials?.region || 'us-east-1',
+          region: acc.credentials?.apiRegion || acc.credentials?.region || 'us-east-1',
           authMethod: acc.credentials?.authMethod,
           provider: acc.credentials?.provider || acc.idp,
           // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险），即便前端忘了重同步也安全
@@ -626,7 +627,7 @@ export function ProxyPanel() {
         </CardHeader>
         <CardContent className="space-y-4">
           {/* 控制按钮 */}
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {!isRunning ? (
               <Button onClick={handleStart} className="gap-2">
                 <Play className="h-4 w-4" />
@@ -706,8 +707,8 @@ export function ProxyPanel() {
                 {tunnelStatus?.running ? (isEn ? 'Online' : 'Đang bật') : (isEn ? 'Off' : 'Đang tắt')}
               </Badge>
             </div>
-            <div className="grid grid-cols-12 gap-2 items-end">
-              <div className="col-span-8 space-y-1.5">
+            <div className="grid grid-cols-1 items-end gap-2 sm:grid-cols-12">
+              <div className="space-y-1.5 sm:col-span-8">
                 <Label htmlFor="tunnelTarget" className="text-xs">{isEn ? 'Local dashboard target' : 'Đích dashboard nội bộ'}</Label>
                 <Input
                   id="tunnelTarget"
@@ -718,7 +719,7 @@ export function ProxyPanel() {
                   className="h-9"
                 />
               </div>
-              <div className="col-span-4 flex gap-2">
+              <div className="flex gap-2 sm:col-span-4">
                 {tunnelStatus?.running ? (
                   <Button onClick={handleTunnelStop} variant="outline" className="gap-2 flex-1" disabled={tunnelLoading}>
                     {tunnelLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4" />}
@@ -755,8 +756,8 @@ export function ProxyPanel() {
             )}
           </div>
 
-          <div className="grid grid-cols-12 gap-3">
-            <div className="col-span-2 space-y-1.5">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
+            <div className="space-y-1.5 sm:col-span-2">
               <Label htmlFor="port" className="text-xs">{isEn ? 'Port' : 'Cổng'}</Label>
               <Input
                 id="port"
@@ -771,7 +772,7 @@ export function ProxyPanel() {
                 className="h-9"
               />
             </div>
-            <div className="col-span-3 space-y-1.5">
+            <div className="space-y-1.5 sm:col-span-3">
               <div className="flex items-center justify-between">
                 <Label htmlFor="host" className="text-xs" title={config.host === '0.0.0.0' ? (isEn ? 'LAN access enabled. Set an API Key and allow port through firewall.' : 'Đang cho phép truy cập ngoài máy; nên đặt API Key và mở cổng firewall') : (isEn ? 'Loopback only. Toggle Public for LAN access.' : 'Chỉ chạy nội bộ; bật Public để thiết bị khác truy cập')}>{isEn ? 'Host' : 'Địa chỉ nghe'}</Label>
                 <div className="flex items-center gap-1">
@@ -811,10 +812,10 @@ export function ProxyPanel() {
               />
             </div>
             {/* API Key 区：占 7 列 */}
-            <div className="col-span-7 space-y-1.5">
-              <div className="flex items-center justify-between">
+            <div className="space-y-1.5 sm:col-span-7">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                 <Label htmlFor="apiKey" className="text-xs" title={isEn ? 'When set, requests must provide this key in Authorization or X-Api-Key header' : 'Khi đặt key, request phải gửi qua header Authorization hoặc X-Api-Key'}>{isEn ? 'API Key (Optional)' : 'API Key (tùy chọn)'}</Label>
-                <div className="flex items-center gap-1">
+                <div className="flex max-w-full flex-wrap items-center gap-1">
                   <Select
                     value={apiKeyFormat}
                     options={[
@@ -868,7 +869,7 @@ export function ProxyPanel() {
 
 
           {/* 运行模式开关区 — 网格化对齐，避免 flex-wrap 造成的凌乱布局 */}
-          <div className="grid grid-cols-3 gap-x-4 gap-y-3 items-center">
+          <div className="grid grid-cols-1 items-center gap-x-4 gap-y-3 sm:grid-cols-3">
             <div className="flex items-center gap-2">
               <Switch
                 id="autoStart"
@@ -904,11 +905,11 @@ export function ProxyPanel() {
             </div>
             {/* 开启多账号轮询时显示策略选择 */}
             {config.enableMultiAccount && (
-              <div className="col-span-2 flex items-center gap-2">
+              <div className="flex min-w-0 flex-col gap-2 sm:col-span-2 lg:flex-row lg:items-center">
                 <Label className="text-sm shrink-0">
                   {isEn ? 'Strategy' : 'Chiến lược'}:
                 </Label>
-                <div className="flex gap-1 bg-muted/30 rounded-lg p-0.5">
+                <div className="flex max-w-full flex-wrap gap-1 rounded-lg bg-muted/30 p-0.5">
                   {(['smart', 'round-robin', 'least-used', 'sticky'] as const).map(strategy => {
                     const active = (config.accountSelectionStrategy || 'smart') === strategy
                     const labelEn = strategy === 'smart' ? 'Smart' : strategy === 'round-robin' ? 'Round-Robin' : strategy === 'least-used' ? 'Least-Used' : 'Sticky'
@@ -918,7 +919,7 @@ export function ProxyPanel() {
                         key={strategy}
                         type="button"
                         disabled={isRunning}
-                        className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                        className={`rounded-md px-2 py-1 text-xs font-medium transition-all sm:px-3 ${
                           active
                             ? 'bg-primary text-primary-foreground shadow-sm'
                             : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
@@ -936,7 +937,7 @@ export function ProxyPanel() {
                     )
                   })}
                 </div>
-                <span className="text-xs text-muted-foreground">
+                <span className="min-w-0 text-xs text-muted-foreground">
                   {(() => {
                     const strategy = config.accountSelectionStrategy || 'smart'
                     if (strategy === 'smart') return isEn ? 'Score quota, errors, latency and token freshness before each request' : 'Chấm điểm quota, lỗi, độ trễ và token trước mỗi request'
@@ -1125,7 +1126,7 @@ export function ProxyPanel() {
               <Settings2 className="h-3.5 w-3.5" />
               {isEn ? 'Advanced Settings' : 'Cài đặt nâng cao'}
             </h4>
-            <div className="grid grid-cols-3 gap-x-3 gap-y-3 items-start overflow-visible">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-3 gap-y-3 items-start overflow-visible">
               <div className="space-y-1.5 relative z-20">
                 <Label htmlFor="preferredEndpoint" className="text-xs">{isEn ? 'Preferred Endpoint' : 'Endpoint ưu tiên'}</Label>
                 <Select
@@ -1261,7 +1262,7 @@ export function ProxyPanel() {
 
       {/* 统计卡片 */}
       {isRunning && (
-        <div className="grid grid-cols-6 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           <Card className="hover-lift bg-gradient-to-br from-blue-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
@@ -1349,7 +1350,7 @@ export function ProxyPanel() {
 
       {/* 第二行统计卡片 - Token 分解和 Cache */}
       {isRunning && stats && (
-        <div className="grid grid-cols-6 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           <Card className="hover-lift bg-gradient-to-br from-indigo-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
@@ -1435,7 +1436,7 @@ export function ProxyPanel() {
             {isEn ? 'API Endpoints' : 'Endpoint API'}
           </CardTitle>
         </CardHeader>
-        <CardContent className="space-y-1.5 text-sm">
+        <CardContent className="proxy-endpoint-list space-y-1.5 text-sm">
           <div className="flex items-center gap-2">
             <span className="text-orange-500 w-11 flex-shrink-0 font-mono">POST</span>
             <code className="text-muted-foreground flex-1 font-mono">/v1/chat/completions</code>
@@ -1680,7 +1681,7 @@ export function ProxyPanel() {
       {showApiKeyManager && createPortal(
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div className="absolute inset-0 bg-black/50" onClick={() => setShowApiKeyManager(false)} />
-          <div className="relative bg-background rounded-lg shadow-lg w-[800px] max-h-[80vh] overflow-y-auto p-4">
+          <div className="relative bg-background rounded-lg shadow-lg w-[800px] max-w-[95vw] max-h-[80vh] overflow-y-auto p-4">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold">{isEn ? 'API Key Management' : 'Quản lý API Key'}</h2>
               <Button variant="ghost" size="icon" onClick={() => setShowApiKeyManager(false)}>✕</Button>

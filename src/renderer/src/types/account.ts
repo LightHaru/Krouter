@@ -2,7 +2,7 @@
 // 多账号管理器类型定义
 // ============================================
 
-export type IdpType = 'Google' | 'Github' | 'BuilderId' | 'Enterprise' | 'AWSIdC' | 'Internal' | 'IAM_SSO'
+export type IdpType = 'Google' | 'Github' | 'BuilderId' | 'Enterprise' | 'AWSIdC' | 'Internal' | 'IAM_SSO' | 'KiroApiKey'
 
 export type SubscriptionType = 'Free' | 'Pro' | 'Pro_Plus' | 'Enterprise' | 'Teams'
 
@@ -18,10 +18,13 @@ export interface AccountCredentials {
   clientId?: string      // OIDC 客户端 ID（用于刷新 token）
   clientSecret?: string  // OIDC 客户端密钥
   region?: string        // AWS 区域，默认 us-east-1
+  kiroApiKey?: string    // Kiro API key (ksk_...) for headless auth
+  authRegion?: string
+  apiRegion?: string
   startUrl?: string      // SSO Start URL（Enterprise 账户专用）
   expiresAt: number      // 时间戳
-  authMethod?: 'IdC' | 'social'  // 认证方式：IdC (BuilderId/Enterprise) 或 social (GitHub/Google)
-  provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO'  // 身份提供商
+  authMethod?: 'IdC' | 'social' | 'api_key'  // 认证方式：IdC/Social/API key
+  provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO' | 'KiroApiKey'  // 身份提供商
 }
 
 /**
@@ -202,6 +205,7 @@ export interface AccountImportItem {
   clientId?: string
   clientSecret?: string
   region?: string
+  kiroApiKey?: string
   idp?: IdpType | string
   nickname?: string
   groupId?: string

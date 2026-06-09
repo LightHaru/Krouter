@@ -33,11 +33,14 @@ interface ErrorDiagnosis {
  */
 function diagnoseRegError(err: string | undefined): ErrorDiagnosis {
   const e = (err || '').toLowerCase()
+  const isTesBlocked = e.includes('"errorcode":"blocked"')
+    || e.includes('request was blocked by tes')
+    || (e.includes('blocked') && e.includes('tes'))
   if (!e) {
     return { category: 'unknown', title: 'Lỗi không xác định', reasons: ['Không nhận được thông tin lỗi cụ thể'], suggestions: ['Xem nhật ký đầy đủ'] }
   }
   // AWS 风控
-  if (e.includes('aws-risk-control') || e.includes('风控') || e.includes('请稍后再试') || e.includes('try again later')) {
+  if (isTesBlocked || e.includes('aws-risk-control') || e.includes('风控') || e.includes('请稍后再试') || e.includes('try again later')) {
     return {
       category: 'risk_control',
       title: 'AWS đã chặn yêu cầu',
@@ -2642,7 +2645,7 @@ export function RegisterPage(): React.JSX.Element {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex gap-1 p-1 bg-muted rounded-lg w-fit">
+          <div className="flex w-full flex-wrap gap-1 rounded-lg bg-muted p-1 sm:w-fit">
             {([
               ['manual', t('register.manual')],
               ['outlook', 'Outlook'],
@@ -2656,7 +2659,7 @@ export function RegisterPage(): React.JSX.Element {
                 onClick={() => setMode(m)}
                 disabled={isRunning || batchRunning}
                 className={cn(
-                  'px-4 py-1.5 rounded-md text-sm font-medium transition-colors disabled:opacity-50',
+                  'min-w-[88px] flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50 sm:flex-none',
                   mode === m
                     ? 'bg-background shadow text-foreground'
                     : 'text-muted-foreground hover:text-foreground'

@@ -232,8 +232,16 @@ function isBannedAccountError(error?: string): boolean {
     lowerError.includes('accountsuspendedexception') ||
     lowerError.includes('account suspended') ||
     lowerError.includes('temporarily_suspended') ||
+    lowerError.includes('permanently_suspended') ||
     lowerError.includes('temporarily suspended') ||
+    lowerError.includes('permanently suspended') ||
     (lowerError.includes('user id is') && lowerError.includes('suspended')) ||
+    lowerError.includes('user id is temporarily suspended') ||
+    lowerError.includes('account is locked') ||
+    lowerError.includes('locked it as a security precaution') ||
+    lowerError.includes('security precaution') ||
+    lowerError.includes('unusual user activity') ||
+    lowerError.includes('restricted your ability to use kiro') ||
     lowerError.includes('账户已封禁') ||
     lowerError.includes('已封禁') ||
     /\b423\b/.test(lowerError)
@@ -252,6 +260,23 @@ function isBannedAccountError(error?: string): boolean {
 }
 
 // 自动换号定时器
+function preserveBannedState<T extends Account>(current: Account, next: T, forceClearBanned = false): T {
+  const currentBanned = isBannedAccountError(current.lastError)
+  const incomingBanned = isBannedAccountError(next.lastError)
+  if (incomingBanned) {
+    return {
+      ...next,
+      status: 'error'
+    }
+  }
+  if (!currentBanned || forceClearBanned) return next
+  return {
+    ...next,
+    status: 'error',
+    lastError: current.lastError
+  }
+}
+
 function normalizeUsagePercent(usage: { current?: number; limit?: number; percentUsed?: number }): number {
   const current = Number(usage.current)
   const limit = Number(usage.limit)
@@ -447,7 +472,7 @@ interface AccountsActions {
   importFromExportData: (data: AccountExportData) => BatchOperationResult
 
   // 状态管理
-  updateAccountStatus: (id: string, status: AccountStatus, error?: string) => void
+  updateAccountStatus: (id: string, status: AccountStatus, error?: string, options?: { forceClearBanned?: boolean }) => void
   refreshAccountToken: (id: string) => Promise<boolean>
   batchRefreshTokens: (ids: string[]) => Promise<BatchOperationResult>
   checkAccountStatus: (id: string) => Promise<void>
@@ -694,7 +719,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const accounts = new Map(state.accounts)
       const account = accounts.get(id)
       if (account) {
-        accounts.set(id, normalizeAccountUsage({ ...account, ...updates }))
+        accounts.set(id, preserveBannedState(account, normalizeAccountUsage({ ...account, ...updates })))
       }
       return { accounts }
     })
@@ -725,7 +750,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         ? account.usage.current + delta
         : Math.max(account.usage.current, incomingCurrent)
 
-      accounts.set(proxyAccount.id, normalizeAccountUsage({
+      accounts.set(proxyAccount.id, preserveBannedState(account, normalizeAccountUsage({
         ...account,
         profileArn: proxyAccount.profileArn || account.profileArn,
         credentials: {
@@ -745,7 +770,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         lastUsedAt: proxyAccount.lastUsed || now,
         status: 'active',
         lastError: undefined
-      }))
+      })))
 
       return { accounts }
     })
@@ -1404,19 +1429,21 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   // ==================== 状态管理 ====================
 
-  updateAccountStatus: (id, status, error) => {
-    const wasBanned = isBannedAccountError(get().accounts.get(id)?.lastError)
+  updateAccountStatus: (id, status, error, options) => {
+    const previous = get().accounts.get(id)
+    const wasBanned = isBannedAccountError(previous?.lastError)
     const isBanned = isBannedAccountError(error)
     set((state) => {
       const accounts = new Map(state.accounts)
       const account = accounts.get(id)
       if (account) {
-        accounts.set(id, {
+        const nextAccount = preserveBannedState(account, {
           ...account,
           status,
           lastError: error,
           lastCheckedAt: Date.now()
-        })
+        }, options?.forceClearBanned)
+        accounts.set(id, nextAccount)
       }
       return { accounts }
     })
@@ -1462,7 +1489,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           const accounts = new Map(state.accounts)
           const acc = accounts.get(id)
           if (acc) {
-            accounts.set(id, {
+            accounts.set(id, preserveBannedState(acc, {
               ...acc,
               credentials: {
                 ...acc.credentials,
@@ -1474,7 +1501,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               status: 'active',
               lastError: undefined,
               lastCheckedAt: Date.now()
-            })
+            }))
           }
           return { accounts }
         })
@@ -1611,7 +1638,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               // 未知类型保持原值，不强制改为 Internal
             }
 
-            accounts.set(id, {
+            accounts.set(id, preserveBannedState(acc, {
               ...acc,
               // 更新邮箱（如果 API 返回了）
               email: result.data!.email ?? acc.email,
@@ -1624,7 +1651,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               credentials: updatedCredentials,
               lastCheckedAt: Date.now(),
               lastError: undefined
-            })
+            }))
           }
           return { accounts }
         })
@@ -1739,7 +1766,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         Enterprise: 0,
         AWSIdC: 0,
         Internal: 0,
-        IAM_SSO: 0
+        IAM_SSO: 0,
+        KiroApiKey: 0
       },
       activeCount: 0,
       expiringSoonCount: 0,
@@ -2568,12 +2596,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         if (!account) continue
 
         if (!success) {
-          accounts.set(id, {
+          accounts.set(id, preserveBannedState(account, {
             ...account,
             status: 'error',
             lastError: error,
             lastCheckedAt: now
-          })
+          }))
           continue
         }
 
@@ -2612,7 +2640,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const newStatus = refreshData?.status === 'error' ? 'error' as AccountStatus : 'active' as AccountStatus
       const newError = refreshData?.errorMessage
 
-      accounts.set(id, {
+      accounts.set(id, preserveBannedState(account, {
         ...account,
         credentials: {
           ...account.credentials,
@@ -2650,11 +2678,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         status: newStatus,
         lastError: newError,
         lastCheckedAt: now
-      })
+      }))
       } // end for-loop
 
       return { accounts }
     })
+    get().saveToStorage()
   },
 
   // 处理后台检查结果（兼容入口；高频场景请走 applyBackgroundCheckResults 批量）
@@ -2676,12 +2705,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         if (!account) continue
 
         if (!success) {
-          accounts.set(id, {
+          accounts.set(id, preserveBannedState(account, {
             ...account,
             status: 'error',
             lastError: error,
             lastCheckedAt: now
-          })
+          }))
           continue
         }
 
@@ -2723,7 +2752,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       }
       const newError = checkData?.errorMessage
 
-      accounts.set(id, {
+      accounts.set(id, preserveBannedState(account, {
         ...account,
         usage: checkData?.usage ? (() => {
           return mergeUsageSnapshot(account.usage, {
@@ -2755,15 +2784,15 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         status: newStatus,
         lastError: newError,
         lastCheckedAt: now
-      })
+      }))
       } // end for-loop
 
       return { accounts }
     })
+    get().saveToStorage()
   },
 
   // ==================== 定时自动保存 ====================
-
   startAutoSave: () => {
     // 如果已有定时器，先停止
     if (autoSaveTimer) {

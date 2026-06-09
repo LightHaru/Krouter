@@ -307,17 +307,17 @@ export function KProxyPanel() {
         <div className="rounded-lg border bg-card p-4">
           <div className="text-xs text-muted-foreground">{isEn ? 'MITM daemon' : 'MITM daemon'}</div>
           <div className={cn('mt-2 text-sm font-semibold', isRunning ? 'text-green-600' : 'text-muted-foreground')}>
-            {isRunning ? (isEn ? 'Running' : 'Dang chay') : (isEn ? 'Stopped' : 'Dang tat')}
+            {isRunning ? (isEn ? 'Running' : 'Đang chạy') : (isEn ? 'Stopped' : 'Đang tắt')}
           </div>
           <div className="mt-1 text-xs text-muted-foreground">{config.host}:{config.port}</div>
         </div>
         <div className="rounded-lg border bg-card p-4">
-          <div className="text-xs text-muted-foreground">{isEn ? 'Auto start' : 'Tu khoi dong'}</div>
+          <div className="text-xs text-muted-foreground">{isEn ? 'Auto start' : 'Tự khởi động'}</div>
           <div className={cn('mt-2 text-sm font-semibold', config.autoStart ? 'text-green-600' : 'text-muted-foreground')}>
-            {config.autoStart ? (isEn ? 'Enabled' : 'Da bat') : (isEn ? 'Disabled' : 'Chua bat')}
+            {config.autoStart ? (isEn ? 'Enabled' : 'Đã bật') : (isEn ? 'Disabled' : 'Chưa bật')}
           </div>
           <div className="mt-1 text-xs text-muted-foreground">
-            {isEn ? 'Web backend restores it on restart.' : 'Backend web se tu bat lai sau restart.'}
+            {isEn ? 'Web backend restores it on restart.' : 'Backend web sẽ tự bật lại sau restart.'}
           </div>
         </div>
         <div className="rounded-lg border bg-card p-4">
@@ -325,24 +325,24 @@ export function KProxyPanel() {
             <div>
               <div className="text-xs text-muted-foreground">{isEn ? 'API routing' : 'Route API'}</div>
               <div className={cn('mt-2 text-sm font-semibold', useKProxyForApi ? 'text-green-600' : 'text-muted-foreground')}>
-                {useKProxyForApi ? (isEn ? 'Via K-Proxy' : 'Qua K-Proxy') : (isEn ? 'Direct' : 'Di thang')}
+                {useKProxyForApi ? (isEn ? 'Via K-Proxy' : 'Qua K-Proxy') : (isEn ? 'Direct' : 'Đi thẳng')}
               </div>
             </div>
             <Switch checked={useKProxyForApi} onCheckedChange={toggleApiRouting} disabled={routingLoading} />
           </div>
           <div className="mt-1 text-xs text-muted-foreground">
             {useKProxyForApi && !isRunning
-              ? (isEn ? 'Start K-Proxy before this route.' : 'Can Start K-Proxy truoc khi dung route nay.')
-              : (isEn ? 'Controls API Proxy network path.' : 'Dieu khien duong di cua API Proxy.')}
+              ? (isEn ? 'Start K-Proxy before this route.' : 'Cần Start K-Proxy trước khi dùng route này.')
+              : (isEn ? 'Controls API Proxy network path.' : 'Điều khiển đường đi của API Proxy.')}
           </div>
         </div>
         <div className="rounded-lg border bg-card p-4">
           <div className="text-xs text-muted-foreground">{isEn ? 'CA certificate' : 'CA certificate'}</div>
           <div className={cn('mt-2 text-sm font-semibold', caInstalled ? 'text-green-600' : 'text-muted-foreground')}>
-            {caInstalled ? (isEn ? 'Trusted' : 'Da trust') : (isEn ? 'Not trusted' : 'Chua trust')}
+            {caInstalled ? (isEn ? 'Trusted' : 'Đã trust') : (isEn ? 'Not trusted' : 'Chưa trust')}
           </div>
           <div className="mt-1 truncate text-xs text-muted-foreground">
-            {caInfo?.fingerprint || (isEn ? 'CA is created after init.' : 'CA duoc tao sau khi init.')}
+            {caInfo?.fingerprint || (isEn ? 'CA is created after init.' : 'CA được tạo sau khi init.')}
           </div>
         </div>
       </div>
@@ -585,7 +585,7 @@ export function KProxyPanel() {
             </div>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-4 gap-4 text-center">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
               <div>
                 <div className="text-2xl font-bold">{stats.totalRequests}</div>
                 <div className="text-xs text-muted-foreground">{isEn ? 'Total' : '总请求'}</div>

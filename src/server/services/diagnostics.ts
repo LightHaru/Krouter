@@ -150,11 +150,12 @@ export async function diagnoseAccountLiveness(params: {
     id?: string
     email?: string
     accessToken?: string
+    kiroApiKey?: string
     refreshToken?: string
     clientId?: string
     clientSecret?: string
     region?: string
-    authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
+    authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp' | 'api_key' | 'apikey'
     provider?: string
     profileArn?: string
     machineId?: string
@@ -194,7 +195,13 @@ export async function diagnoseAccountLiveness(params: {
   }>) | undefined
   try {
     let accessToken = account.accessToken
+    const authMethodKey = String(account.authMethod || '').trim().toLowerCase()
+    const providerKey = String(account.provider || '').trim().toLowerCase().replace(/[\s_-]/g, '')
+    const accessTokenLooksLikeApiKey = account.accessToken?.trim().startsWith('ksk_') ?? false
+    const isApiKeyAccount = Boolean(account.kiroApiKey) || accessTokenLooksLikeApiKey || authMethodKey === 'api_key' || authMethodKey === 'apikey' || providerKey === 'kiroapikey' || providerKey === 'apikey'
+    const apiKey = account.kiroApiKey || (isApiKeyAccount ? account.accessToken : undefined)
     const refreshAccessToken = async (): Promise<string | null> => {
+      if (apiKey) return apiKey
       if (!account.refreshToken) return null
       const refreshed = await refreshTokenByMethod({
         refreshToken: account.refreshToken,
@@ -218,6 +225,7 @@ export async function diagnoseAccountLiveness(params: {
       id: account.id || 'diagnose',
       email: account.email,
       accessToken,
+      kiroApiKey: apiKey,
       refreshToken: account.refreshToken,
       clientId: account.clientId,
       clientSecret: account.clientSecret,
@@ -231,6 +239,7 @@ export async function diagnoseAccountLiveness(params: {
     }
     resolvedProfileArn = await resolveStreamingProfileArn({
       accessToken,
+      kiroApiKey: apiKey,
       profileArn: account.profileArn,
       machineId: account.machineId,
       region: account.region || 'us-east-1',
@@ -247,9 +256,11 @@ export async function diagnoseAccountLiveness(params: {
       profileArn?: string
       error?: string
     }> => {
-      if (account.refreshToken) {
+      if (account.refreshToken || apiKey) {
         const verified = await verifyAccountCredentials({
           refreshToken: account.refreshToken,
+          accessToken,
+          kiroApiKey: apiKey,
           clientId: account.clientId,
           clientSecret: account.clientSecret,
           region: account.region || 'us-east-1',
@@ -260,14 +271,15 @@ export async function diagnoseAccountLiveness(params: {
         }) as {
           success?: boolean
           data?: { email?: string; subscriptionTitle?: string; profileArn?: string; usage?: { current?: number; limit?: number } }
-          error?: string
+          error?: string | { message?: string }
         }
         if (!verified.success) {
+          const errorMessage = typeof verified.error === 'string' ? verified.error : verified.error?.message
           return {
             success: false,
             latencyMs: Date.now() - started,
             model: 'credential-check',
-            error: verified.error || 'Credential check failed'
+            error: errorMessage || 'Credential check failed'
           }
         }
         const usage = verified.data?.usage
@@ -293,7 +305,7 @@ export async function diagnoseAccountLiveness(params: {
       }
     }
 
-    if (!resolvedProfileArn) {
+    if (!resolvedProfileArn && !isApiKeyAccount) {
       return await runCredentialCheck('No usable streaming profileArn is available for this account, so model chat was skipped.', { success: false })
     }
 

@@ -701,6 +701,9 @@ export class Registrar {
     if (body.includes('请稍后再试') && body.includes('管理员')) return 'AWS-RISK-CONTROL'
     if (body.includes('发生意外错误')) return 'AWS-RISK-CONTROL'
     // 英文消息
+    if (lower.includes('"errorcode":"blocked"')) return 'AWS-RISK-CONTROL'
+    if (lower.includes('request was blocked by tes')) return 'AWS-RISK-CONTROL'
+    if (lower.includes('blocked') && lower.includes('tes')) return 'AWS-RISK-CONTROL'
     if (lower.includes('try again later') && lower.includes('administrator')) return 'AWS-RISK-CONTROL'
     if (lower.includes('unexpected error') && lower.includes('contact')) return 'AWS-RISK-CONTROL'
     return null
@@ -1161,7 +1164,7 @@ export class Registrar {
     }
 
     const resp = await this.doPost(this.cfg.profileBase + '/api/send-otp', payload, this.buildProfileHeaders(ref))
-    if (resp.status !== 200) throw new Error(`Gửi mã xác minh thất bại (${resp.status}), body: ${resp.body.substring(0, 300)}`)
+    if (resp.status !== 200) throw new Error(`Gửi mã xác minh thất bại: ${this.formatErrorBody(resp.body, resp.status)}`)
     this.log('Đã gửi mã xác minh')
   }
 

@@ -7,6 +7,7 @@ import {
 interface AccountCredentialsShape {
   accessToken?: string
   refreshToken?: string
+  kiroApiKey?: string
   clientId?: string
   clientSecret?: string
   region?: string
@@ -35,6 +36,7 @@ function shouldResolveProfileArn(account: AccountShape): boolean {
   const provider = String(credentials.provider || account.idp || '').trim().toLowerCase()
   const authMethod = String(credentials.authMethod || '').trim().toLowerCase()
 
+  if (credentials.kiroApiKey || credentials.accessToken?.trim().startsWith('ksk_') || authMethod === 'api_key' || authMethod === 'apikey' || provider === 'kiroapikey') return true
   if (provider === 'builderid' || provider === 'builder_id') return true
   if (provider === 'github' || provider === 'google') return true
   if (authMethod === 'social') return true
@@ -47,7 +49,7 @@ function shouldResolveProfileArn(account: AccountShape): boolean {
 
 async function ensureAccessToken(account: AccountShape): Promise<{ accessToken?: string; changed: boolean }> {
   const credentials = account.credentials || {}
-  let accessToken = credentials.accessToken
+  let accessToken = credentials.kiroApiKey || credentials.accessToken
   let changed = false
   const expiresAt = Number(credentials.expiresAt || 0)
   const needsRefresh = Boolean(credentials.refreshToken) && (!accessToken || expiresAt < Date.now() + 300000)
@@ -104,6 +106,7 @@ export async function hydrateAccountDataProfileArns<T extends AccountDataShape |
 
     const profileArn = await resolveStreamingProfileArn({
       accessToken: token.accessToken,
+      kiroApiKey: account.credentials.kiroApiKey,
       machineId: account.machineId,
       region: account.credentials.region || 'us-east-1',
       authMethod: account.credentials.authMethod,

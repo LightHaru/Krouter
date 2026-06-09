@@ -98,31 +98,31 @@ export function AboutPage() {
   const features: FeatureItem[] = [
     {
       icon: Route,
-      title: isEn ? 'Account router' : 'Router tai khoan',
+      title: isEn ? 'Account router' : 'Router tài khoản',
       body: isEn
         ? 'Rotates requests across healthy Kiro accounts by model, quota, and runtime state.'
-        : 'Xoay request qua cac tai khoan Kiro con khoe theo model, quota va trang thai runtime.'
+        : 'Xoay request qua các tài khoản Kiro còn khỏe theo model, quota và trạng thái runtime.'
     },
     {
       icon: KeyRound,
       title: isEn ? 'Client API keys' : 'Key cho client',
       body: isEn
         ? 'Creates OpenAI-compatible keys for OpenClaw, Aira, Codex, and other dev tools.'
-        : 'Tao key tuong thich OpenAI cho OpenClaw, Aira, Codex va cac cong cu dev.'
+        : 'Tạo key tương thích OpenAI cho OpenClaw, Aira, Codex và các công cụ dev.'
     },
     {
       icon: ServerCog,
       title: isEn ? 'Backend runtime' : 'Backend runtime',
       body: isEn
         ? 'Keeps the proxy service alive from the backend/CLI instead of relying on a browser tab.'
-        : 'Giu API proxy chay bang backend/CLI thay vi phu thuoc vao tab trinh duyet.'
+        : 'Giữ API proxy chạy bằng backend/CLI thay vì phụ thuộc vào tab trình duyệt.'
     },
     {
       icon: Network,
-      title: isEn ? 'Localhost or tunnel' : 'Localhost hoac tunnel',
+      title: isEn ? 'Localhost or tunnel' : 'Localhost hoặc tunnel',
       body: isEn
         ? 'Runs local-first and exposes the dashboard publicly only when a tunnel is enabled.'
-        : 'Uu tien localhost va chi public dashboard khi bat tunnel.'
+        : 'Ưu tiên localhost và chỉ public dashboard khi bật tunnel.'
     }
   ]
 
@@ -130,7 +130,7 @@ export function AboutPage() {
     {
       icon: Bot,
       label: isEn ? 'OpenClaw / Aira' : 'OpenClaw / Aira',
-      detail: isEn ? 'One client endpoint' : 'Mot endpoint client'
+      detail: isEn ? 'One client endpoint' : 'Một endpoint client'
     },
     {
       icon: Zap,
@@ -139,7 +139,7 @@ export function AboutPage() {
     },
     {
       icon: Shield,
-      label: isEn ? 'Kiro accounts' : 'Tai khoan Kiro',
+      label: isEn ? 'Kiro accounts' : 'Tài khoản Kiro',
       detail: isEn ? 'Health, quota, profile ARN' : 'Health, quota, profile ARN'
     }
   ]
@@ -157,7 +157,7 @@ export function AboutPage() {
                   {isEn ? APP_TAGLINE : APP_TAGLINE_VI}
                 </p>
                 <p className="mt-2 text-xs text-muted-foreground">
-                  {isEn ? 'Version' : 'Phien ban'} {version} · {APP_OWNER}
+                  {isEn ? 'Version' : 'Phiên bản'} {version} · {APP_OWNER}
                 </p>
               </div>
             </div>
@@ -165,11 +165,11 @@ export function AboutPage() {
             <div className="grid gap-2 text-sm text-muted-foreground sm:grid-cols-3">
               <div className="rounded-xl border border-primary/10 bg-white/45 p-3 dark:bg-white/5">
                 <p className="font-semibold text-foreground">{isEn ? 'Web dashboard' : 'Dashboard web'}</p>
-                <p className="mt-1 text-xs">{isEn ? 'Account control surface' : 'Noi quan ly tai khoan'}</p>
+                <p className="mt-1 text-xs">{isEn ? 'Account control surface' : 'Nơi quản lý tài khoản'}</p>
               </div>
               <div className="rounded-xl border border-primary/10 bg-white/45 p-3 dark:bg-white/5">
                 <p className="font-semibold text-foreground">{isEn ? 'CLI runtime' : 'CLI runtime'}</p>
-                <p className="mt-1 text-xs">{isEn ? 'Setup and tunnel control' : 'Setup va tunnel'}</p>
+                <p className="mt-1 text-xs">{isEn ? 'Setup and tunnel control' : 'Setup và tunnel'}</p>
               </div>
               <div className="rounded-xl border border-primary/10 bg-white/45 p-3 dark:bg-white/5">
                 <p className="font-semibold text-foreground">OpenClaw</p>
@@ -186,7 +186,7 @@ export function AboutPage() {
                 disabled={isCheckingUpdate}
               >
                 <RefreshCw className={cn('h-4 w-4', isCheckingUpdate && 'animate-spin')} />
-                {isCheckingUpdate ? (isEn ? 'Checking...' : 'Dang kiem tra...') : (isEn ? 'Check updates' : 'Kiem tra cap nhat')}
+                {isCheckingUpdate ? (isEn ? 'Checking...' : 'Đang kiểm tra...') : (isEn ? 'Check updates' : 'Kiểm tra cập nhật')}
               </Button>
               <Button
                 variant="outline"
@@ -237,7 +237,7 @@ export function AboutPage() {
                     <Download className="h-6 w-6 text-success" />
                   </div>
                   <div>
-                    <h3 className="text-lg font-semibold">{isEn ? 'New version available' : 'Co ban moi'}</h3>
+                    <h3 className="text-lg font-semibold">{isEn ? 'New version available' : 'Có bản mới'}</h3>
                     <p className="text-sm text-muted-foreground">
                       {updateInfo.currentVersion} -&gt; {updateInfo.latestVersion}
                     </p>
@@ -274,7 +274,7 @@ export function AboutPage() {
 
                 <Button className="w-full gap-2" onClick={() => openExternal(updateInfo.releaseUrl)}>
                   <ExternalLink className="h-4 w-4" />
-                  {isEn ? 'Open release page' : 'Mo trang phat hanh'}
+                  {isEn ? 'Open release page' : 'Mở trang phát hành'}
                 </Button>
               </div>
             ) : updateInfo.error ? (
@@ -284,12 +284,12 @@ export function AboutPage() {
                     <AlertCircle className="h-6 w-6 text-red-500" />
                   </div>
                   <div>
-                    <h3 className="text-lg font-semibold">{isEn ? 'Check failed' : 'Kiem tra loi'}</h3>
+                    <h3 className="text-lg font-semibold">{isEn ? 'Check failed' : 'Kiểm tra lỗi'}</h3>
                     <p className="text-sm text-muted-foreground">{updateInfo.error}</p>
                   </div>
                 </div>
                 <Button variant="outline" className="w-full" onClick={checkForUpdates}>
-                  {isEn ? 'Retry' : 'Thu lai'}
+                  {isEn ? 'Retry' : 'Thử lại'}
                 </Button>
               </div>
             ) : (
@@ -299,9 +299,9 @@ export function AboutPage() {
                     <CheckCircle className="h-6 w-6 text-success" />
                   </div>
                   <div>
-                    <h3 className="text-lg font-semibold">{isEn ? 'Up to date' : 'Dang la ban moi nhat'}</h3>
+                    <h3 className="text-lg font-semibold">{isEn ? 'Up to date' : 'Đang là bản mới nhất'}</h3>
                     <p className="text-sm text-muted-foreground">
-                      {isEn ? `Version ${updateInfo.currentVersion}` : `Phien ban ${updateInfo.currentVersion}`}
+                      {isEn ? `Version ${updateInfo.currentVersion}` : `Phiên bản ${updateInfo.currentVersion}`}
                     </p>
                   </div>
                 </div>
@@ -339,19 +339,19 @@ export function AboutPage() {
               <div className="rounded-lg bg-primary/10 p-2">
                 <Sparkles className="h-4 w-4 text-primary" />
               </div>
-              {isEn ? 'What Krouter is for' : 'Krouter dung de lam gi'}
+              {isEn ? 'What Krouter is for' : 'Krouter dùng để làm gì'}
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-3 text-sm leading-relaxed text-muted-foreground">
             <p>
               {isEn
                 ? 'Krouter is the control plane for a Kiro-based AI coding setup: it keeps account state visible, exposes one compatible API endpoint, and routes each request to a usable account.'
-                : 'Krouter la control plane cho workflow AI coding dung Kiro: hien thi trang thai tai khoan, mo mot API endpoint tuong thich va dieu huong moi request den tai khoan dang dung duoc.'}
+                : 'Krouter là control plane cho workflow AI coding dùng Kiro: hiển thị trạng thái tài khoản, mở một API endpoint tương thích và điều hướng mỗi request đến tài khoản đang dùng được.'}
             </p>
             <p>
               {isEn
                 ? 'The web dashboard handles operations. The backend service and CLI keep proxy, tunnel, API keys, and client imports running outside the browser.'
-                : 'Dashboard web xu ly thao tac quan ly. Backend service va CLI giu API proxy, tunnel, API key va import client chay doc lap voi trinh duyet.'}
+                : 'Dashboard web xử lý thao tác quản lý. Backend service và CLI giữ API proxy, tunnel, API key và import client chạy độc lập với trình duyệt.'}
             </p>
           </CardContent>
         </Card>
@@ -362,7 +362,7 @@ export function AboutPage() {
               <div className="rounded-lg bg-primary/10 p-2">
                 <TerminalSquare className="h-4 w-4 text-primary" />
               </div>
-              {isEn ? 'Runtime commands' : 'Lenh runtime'}
+              {isEn ? 'Runtime commands' : 'Lệnh runtime'}
             </CardTitle>
           </CardHeader>
           <CardContent>

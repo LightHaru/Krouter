@@ -29,21 +29,71 @@ import type {
 } from './types'
 import { buildKiroPayload, mapModelId } from './kiroApi'
 import { ToolNameRegistry } from './toolNameRegistry'
+import { kiroProxyModelSupportsThinking } from './modelCatalog'
 
 const KIRO_CACHE_POINT: KiroCachePoint = { type: 'default' }
 
 // 判断模型是否支持 additionalModelRequestFields.thinking 参数
 // 只有 Claude 4+ 系列模型支持，非 Claude 模型（deepseek/minimax/glm/qwen 等）不支持
 function modelSupportsThinkingParam(modelId: string): boolean {
-  const lower = modelId.toLowerCase()
+  return kiroProxyModelSupportsThinking(modelId)
   // 必须是 claude 模型
-  if (!lower.includes('claude')) return false
   // claude-3.x 不支持 thinking
-  if (lower.includes('claude-3-') || lower.includes('claude-3.')) return false
   // auto 模型由后端决定，保守不传
-  if (lower === 'auto') return false
   // claude-sonnet-4、claude-opus-4、claude-haiku-4.5 等都支持
-  return true
+}
+
+type ClientThinkingConfig = NonNullable<OpenAIChatRequest['thinking'] | ClaudeRequest['thinking']>
+
+function normalizeThinkingEffort(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const effort = value.trim().toLowerCase().replace(/_/g, '-')
+  if (!effort || !/^[a-z0-9-]+$/u.test(effort)) return undefined
+  return effort
+}
+
+function normalizeThinkingBudget(value: unknown): number | undefined {
+  const numeric = typeof value === 'number'
+    ? value
+    : typeof value === 'string'
+      ? Number(value)
+      : NaN
+  if (!Number.isFinite(numeric) || numeric <= 0) return undefined
+  return Math.floor(numeric)
+}
+
+function buildKiroThinkingFields(
+  modelId: string,
+  thinking?: ClientThinkingConfig,
+  effort?: unknown,
+  taskBudget?: { type?: string; total?: number; remaining?: number }
+): Record<string, unknown> | undefined {
+  if (thinking?.type === 'disabled') return undefined
+
+  const normalizedEffort = normalizeThinkingEffort(effort)
+  const budgetTokens = normalizeThinkingBudget((thinking as { budget_tokens?: unknown } | undefined)?.budget_tokens)
+    ?? normalizeThinkingBudget(taskBudget?.total)
+  const hasThinkingRequest = !!thinking || !!normalizedEffort || !!budgetTokens
+  if (!hasThinkingRequest || !modelSupportsThinkingParam(modelId) || !kiroProxyModelSupportsThinking(modelId)) return undefined
+
+  const fields: Record<string, unknown> = { thinking: { type: 'adaptive' } }
+  const outputConfig: Record<string, unknown> = {}
+  if (normalizedEffort) outputConfig.effort = normalizedEffort
+  if (budgetTokens) {
+    const normalizedRemaining = normalizeThinkingBudget(taskBudget?.remaining)
+    outputConfig.task_budget = {
+      type: 'tokens',
+      total: budgetTokens,
+      ...(normalizedRemaining ? { remaining: normalizedRemaining } : {})
+    }
+  }
+  if (Object.keys(outputConfig).length > 0) fields.output_config = outputConfig
+  return fields
+}
+
+function extractResponsesReasoningEffort(reasoning: unknown): string | undefined {
+  if (!reasoning || typeof reasoning !== 'object') return undefined
+  return normalizeThinkingEffort((reasoning as { effort?: unknown }).effort)
 }
 
 function toKiroCachePoint(cacheControl?: { type: string }): KiroCachePoint | undefined {
@@ -147,6 +197,8 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
   if (request.previous_response_id !== undefined) chatRequest.conversation_id = request.previous_response_id
   if (request.metadata !== undefined) chatRequest.metadata = request.metadata
   if (request.kiro_context !== undefined) chatRequest.kiro_context = request.kiro_context
+  const reasoningEffort = extractResponsesReasoningEffort(request.reasoning)
+  if (reasoningEffort !== undefined) chatRequest.reasoning_effort = reasoningEffort
   return chatRequest
 }
 
@@ -460,10 +512,11 @@ export function openaiToKiro(
 
   // OpenAI 兼容请求的 thinking 映射到 Kiro additionalModelRequestFields
   // 仅对支持 thinking 的模型传递（Claude 4+ 系列）
-  let additionalModelRequestFields: Record<string, unknown> | undefined
-  if (request.thinking && request.thinking.type !== 'disabled' && modelSupportsThinkingParam(modelId)) {
-    additionalModelRequestFields = { thinking: { type: 'adaptive' } }
-  }
+  const additionalModelRequestFields = buildKiroThinkingFields(
+    modelId,
+    request.thinking,
+    request.reasoning_effort
+  )
 
   return buildKiroPayload(
     finalContent,
@@ -937,10 +990,12 @@ export function claudeToKiro(
   // 将 Claude thinking 参数映射为 Kiro additionalModelRequestFields
   // 仅对支持 thinking 的模型传递（Claude 4+ 系列）
   // 非 Claude 模型（deepseek/minimax/glm 等）的 schema 没有 thinking 属性，传了会 400
-  let additionalModelRequestFields: Record<string, unknown> | undefined
-  if (request.thinking && request.thinking.type !== 'disabled' && modelSupportsThinkingParam(modelId)) {
-    additionalModelRequestFields = { thinking: { type: 'adaptive' } }
-  }
+  const additionalModelRequestFields = buildKiroThinkingFields(
+    modelId,
+    request.thinking,
+    request.output_config?.effort,
+    request.output_config?.task_budget
+  )
 
   return buildKiroPayload(
     finalContent,

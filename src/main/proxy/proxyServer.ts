@@ -37,7 +37,12 @@ import {
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
 import { getRuntimeUserDataPath } from '../runtimePaths'
-import { KIRO_PROXY_MODEL_PRESETS, normalizeKiroModelIdForCompare } from './modelCatalog'
+import {
+  KIRO_PROXY_DEFAULT_THINKING_EFFORTS,
+  KIRO_PROXY_MODEL_PRESETS,
+  kiroProxyModelSupportsThinking,
+  normalizeKiroModelIdForCompare
+} from './modelCatalog'
 
 type ProxyAttemptError = Error & {
   proxyAccountId?: string
@@ -173,6 +178,18 @@ function extractThinkingEfforts(schema?: Record<string, unknown> | null): string
   return undefined
 }
 
+function modelSchemaSupportsThinking(schema?: Record<string, unknown> | null): boolean {
+  return !!(schema?.properties as Record<string, unknown> | undefined)?.thinking
+}
+
+function clientModelSupportsThinking(id: string, schema?: Record<string, unknown> | null): boolean {
+  return modelSchemaSupportsThinking(schema) || kiroProxyModelSupportsThinking(id)
+}
+
+function clientModelThinkingEfforts(id: string, schema?: Record<string, unknown> | null): string[] | undefined {
+  return extractThinkingEfforts(schema) || (clientModelSupportsThinking(id, schema) ? KIRO_PROXY_DEFAULT_THINKING_EFFORTS : undefined)
+}
+
 function buildClientModel(input: {
   id: string
   created: number
@@ -193,8 +210,9 @@ function buildClientModel(input: {
   const outputModalities: ModelModality[] = ['text']
   const output = modelOutputLimit(input.id, input.maxOutputTokens)
   const context = typeof input.maxInputTokens === 'number' && input.maxInputTokens > 0 ? input.maxInputTokens : 200000
-  const reasoning = false
-  const interleaved = false
+  const supportsThinking = clientModelSupportsThinking(input.id, input.additionalModelRequestFieldsSchema)
+  const reasoning = supportsThinking
+  const interleaved: ClientModel['interleaved'] = supportsThinking ? { field: 'reasoning_content' } : false
 
   return {
     id: input.id,
@@ -234,8 +252,8 @@ function buildClientModel(input: {
     inputTypes: input.supportedInputTypes,
     rateMultiplier: input.rateMultiplier,
     rateUnit: input.rateUnit,
-    supportsThinking: !!(input.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.thinking,
-    thinkingEfforts: extractThinkingEfforts(input.additionalModelRequestFieldsSchema),
+    supportsThinking,
+    thinkingEfforts: clientModelThinkingEfforts(input.id, input.additionalModelRequestFieldsSchema),
     supportsPromptCaching: input.promptCaching?.supportsPromptCaching || false,
     modelProvider: input.modelProvider || undefined,
     permission: [],
@@ -292,6 +310,9 @@ export interface NoAccountDiagnosis {
   cooldown: number
 }
 
+const MIN_PROXY_RETRY_DELAY_MS = 5_000
+const MAX_PROXY_RETRY_DELAY_MS = 10_000
+
 export class ProxyServer {
   private server: http.Server | https.Server | null = null
   private fallbackServer: http.Server | null = null  // HTTPS 启用时同时监听 HTTP（可选）
@@ -315,7 +336,7 @@ export class ProxyServer {
   private modelPaceReadyAt: Map<string, number> = new Map()
   private readonly MODEL_CAPABILITY_CACHE_TTL = 5 * 60 * 1000
   private readonly OPUS_MODEL_PACE_MS = 10 * 1000
-  private readonly MAX_COMPATIBLE_COOLDOWN_WAIT_MS = 65 * 1000
+  private readonly MAX_COMPATIBLE_COOLDOWN_WAIT_MS = MAX_PROXY_RETRY_DELAY_MS
   /** P2-17 审计日志（最近 200 条） */
   private auditLog: Array<{ ts: number; type: string; data: Record<string, unknown> }> = []
   /** Webhook 触发回调（由外部注入，避免 main → renderer 循环依赖） */
@@ -375,7 +396,7 @@ export class ProxyServer {
       logRequests: true,
       maxConcurrent: 10,
       maxRetries: 3,
-      retryDelayMs: 1000,
+      retryDelayMs: MIN_PROXY_RETRY_DELAY_MS,
       tokenRefreshBeforeExpiry: 300, // 5分钟提前刷新
       autoStart: false, // 是否自动启动
       clientDrivenToolExecution: true,
@@ -690,6 +711,11 @@ export class ProxyServer {
     if (this.config.enableMultiAccount && strategy !== 'sticky') {
       this.config.sessionAffinityEnabled = false
     }
+
+    const retryDelay = Number(this.config.retryDelayMs)
+    this.config.retryDelayMs = Number.isFinite(retryDelay)
+      ? Math.min(MAX_PROXY_RETRY_DELAY_MS, Math.max(MIN_PROXY_RETRY_DELAY_MS, retryDelay))
+      : MIN_PROXY_RETRY_DELAY_MS
   }
 
   private isSessionAffinityActive(): boolean {
@@ -1132,8 +1158,8 @@ export class ProxyServer {
       maxOutputTokens: m.tokenLimits?.maxOutputTokens,
       rateMultiplier: m.rateMultiplier,
       rateUnit: m.rateUnit,
-      supportsThinking: !!(m.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.thinking,
-      thinkingEfforts: extractThinkingEfforts(m.additionalModelRequestFieldsSchema),
+      supportsThinking: clientModelSupportsThinking(m.modelId, m.additionalModelRequestFieldsSchema),
+      thinkingEfforts: clientModelThinkingEfforts(m.modelId, m.additionalModelRequestFieldsSchema),
       supportsPromptCaching: m.promptCaching?.supportsPromptCaching || false,
       modelProvider: m.modelProvider || undefined
     }
@@ -1615,7 +1641,7 @@ export class ProxyServer {
   ): Promise<{ result: T; account: ProxyAccount }> {
     const configuredRetries = Math.max(0, this.config.maxRetries ?? 3)
     const maxAttempts = Math.min(100, Math.max(configuredRetries + 1, this.accountPool.size))
-    const retryDelay = this.config.retryDelayMs || 1000
+    const retryDelay = this.config.retryDelayMs || MIN_PROXY_RETRY_DELAY_MS
     let lastError: Error | null = null
     let currentAccount = account
     // 本次请求累计已尝试的账号 ID，避免重试时循环命中已经失败过的账号
@@ -1705,7 +1731,7 @@ export class ProxyServer {
             const cooldownWaitMs = cooledAccount.cooldownUntil && cooledAccount.cooldownUntil > Date.now()
               ? cooledAccount.cooldownUntil - Date.now()
               : retryDelay * (attempt + 1)
-            const waitMs = Math.min(this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS, Math.max(1000, cooldownWaitMs + 100))
+            const waitMs = Math.min(this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS, Math.max(MIN_PROXY_RETRY_DELAY_MS, cooldownWaitMs + 100))
             proxyLogger.info('ProxyServer', `No alternate ${modelId || 'model'} account after throttle; waiting ${waitMs}ms before retrying ${cooledAccount.email || cooledAccount.id.slice(0, 8)}`)
             await this.waitForRetry(waitMs, signal)
             currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
@@ -1919,8 +1945,8 @@ export class ProxyServer {
           const cooledAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
           const cooldownWaitMs = cooledAccount.cooldownUntil && cooledAccount.cooldownUntil > Date.now()
             ? cooledAccount.cooldownUntil - Date.now()
-            : (this.config.retryDelayMs || 1000) * (attempt + 1)
-          const waitMs = Math.min(this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS, Math.max(1000, cooldownWaitMs + 100))
+            : (this.config.retryDelayMs || MIN_PROXY_RETRY_DELAY_MS) * (attempt + 1)
+          const waitMs = Math.min(this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS, Math.max(MIN_PROXY_RETRY_DELAY_MS, cooldownWaitMs + 100))
           proxyLogger.info('ProxyServer', `No alternate streaming ${modelId || 'model'} account after throttle; waiting ${waitMs}ms before retrying ${cooledAccount.email || cooledAccount.id.slice(0, 8)}`)
           await this.waitForRetry(waitMs, signal)
           currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount

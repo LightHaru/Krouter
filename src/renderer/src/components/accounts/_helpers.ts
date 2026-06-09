@@ -171,8 +171,16 @@ export function isBannedError(error: string | undefined): boolean {
     lower.includes('accountsuspendedexception') ||
     lower.includes('account suspended') ||
     lower.includes('temporarily_suspended') ||
+    lower.includes('permanently_suspended') ||
     lower.includes('temporarily suspended') ||
+    lower.includes('permanently suspended') ||
     (lower.includes('user id is') && lower.includes('suspended')) ||
+    lower.includes('user id is temporarily suspended') ||
+    lower.includes('account is locked') ||
+    lower.includes('locked it as a security precaution') ||
+    lower.includes('security precaution') ||
+    lower.includes('unusual user activity') ||
+    lower.includes('restricted your ability to use kiro') ||
     lower.includes('账户已封禁') ||
     lower.includes('已封禁') ||
     /\b423\b/.test(lower)

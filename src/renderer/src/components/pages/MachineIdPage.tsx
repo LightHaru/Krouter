@@ -214,17 +214,17 @@ export function MachineIdPage() {
   const boundAccountCount = Object.keys(accountMachineIds).length
 
   return (
-    <div className="flex-1 p-6 space-y-6 overflow-auto">
+    <div className="flex-1 space-y-4 overflow-auto p-4 md:space-y-6 md:p-6">
       {/* Hero Header */}
       <div className="page-hero">
         <div className="absolute inset-0 bg-grid-white/5" />
         <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-br from-primary/20 to-transparent rounded-full blur-3xl -translate-y-1/2 translate-x-1/2" />
         <div className="absolute bottom-0 left-0 w-48 h-48 bg-gradient-to-tr from-primary/20 to-transparent rounded-full blur-3xl translate-y-1/2 -translate-x-1/2" />
         
-        <div className="relative p-6">
-          <div className="flex items-start justify-between">
-            <div className="flex items-center gap-4">
-              <div className="p-4 rounded-2xl bg-gradient-to-br from-primary to-primary/80 shadow-lg shadow-primary/25">
+        <div className="relative p-4 md:p-6">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="flex min-w-0 items-center gap-3 md:gap-4">
+              <div className="rounded-2xl bg-gradient-to-br from-primary to-primary/80 p-3 shadow-lg shadow-primary/25 md:p-4">
                 <Fingerprint className="h-8 w-8 text-white" />
               </div>
               <div>
@@ -243,31 +243,31 @@ export function MachineIdPage() {
           </div>
 
           {/* 统计卡片 */}
-          <div className="grid grid-cols-3 gap-4 mt-6">
+          <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-3 md:gap-4">
             <div className="p-4 rounded-xl bg-background/60 backdrop-blur-sm border border-white/10">
-              <div className="flex items-center gap-3">
+              <div className="flex min-w-0 items-center gap-3">
                 <div className="p-2 rounded-lg bg-primary/10">
                   <Fingerprint className="h-4 w-4 text-primary" />
                 </div>
-                <div>
-                  <p className="text-2xl font-bold">{machineIdHistory.length}</p>
+                <div className="min-w-0">
+                  <p className="text-xl font-bold md:text-2xl">{machineIdHistory.length}</p>
                   <p className="text-xs text-muted-foreground">{isEn ? 'History' : '变更记录'}</p>
                 </div>
               </div>
             </div>
             <div className="p-4 rounded-xl bg-background/60 backdrop-blur-sm border border-white/10">
-              <div className="flex items-center gap-3">
+              <div className="flex min-w-0 items-center gap-3">
                 <div className="p-2 rounded-lg bg-primary/10">
                   <Link2 className="h-4 w-4 text-primary" />
                 </div>
-                <div>
-                  <p className="text-2xl font-bold">{boundAccountCount}</p>
+                <div className="min-w-0">
+                  <p className="text-xl font-bold md:text-2xl">{boundAccountCount}</p>
                   <p className="text-xs text-muted-foreground">{isEn ? 'Bound Accounts' : '已绑定账户'}</p>
                 </div>
               </div>
             </div>
             <div className="p-4 rounded-xl bg-background/60 backdrop-blur-sm border border-white/10">
-              <div className="flex items-center gap-3">
+              <div className="flex min-w-0 items-center gap-3">
                 <div className="p-2 rounded-lg bg-primary/10">
                   <Shield className="h-4 w-4 text-primary" />
                 </div>
