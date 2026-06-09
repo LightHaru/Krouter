@@ -1344,7 +1344,7 @@ export async function callKiroApiStream(
       }
 
       if (response.status === 429) {
-        const retryDelayMs = parseRetryAfterMs(response.headers) ?? 2500
+        const retryDelayMs = parseRetryAfterMs(response.headers) ?? 5000
         const firstBody = await response.text().catch(() => '')
         console.log(`[KiroAPI] Endpoint ${endpoint.name} rate limited, retrying once after ${retryDelayMs}ms...`)
         await waitForRetry(retryDelayMs, signal)

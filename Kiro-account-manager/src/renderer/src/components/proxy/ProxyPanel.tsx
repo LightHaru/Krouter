@@ -1126,7 +1126,7 @@ export function ProxyPanel() {
               <Settings2 className="h-3.5 w-3.5" />
               {isEn ? 'Advanced Settings' : 'Cài đặt nâng cao'}
             </h4>
-            <div className="grid grid-cols-3 gap-x-3 gap-y-3 items-start overflow-visible">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-3 gap-y-3 items-start overflow-visible">
               <div className="space-y-1.5 relative z-20">
                 <Label htmlFor="preferredEndpoint" className="text-xs">{isEn ? 'Preferred Endpoint' : 'Endpoint ưu tiên'}</Label>
                 <Select
@@ -1262,7 +1262,7 @@ export function ProxyPanel() {
 
       {/* 统计卡片 */}
       {isRunning && (
-        <div className="grid grid-cols-6 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           <Card className="hover-lift bg-gradient-to-br from-blue-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
@@ -1350,7 +1350,7 @@ export function ProxyPanel() {
 
       {/* 第二行统计卡片 - Token 分解和 Cache */}
       {isRunning && stats && (
-        <div className="grid grid-cols-6 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           <Card className="hover-lift bg-gradient-to-br from-indigo-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
@@ -1436,7 +1436,7 @@ export function ProxyPanel() {
             {isEn ? 'API Endpoints' : 'Endpoint API'}
           </CardTitle>
         </CardHeader>
-        <CardContent className="space-y-1.5 text-sm">
+        <CardContent className="proxy-endpoint-list space-y-1.5 text-sm">
           <div className="flex items-center gap-2">
             <span className="text-orange-500 w-11 flex-shrink-0 font-mono">POST</span>
             <code className="text-muted-foreground flex-1 font-mono">/v1/chat/completions</code>
@@ -1681,7 +1681,7 @@ export function ProxyPanel() {
       {showApiKeyManager && createPortal(
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div className="absolute inset-0 bg-black/50" onClick={() => setShowApiKeyManager(false)} />
-          <div className="relative bg-background rounded-lg shadow-lg w-[800px] max-h-[80vh] overflow-y-auto p-4">
+          <div className="relative bg-background rounded-lg shadow-lg w-[800px] max-w-[95vw] max-h-[80vh] overflow-y-auto p-4">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold">{isEn ? 'API Key Management' : 'Quản lý API Key'}</h2>
               <Button variant="ghost" size="icon" onClick={() => setShowApiKeyManager(false)}>✕</Button>

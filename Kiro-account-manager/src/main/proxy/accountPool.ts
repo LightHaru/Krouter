@@ -56,8 +56,8 @@ export interface AccountPoolConfig {
 
 const DEFAULT_CONFIG: AccountPoolConfig = {
   baseCooldownMs: 60000,        // 60s 基础冷却
-  throttleCooldownMs: 60000,
-  maxThrottleCooldownMs: 15 * 60_000,
+  throttleCooldownMs: 5000,
+  maxThrottleCooldownMs: 10_000,
   maxBackoffMultiplier: 1440,   // 最大 1440 倍 = 24h
   quotaResetMs: 3600000,        // 1h 配额重置
   probabilisticRetryChance: 0.1 // 10% 概率重试

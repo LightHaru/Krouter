@@ -29,12 +29,104 @@ function steeringFilePath(filename: string): string {
   return path.join(steeringDir(), safeName)
 }
 
+function stripJsoncComments(content: string): string {
+  let output = ''
+  let inString = false
+  let escaped = false
+  let inLineComment = false
+  let inBlockComment = false
+
+  for (let index = 0; index < content.length; index++) {
+    const char = content[index]
+    const next = content[index + 1]
+
+    if (inLineComment) {
+      if (char === '\n' || char === '\r') {
+        inLineComment = false
+        output += char
+      }
+      continue
+    }
+
+    if (inBlockComment) {
+      if (char === '*' && next === '/') {
+        inBlockComment = false
+        index++
+      } else if (char === '\n' || char === '\r') {
+        output += char
+      }
+      continue
+    }
+
+    if (inString) {
+      output += char
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+      output += char
+    } else if (char === '/' && next === '/') {
+      inLineComment = true
+      index++
+    } else if (char === '/' && next === '*') {
+      inBlockComment = true
+      index++
+    } else {
+      output += char
+    }
+  }
+
+  return output
+}
+
+function stripTrailingCommas(content: string): string {
+  let output = ''
+  let inString = false
+  let escaped = false
+
+  for (let index = 0; index < content.length; index++) {
+    const char = content[index]
+
+    if (inString) {
+      output += char
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+      output += char
+      continue
+    }
+
+    if (char === ',') {
+      let lookahead = index + 1
+      while (/\s/.test(content[lookahead] || '')) lookahead++
+      if (content[lookahead] === '}' || content[lookahead] === ']') continue
+    }
+
+    output += char
+  }
+
+  return output
+}
+
 function parseJsonc(content: string): Record<string, unknown> {
-  const cleaned = content
-    .replace(/\/\/.*$/gm, '')
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/,(\s*[}\]])/g, '$1')
-  return JSON.parse(cleaned)
+  return JSON.parse(stripTrailingCommas(stripJsoncComments(content)))
 }
 
 async function readJsonFile(filePath: string, fallback: Record<string, unknown>): Promise<Record<string, unknown>> {

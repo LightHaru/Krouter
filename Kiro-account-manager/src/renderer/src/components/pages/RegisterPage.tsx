@@ -33,11 +33,14 @@ interface ErrorDiagnosis {
  */
 function diagnoseRegError(err: string | undefined): ErrorDiagnosis {
   const e = (err || '').toLowerCase()
+  const isTesBlocked = e.includes('"errorcode":"blocked"')
+    || e.includes('request was blocked by tes')
+    || (e.includes('blocked') && e.includes('tes'))
   if (!e) {
     return { category: 'unknown', title: 'Lỗi không xác định', reasons: ['Không nhận được thông tin lỗi cụ thể'], suggestions: ['Xem nhật ký đầy đủ'] }
   }
   // AWS 风控
-  if (e.includes('aws-risk-control') || e.includes('风控') || e.includes('请稍后再试') || e.includes('try again later')) {
+  if (isTesBlocked || e.includes('aws-risk-control') || e.includes('风控') || e.includes('请稍后再试') || e.includes('try again later')) {
     return {
       category: 'risk_control',
       title: 'AWS đã chặn yêu cầu',

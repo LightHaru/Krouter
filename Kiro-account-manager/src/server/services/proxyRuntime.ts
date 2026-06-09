@@ -63,7 +63,7 @@ function defaultProxyConfig(saved?: Partial<ProxyConfig>): ProxyConfig {
     logRequests: true,
     maxConcurrent: 10,
     maxRetries: 3,
-    retryDelayMs: 1000,
+    retryDelayMs: 5000,
     tokenRefreshBeforeExpiry: 300,
     clientDrivenToolExecution: true,
     accountSelectionStrategy: 'smart',

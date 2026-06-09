@@ -109,7 +109,7 @@ export function ApiKeyUsageDialog({ open, onOpenChange, apiKey }: ApiKeyUsageDia
           </div>
           
           {/* 总计统计 */}
-          <div className="grid grid-cols-4 gap-4 mt-4">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
             <div className="bg-primary/10 rounded-lg p-3">
               <div className="text-xs text-muted-foreground mb-1">{isEn ? 'Total Requests' : '总请求数'}</div>
               <div className="text-xl font-bold text-primary">{apiKey.usage.totalRequests.toLocaleString()}</div>
@@ -214,7 +214,7 @@ export function ApiKeyUsageDialog({ open, onOpenChange, apiKey }: ApiKeyUsageDia
                         style={{ width: `${(stat.requests / maxModelRequests) * 100}%` }}
                       />
                     </div>
-                    <div className="grid grid-cols-3 gap-4 text-sm">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
                       <div>
                         <span className="text-muted-foreground">{isEn ? 'Credits' : 'Credits'}:</span>
                         <span className="ml-2 font-mono">{stat.credits.toFixed(4)}</span>

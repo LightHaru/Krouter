@@ -585,7 +585,7 @@ export function KProxyPanel() {
             </div>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-4 gap-4 text-center">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
               <div>
                 <div className="text-2xl font-bold">{stats.totalRequests}</div>
                 <div className="text-xs text-muted-foreground">{isEn ? 'Total' : '总请求'}</div>
