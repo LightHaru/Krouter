@@ -1057,7 +1057,9 @@ await test('batch', 'TES/BLOCKED SendOTP error stops batch without retrying or l
     assert.ok(state.cancelCalls >= 1)
     assert.ok(await page.getByText(viBatch.failed(1), { exact: true }).isVisible())
     assert.ok(await page.getByText(viBatch.progress(1, 4), { exact: true }).isVisible())
-    return { registrationStartAutoCalls: state.calls, cancelCalls: state.cancelCalls }
+    await page.getByText('AWS/Kiro da chan yeu cau dang ky').waitFor({ timeout: 10000 })
+    await page.getByText('Request was blocked by TES').first().waitFor({ timeout: 10000 })
+    return { registrationStartAutoCalls: state.calls, cancelCalls: state.cancelCalls, diagnosisVisible: true }
   } finally {
     await context.close()
     await browser.close()
@@ -1244,6 +1246,100 @@ await test('batch', 'controlled proxy pool is passed to auto registration', asyn
     assert.equal(state.registrationConfig?.useTingamefiMail, true)
     assert.match(String(state.registrationConfig?.proxy || ''), /^http:\/\/user-[A-Za-z0-9]{8}:pass@proxy\.example\.invalid:18080$/)
     assert.doesNotMatch(String(state.registrationConfig?.proxy || ''), /\{session\}/)
+    return {
+      strictProxy: state.registrationConfig.strictProxy,
+      proxy: String(state.registrationConfig.proxy).replace(/:([^:@/]+)@/, ':***@')
+    }
+  } finally {
+    await context.close()
+    await browser.close()
+    await ipc('saveAccounts', [originalData]).catch(() => undefined)
+    accountData = undefined
+  }
+})
+
+await test('batch', 'client proxy source is passed to auto registration in strict mode', async () => {
+  const originalData = JSON.parse(JSON.stringify(await ipc('loadAccounts')))
+  const seededData = JSON.parse(JSON.stringify(originalData))
+  seededData.proxyPool = {}
+  seededData.proxyPoolConfig = { ...(seededData.proxyPoolConfig || {}), enabled: false }
+  seededData.proxyPoolCursor = 0
+  seededData.autoRefreshEnabled = false
+  seededData.autoRefreshSyncInfo = false
+  await ipc('saveAccounts', [seededData])
+
+  const clientProxyUrl = 'http://client-{session}:pass@127.0.0.1:19090'
+  const clientUpstream = 'http://upstream.example.invalid:18080'
+  const browser = await chromium.launch({ headless: true })
+  const context = await browser.newContext({ viewport: { width: 1440, height: 1100 } })
+  await context.addInitScript(({ clientProxyUrl, clientUpstream }) => {
+    localStorage.setItem('kiro-register-config', JSON.stringify({
+      mode: 'tingamefi',
+      networkSource: 'client-proxy',
+      clientProxyUrl,
+      clientProxyUpstream: clientUpstream,
+      batchCount: 1,
+      batchInterval: 0,
+      batchAutoImport: false,
+      batchRetries: 0,
+      batchConcurrency: 1,
+      autoFetchProLink: false,
+      tingamefiMailApiUrl: 'https://mail.invalid',
+      tingamefiMailAdminPassword: 'client-route-test',
+      tingamefiMailDomain: 'example.invalid'
+    }))
+    localStorage.setItem('kiro-register-ratelimit-enabled', '0')
+    localStorage.setItem('kiro-register-dailyquota-limit', '0')
+  }, { clientProxyUrl, clientUpstream })
+  const page = await context.newPage()
+  const state = { calls: 0, registrationConfig: null, validatedProxy: null, validatedUpstream: null }
+  await page.route('**/api/ipc', async (route) => {
+    const body = route.request().postDataJSON?.()
+    if (body?.method === 'proxyPoolValidate') {
+      state.validatedProxy = body.args?.[0]?.url || null
+      state.validatedUpstream = body.args?.[0]?.upstreamProxy || null
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, latencyMs: 12, externalIp: '198.51.100.77', route: 'client-proxy' })
+      })
+      return
+    }
+    if (body?.method === 'networkRouteValidate') {
+      throw new Error('client proxy mode must not use direct network validation')
+    }
+    if (body?.method !== 'registrationStartAuto') {
+      await route.continue()
+      return
+    }
+    state.calls++
+    state.registrationConfig = body.args?.[0] || null
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        success: true,
+        result: {
+          status: 'success',
+          email: 'client-proxy-auto@example.invalid',
+          password: 'controlled'
+        }
+      })
+    })
+  })
+
+  try {
+    await loginUi(page)
+    await page.locator('nav button').nth(7).click()
+    await page.getByText(viBatch.title, { exact: true }).waitFor()
+    await clickBatchStart(page)
+    await page.getByText(viBatch.progress(1, 1), { exact: true }).waitFor({ timeout: 10000 })
+    assert.equal(state.calls, 1)
+    assert.equal(state.registrationConfig?.strictProxy, true)
+    assert.equal(state.registrationConfig?.upstreamProxy, clientUpstream)
+    assert.match(String(state.registrationConfig?.proxy || ''), /^http:\/\/client-[A-Za-z0-9]{8}:pass@127\.0\.0\.1:19090$/)
+    assert.equal(state.validatedUpstream, clientUpstream)
+    assert.match(String(state.validatedProxy || ''), /^http:\/\/client-[A-Za-z0-9]{8}:pass@127\.0\.0\.1:19090$/)
     return {
       strictProxy: state.registrationConfig.strictProxy,
       proxy: String(state.registrationConfig.proxy).replace(/:([^:@/]+)@/, ':***@')

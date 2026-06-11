@@ -11,6 +11,7 @@ interface LogEntry {
   inputTokens?: number
   outputTokens?: number
   cacheReadTokens?: number
+  cacheWriteTokens?: number
   reasoningTokens?: number
   credits?: number
   responseTime?: number
@@ -45,9 +46,22 @@ export function ProxyLogsDialog({
   if (!open) return null
 
   const handleExport = () => {
-    const content = logs.map(log => 
-      `${log.time}\t${log.path}\t${log.status}${log.credits ? `\t${log.credits.toFixed(6)} credits` : ''}`
-    ).join('\n')
+    const header = 'time\tpath\tmodel\tstatus\tinput\toutput\tcache_read\tcache_write\treasoning\tcredits\tresponse_ms\terror'
+    const rows = logs.map(log => [
+      log.time,
+      log.path,
+      log.model || '',
+      log.status,
+      log.inputTokens || 0,
+      log.outputTokens || 0,
+      log.cacheReadTokens || 0,
+      log.cacheWriteTokens || 0,
+      log.reasoningTokens || 0,
+      log.credits ? log.credits.toFixed(6) : '',
+      log.responseTime || '',
+      log.error || ''
+    ].join('\t'))
+    const content = [header, ...rows].join('\n')
     const blob = new Blob([content], { type: 'text/plain' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -65,7 +79,7 @@ export function ProxyLogsDialog({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/50" onClick={() => onOpenChange(false)} />
-      <Card className="relative w-[900px] max-h-[80vh] shadow-2xl border-0 overflow-hidden animate-in fade-in zoom-in-95 duration-200 glass-card-strong">
+      <Card className="relative w-[1040px] max-w-[96vw] max-h-[80vh] shadow-2xl border-0 overflow-hidden animate-in fade-in zoom-in-95 duration-200 glass-card-strong">
         <CardHeader className="pb-3 border-b sticky top-0 z-10">
           <div className="flex items-center justify-between">
             <CardTitle className="text-lg">{isEn ? 'Request Logs' : '请求日志'}</CardTitle>
@@ -125,7 +139,8 @@ export function ProxyLogsDialog({
                     <th className="text-center p-2 font-medium">{isEn ? 'Status' : '状态'}</th>
                     <th className="text-center p-2 font-medium">{isEn ? 'In' : '输入'}</th>
                     <th className="text-center p-2 font-medium">{isEn ? 'Out' : '输出'}</th>
-                    <th className="text-center p-2 font-medium">Cache</th>
+                    <th className="text-center p-2 font-medium">Cache R/W</th>
+                    <th className="text-center p-2 font-medium">{isEn ? 'Think' : 'Suy luận'}</th>
                     <th className="text-right p-2 font-medium">Credits</th>
                     <th className="text-right p-2 font-medium">{isEn ? 'Time' : '耗时'}</th>
                   </tr>
@@ -167,7 +182,8 @@ export function ProxyLogsDialog({
                       </td>
                       <td className="p-2 text-center text-muted-foreground">{log.inputTokens ? log.inputTokens.toLocaleString() : '-'}</td>
                       <td className="p-2 text-center text-muted-foreground">{log.outputTokens ? log.outputTokens.toLocaleString() : '-'}</td>
-                      <td className="p-2 text-center text-success">{log.cacheReadTokens ? log.cacheReadTokens.toLocaleString() : '-'}</td>
+                      <td className="p-2 text-center text-success">{log.cacheReadTokens || log.cacheWriteTokens ? `${(log.cacheReadTokens || 0).toLocaleString()}/${(log.cacheWriteTokens || 0).toLocaleString()}` : '-'}</td>
+                      <td className="p-2 text-center text-violet-500">{log.reasoningTokens ? log.reasoningTokens.toLocaleString() : '-'}</td>
                       <td className="p-2 text-right text-muted-foreground">{log.credits ? log.credits.toFixed(6) : '-'}</td>
                       <td className="p-2 text-right text-muted-foreground">{log.responseTime ? `${(log.responseTime / 1000).toFixed(1)}s` : '-'}</td>
                     </tr>

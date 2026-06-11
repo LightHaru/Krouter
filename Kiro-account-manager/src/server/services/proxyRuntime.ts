@@ -1,5 +1,5 @@
 import crypto from 'crypto'
-import { ProxyServer } from '../../main/proxy/proxyServer'
+import { ProxyServer, type ProxyUsageStatsUpdate } from '../../main/proxy/proxyServer'
 import { configureProxyClients, type ProxyClientModel, type ProxyClientTarget } from '../../main/proxy/clientConfig'
 import { interceptConsole, proxyLogStore } from '../../main/proxy/logger'
 import { getRuntimeUserDataPath } from '../../main/runtimePaths'
@@ -206,6 +206,33 @@ export class ProxyRuntime {
     return Boolean(config.autoStart || config.enabled || lastRunning)
   }
 
+  private restorePersistedStats(server: ProxyServer): void {
+    const savedCredits = this.store.getUserSetting<number>(this.userId, 'proxyTotalCredits', 0) || 0
+    const savedUsage = this.store.getUserSetting<Partial<ProxyUsageStatsUpdate>>(this.userId, 'proxyUsageStats', {}) || {}
+    const inputTokens = savedUsage.inputTokens ?? this.store.getUserSetting<number>(this.userId, 'proxyInputTokens', 0) ?? 0
+    const outputTokens = savedUsage.outputTokens ?? this.store.getUserSetting<number>(this.userId, 'proxyOutputTokens', 0) ?? 0
+    const requestStats = this.store.getUserSetting<{ totalRequests?: number; successRequests?: number; failedRequests?: number }>(
+      this.userId,
+      'proxyRequestStats',
+      {}
+    ) || {}
+
+    server.setTotalCredits(savedCredits)
+    server.setUsageStats({
+      totalTokens: savedUsage.totalTokens ?? inputTokens + outputTokens,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens: savedUsage.cacheReadTokens ?? 0,
+      cacheWriteTokens: savedUsage.cacheWriteTokens ?? 0,
+      reasoningTokens: savedUsage.reasoningTokens ?? 0
+    })
+    server.setRequestStats(
+      requestStats.totalRequests || 0,
+      requestStats.successRequests || 0,
+      requestStats.failedRequests || 0
+    )
+  }
+
   async ensureAutoStarted(reason = 'auto'): Promise<{ success: boolean; port?: number; error?: string }> {
     const server = this.getOrCreateServer()
     if (server.isRunning()) return { success: true, port: server.getConfig().port }
@@ -276,6 +303,11 @@ export class ProxyRuntime {
         void this.store.setUserSetting(this.userId, 'proxyInputTokens', inputTokens)
         void this.store.setUserSetting(this.userId, 'proxyOutputTokens', outputTokens)
       },
+      onUsageStatsUpdate: (usage) => {
+        void this.store.setUserSetting(this.userId, 'proxyUsageStats', usage)
+        void this.store.setUserSetting(this.userId, 'proxyInputTokens', usage.inputTokens)
+        void this.store.setUserSetting(this.userId, 'proxyOutputTokens', usage.outputTokens)
+      },
       onRequestStatsUpdate: (totalRequests, successRequests, failedRequests) => {
         void this.store.setUserSetting(this.userId, 'proxyRequestStats', { totalRequests, successRequests, failedRequests })
       },
@@ -283,6 +315,7 @@ export class ProxyRuntime {
         await this.syncAccountsFromStoreAsync()
       }
     })
+    this.restorePersistedStats(this.server)
     return this.server
   }
 
@@ -531,6 +564,14 @@ export class ProxyRuntime {
 
   resetTokens(): { success: boolean } {
     this.getOrCreateServer().resetTotalTokens()
+    void this.store.setUserSetting(this.userId, 'proxyUsageStats', {
+      totalTokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0
+    })
     return { success: true }
   }
 

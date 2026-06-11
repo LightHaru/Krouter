@@ -1,8 +1,9 @@
 import http, { IncomingMessage, ServerResponse } from 'http'
+import crypto from 'crypto'
 import { execFile, spawn } from 'child_process'
 import { promises as fs } from 'fs'
 import path from 'path'
-import { WebStore, verifyPassword, type UserRecord } from './store'
+import { WebStore, hashPassword, verifyPassword, type UserRecord } from './store'
 import {
   type AccountLike,
   checkAccountStatus,
@@ -89,6 +90,7 @@ import {
   typeProtonText
 } from './services/protonBrowserRuntime'
 import { getDashboardTunnelRuntime } from './services/dashboardTunnel'
+import { mergePeerAccountData, pushAccountDataToRemote } from './services/accountSync'
 
 type JsonValue = unknown
 type SseClient = ServerResponse
@@ -105,7 +107,16 @@ const backendAutoRefreshRunning = new Set<string>()
 const KROUTER_NPM_PACKAGE = '@lightharu/krouter'
 const KROUTER_NPM_LATEST_URL = 'https://registry.npmjs.org/@lightharu%2Fkrouter/latest'
 const KROUTER_NPM_PACKAGE_URL = 'https://registry.npmjs.org/@lightharu%2Fkrouter'
+const ACCOUNT_SYNC_PASSWORD_SETTING_KEY = 'accountSyncPassword'
 let krouterUpdatePromise: Promise<Record<string, unknown>> | null = null
+
+type AccountSyncPasswordSetting = {
+  enabled?: boolean
+  hash?: string
+  salt?: string
+  createdAt?: number
+  updatedAt?: number
+}
 
 function envFlag(name: string): boolean | undefined {
   const raw = process.env[name]
@@ -222,6 +233,64 @@ function getCliUser(request: IncomingMessage): UserRecord | undefined {
 
 function getApiUser(request: IncomingMessage): UserRecord | undefined {
   return getUser(request) || getCliUser(request)
+}
+
+function getAccountSyncUser(): UserRecord | undefined {
+  return store.getUsers().find((item) => item.role === 'admin') || store.getUsers()[0]
+}
+
+function makeAccountSyncPassword(): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
+  const bytes = crypto.randomBytes(24)
+  let value = ''
+  for (const byte of bytes) value += alphabet[byte % alphabet.length]
+  return `ksync-${value.slice(0, 6)}-${value.slice(6, 12)}-${value.slice(12, 18)}-${value.slice(18, 24)}`
+}
+
+function getAccountSyncPasswordSetting(user: UserRecord): AccountSyncPasswordSetting {
+  return store.getUserSetting<AccountSyncPasswordSetting>(user.id, ACCOUNT_SYNC_PASSWORD_SETTING_KEY, {})
+}
+
+function verifyAccountSyncPassword(user: UserRecord, password: string): boolean {
+  const setting = getAccountSyncPasswordSetting(user)
+  if (!setting.enabled || !setting.hash || !setting.salt || !password) return false
+  const { hash } = hashPassword(password, setting.salt)
+  const expected = Buffer.from(setting.hash, 'hex')
+  const actual = Buffer.from(hash, 'hex')
+  if (expected.length !== actual.length) return false
+  return crypto.timingSafeEqual(actual, expected)
+}
+
+async function saveAccountSyncPassword(user: UserRecord, password: string): Promise<AccountSyncPasswordSetting> {
+  const cleanPassword = String(password || '').trim()
+  if (cleanPassword.length < 8) throw new Error('Account sync password must be at least 8 characters')
+  const current = getAccountSyncPasswordSetting(user)
+  const { hash, salt } = hashPassword(cleanPassword)
+  const now = Date.now()
+  const next: AccountSyncPasswordSetting = {
+    enabled: true,
+    hash,
+    salt,
+    createdAt: current.createdAt || now,
+    updatedAt: now
+  }
+  await store.setUserSetting(user.id, ACCOUNT_SYNC_PASSWORD_SETTING_KEY, next)
+  return next
+}
+
+function accountSyncPasswordStatus(user: UserRecord): {
+  success: true
+  enabled: boolean
+  createdAt?: number
+  updatedAt?: number
+} {
+  const setting = getAccountSyncPasswordSetting(user)
+  return {
+    success: true,
+    enabled: Boolean(setting.enabled && setting.hash && setting.salt),
+    createdAt: setting.createdAt,
+    updatedAt: setting.updatedAt
+  }
 }
 
 function publicUser(user: UserRecord): { id: string; email: string; name?: string; role: 'admin' | 'user' } {
@@ -970,6 +1039,31 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
   const proxyRuntime = getProxyRuntime(store, user.id, emit)
   const kproxyRuntime = getKProxyRuntime(store, user.id, emit)
   switch (method) {
+    case 'accountSyncGetStatus':
+      return accountSyncPasswordStatus(user)
+    case 'accountSyncGeneratePassword':
+      {
+        const password = makeAccountSyncPassword()
+        const setting = await saveAccountSyncPassword(user, password)
+        return {
+          success: true,
+          enabled: true,
+          password,
+          createdAt: setting.createdAt,
+          updatedAt: setting.updatedAt
+        }
+      }
+    case 'accountSyncSetPassword':
+      {
+        const body = args[0] && typeof args[0] === 'object' ? args[0] as Record<string, unknown> : {}
+        const setting = await saveAccountSyncPassword(user, String(body.password || ''))
+        return {
+          success: true,
+          enabled: true,
+          createdAt: setting.createdAt,
+          updatedAt: setting.updatedAt
+        }
+      }
     case 'getAppVersion':
       return packageVersion()
     case 'loadAccounts':
@@ -987,6 +1081,27 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
         scheduleBackendAutoRefreshForUser(user, false)
       }
       return null
+    case 'mergePeerAccounts':
+      {
+        const merged = mergePeerAccountData(store.getAccountData(user.id) || defaultAccountData(), args[0])
+        const hydrated = await hydrateAccountDataProfileArns(merged.data)
+        await store.setAccountData(user.id, hydrated.data)
+        scheduleBackendAutoRefreshForUser(user, false)
+        const hydratedAccounts = hydrated.data.accounts && typeof hydrated.data.accounts === 'object'
+          ? hydrated.data.accounts as Record<string, unknown>
+          : {}
+        return {
+          success: true,
+          totalIncoming: merged.totalIncoming,
+          added: merged.added,
+          skipped: merged.skipped,
+          skippedAccounts: merged.skippedAccounts,
+          syncedAccountIds: merged.syncedAccountIds,
+          remoteTotal: Object.keys(hydratedAccounts).length
+        }
+      }
+    case 'syncAccountsToRemote':
+      return pushAccountDataToRemote(args[0] as Parameters<typeof pushAccountDataToRemote>[0], store.getAccountData(user.id) || defaultAccountData())
     case 'getLocalActiveAccount':
       return getLocalActiveAccount()
     case 'loadKiroCredentials':
@@ -1366,6 +1481,52 @@ async function handleAuth(request: IncomingMessage, response: ServerResponse, pa
   sendJson(response, 404, { error: 'Not found' })
 }
 
+async function handleAccountSyncMerge(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  if (request.method !== 'POST') {
+    sendJson(response, 405, { error: 'Method not allowed' })
+    return
+  }
+  if (store.isSetupRequired()) {
+    sendJson(response, 428, { error: 'Krouter setup is required first', setupRequired: true })
+    return
+  }
+  const user = getAccountSyncUser()
+  if (!user) {
+    sendJson(response, 401, { error: 'No account sync user is configured' })
+    return
+  }
+  const setting = getAccountSyncPasswordSetting(user)
+  if (!setting.enabled || !setting.hash || !setting.salt) {
+    sendJson(response, 403, { error: 'Account sync password is not configured. Run krouter sync-password on the VPS.' })
+    return
+  }
+
+  const body = await readJson(request)
+  const syncPassword = String(body?.syncPassword || '')
+  if (!verifyAccountSyncPassword(user, syncPassword)) {
+    sendJson(response, 401, { error: 'Invalid account sync password' })
+    return
+  }
+
+  const incoming = body?.accountData && typeof body.accountData === 'object' ? body.accountData : body
+  const merged = mergePeerAccountData(store.getAccountData(user.id) || defaultAccountData(), incoming)
+  const hydrated = await hydrateAccountDataProfileArns(merged.data)
+  await store.setAccountData(user.id, hydrated.data)
+  scheduleBackendAutoRefreshForUser(user, false)
+  const hydratedAccounts = hydrated.data.accounts && typeof hydrated.data.accounts === 'object'
+    ? hydrated.data.accounts as Record<string, unknown>
+    : {}
+  sendJson(response, 200, {
+    success: true,
+    totalIncoming: merged.totalIncoming,
+    added: merged.added,
+    skipped: merged.skipped,
+    skippedAccounts: merged.skippedAccounts,
+    syncedAccountIds: merged.syncedAccountIds,
+    remoteTotal: Object.keys(hydratedAccounts).length
+  })
+}
+
 function protonLoginPageHtml(): string {
   return `<!doctype html>
 <html lang="en">
@@ -1593,6 +1754,11 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       mode: serveStaticAssets ? 'fullstack' : 'backend-cli',
       static: serveStaticAssets
     })
+    return
+  }
+
+  if (url.pathname === '/api/account-sync/merge') {
+    await handleAccountSyncMerge(request, response)
     return
   }
 

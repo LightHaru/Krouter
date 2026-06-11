@@ -49,6 +49,15 @@ type ProxyAttemptError = Error & {
   proxyFailureRecorded?: boolean
 }
 
+export interface ProxyUsageStatsUpdate {
+  totalTokens: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+}
+
 export interface ProxyServerEvents {
   onRequest?: (info: { path: string; method: string; accountId?: string }) => void
   onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }) => void
@@ -62,6 +71,7 @@ export interface ProxyServerEvents {
   onAccountSuspended?: (info: { accountId: string; email?: string; reason: string; message: string }) => void
   onCreditsUpdate?: (totalCredits: number) => void
   onTokensUpdate?: (inputTokens: number, outputTokens: number) => void
+  onUsageStatsUpdate?: (usage: ProxyUsageStatsUpdate) => void
   onRequestStatsUpdate?: (totalRequests: number, successRequests: number, failedRequests: number) => void
   onPoolEmpty?: () => Promise<void> // 账号池为空时触发（冷启动懒加载）
 }
@@ -940,10 +950,30 @@ export class ProxyServer {
   }
 
   // 设置初始累计 tokens（用于从持久化存储恢复）
-  setTotalTokens(inputTokens: number, outputTokens: number): void {
+  setTotalTokens(
+    inputTokens: number,
+    outputTokens: number,
+    cacheReadTokens = 0,
+    cacheWriteTokens = 0,
+    reasoningTokens = 0
+  ): void {
     this.stats.inputTokens = inputTokens
     this.stats.outputTokens = outputTokens
     this.stats.totalTokens = inputTokens + outputTokens
+    this.stats.cacheReadTokens = cacheReadTokens
+    this.stats.cacheWriteTokens = cacheWriteTokens
+    this.stats.reasoningTokens = reasoningTokens
+  }
+
+  setUsageStats(usage: Partial<ProxyUsageStatsUpdate>): void {
+    const inputTokens = usage.inputTokens ?? this.stats.inputTokens
+    const outputTokens = usage.outputTokens ?? this.stats.outputTokens
+    this.stats.inputTokens = inputTokens
+    this.stats.outputTokens = outputTokens
+    this.stats.totalTokens = usage.totalTokens ?? inputTokens + outputTokens
+    this.stats.cacheReadTokens = usage.cacheReadTokens ?? this.stats.cacheReadTokens
+    this.stats.cacheWriteTokens = usage.cacheWriteTokens ?? this.stats.cacheWriteTokens
+    this.stats.reasoningTokens = usage.reasoningTokens ?? this.stats.reasoningTokens
   }
 
   // 重置累计 tokens
@@ -951,6 +981,10 @@ export class ProxyServer {
     this.stats.inputTokens = 0
     this.stats.outputTokens = 0
     this.stats.totalTokens = 0
+    this.stats.cacheReadTokens = 0
+    this.stats.cacheWriteTokens = 0
+    this.stats.reasoningTokens = 0
+    this.notifyUsageStatsUpdate()
   }
 
   // 设置请求统计（用于从持久化存储恢复）
@@ -978,6 +1012,22 @@ export class ProxyServer {
   }
 
   // 记录请求成功
+  private getUsageStatsSnapshot(): ProxyUsageStatsUpdate {
+    return {
+      totalTokens: this.stats.totalTokens,
+      inputTokens: this.stats.inputTokens,
+      outputTokens: this.stats.outputTokens,
+      cacheReadTokens: this.stats.cacheReadTokens,
+      cacheWriteTokens: this.stats.cacheWriteTokens,
+      reasoningTokens: this.stats.reasoningTokens
+    }
+  }
+
+  private notifyUsageStatsUpdate(): void {
+    this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
+    this.events.onUsageStatsUpdate?.(this.getUsageStatsSnapshot())
+  }
+
   private recordRequestSuccess(): void {
     this.stats.successRequests++
     this.sessionStats.successRequests++
@@ -1843,6 +1893,78 @@ export class ProxyServer {
       return updated
     }
     return account
+  }
+
+  private recordSuccessfulUsage(input: {
+    path: string
+    model?: string
+    account: ProxyAccount
+    usage: KiroUsage
+    startTime: number
+    apiKeyId?: string
+    simulatedCacheUsage?: { cacheCreationInputTokens?: number; cacheReadInputTokens?: number }
+  }): {
+    responseTime: number
+    cacheReadTokens: number
+    cacheWriteTokens: number
+    reasoningTokens: number
+    credits: number
+  } {
+    const { path, model, account, usage, startTime, apiKeyId, simulatedCacheUsage } = input
+    const inputTokens = usage.inputTokens || 0
+    const outputTokens = usage.outputTokens || 0
+    const cacheReadTokens = usage.cacheReadTokens && usage.cacheReadTokens > 0
+      ? usage.cacheReadTokens
+      : simulatedCacheUsage?.cacheReadInputTokens || 0
+    const cacheWriteTokens = usage.cacheWriteTokens && usage.cacheWriteTokens > 0
+      ? usage.cacheWriteTokens
+      : simulatedCacheUsage?.cacheCreationInputTokens || 0
+    const reasoningTokens = usage.reasoningTokens || 0
+    const credits = usage.credits || 0
+    const responseTime = Date.now() - startTime
+
+    this.recordRequestSuccess()
+    this.stats.totalTokens += inputTokens + outputTokens
+    this.stats.inputTokens += inputTokens
+    this.stats.outputTokens += outputTokens
+    this.stats.cacheReadTokens += cacheReadTokens
+    this.stats.cacheWriteTokens += cacheWriteTokens
+    this.stats.reasoningTokens += reasoningTokens
+    this.stats.totalCredits += credits
+    this.events.onCreditsUpdate?.(this.stats.totalCredits)
+    this.notifyUsageStatsUpdate()
+    this.recordAccountSuccess(account, usage)
+    this.events.onResponse?.({
+      path,
+      model,
+      status: 200,
+      tokens: inputTokens + outputTokens,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      reasoningTokens,
+      credits,
+      responseTime
+    })
+    this.recordRequest({
+      path,
+      model,
+      accountId: account.id,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      reasoningTokens,
+      credits,
+      responseTime,
+      success: true
+    })
+    if (apiKeyId) {
+      this.recordApiKeyUsage(apiKeyId, credits, inputTokens, outputTokens, model, path)
+    }
+
+    return { responseTime, cacheReadTokens, cacheWriteTokens, reasoningTokens, credits }
   }
 
   private isInvalidModelForAccountError(message: string): boolean {
@@ -2760,12 +2882,14 @@ export class ProxyServer {
               const finalChunk = { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: usage.inputTokens, candidatesTokenCount: usage.outputTokens, totalTokenCount: usage.inputTokens + usage.outputTokens } }
               res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
               res.end()
-              this.recordRequestSuccess()
-              this.stats.totalTokens += usage.inputTokens + usage.outputTokens
-              this.stats.inputTokens += usage.inputTokens
-              this.stats.outputTokens += usage.outputTokens
-              this.stats.totalCredits += usage.credits || 0
-              this.recordAccountSuccess(usedAccount, usage)
+              this.recordSuccessfulUsage({
+                path: '/v1beta',
+                model: modelId,
+                account: usedAccount,
+                usage,
+                startTime,
+                apiKeyId: matchedApiKey?.id
+              })
               resolve()
             },
             (_usedAccount, error) => {
@@ -2802,12 +2926,14 @@ export class ProxyServer {
           modelId
         )
         this.throwIfResponseClosed(res, signal)
-        this.recordRequestSuccess()
-        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
-        this.stats.inputTokens += result.usage.inputTokens
-        this.stats.outputTokens += result.usage.outputTokens
-        this.stats.totalCredits += result.usage.credits || 0
-        this.recordAccountSuccess(usedAccount, result.usage)
+        this.recordSuccessfulUsage({
+          path: '/v1beta',
+          model: modelId,
+          account: usedAccount,
+          usage: result.usage,
+          startTime,
+          apiKeyId: matchedApiKey?.id
+        })
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({
           candidates: [{ content: { parts: [{ text: result.content }], role: 'model' }, finishReason: 'STOP' }],
@@ -3024,21 +3150,16 @@ export class ProxyServer {
         const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
         this.throwIfResponseClosed(res, signal)
-        this.recordRequestSuccess()
-        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
-        this.stats.inputTokens += result.usage.inputTokens
-        this.stats.outputTokens += result.usage.outputTokens
-        this.recordAccountSuccess(usedAccount, result.usage)
-
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
-        const respTime = Date.now() - startTime
-        this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
-        this.recordRequest({ path: '/v1/chat/completions', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
-        // 记录 API Key 用量
-        if (matchedApiKey) {
-          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, request.model, '/v1/chat/completions')
-        }
+        this.recordSuccessfulUsage({
+          path: '/v1/chat/completions',
+          model: request.model,
+          account: usedAccount,
+          usage: result.usage,
+          startTime,
+          apiKeyId: matchedApiKey?.id
+        })
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/chat/completions', request.model, startTime, signal)
@@ -3143,17 +3264,14 @@ export class ProxyServer {
         this.throwIfResponseClosed(res, signal)
         res.write(`event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: streamedResponse })}\n\n`)
         res.end()
-        this.recordRequestSuccess()
-        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
-        this.stats.inputTokens += result.usage.inputTokens
-        this.stats.outputTokens += result.usage.outputTokens
-        this.recordAccountSuccess(usedAccount, result.usage)
-        const respTime = Date.now() - startTime
-        this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
-        this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
-        if (matchedApiKey) {
-          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses')
-        }
+        this.recordSuccessfulUsage({
+          path: '/v1/responses',
+          model: chatRequest.model,
+          account: usedAccount,
+          usage: result.usage,
+          startTime,
+          apiKeyId: matchedApiKey?.id
+        })
         return
       }
 
@@ -3172,20 +3290,16 @@ export class ProxyServer {
       this.throwIfResponseClosed(res, signal)
       const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
 
-      this.recordRequestSuccess()
-      this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
-      this.stats.inputTokens += result.usage.inputTokens
-      this.stats.outputTokens += result.usage.outputTokens
-      this.recordAccountSuccess(usedAccount, result.usage)
-
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(response))
-      const respTime = Date.now() - startTime
-      this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
-      this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
-      if (matchedApiKey) {
-        this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses')
-      }
+      this.recordSuccessfulUsage({
+        path: '/v1/responses',
+        model: chatRequest.model,
+        account: usedAccount,
+        usage: result.usage,
+        startTime,
+        apiKeyId: matchedApiKey?.id
+      })
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/responses', chatRequest.model, startTime, signal)
     }
@@ -3272,24 +3386,14 @@ export class ProxyServer {
           }
           ensureStreamStarted()
           
-          this.recordRequestSuccess()
-          this.stats.totalTokens += usage.inputTokens + usage.outputTokens
-          this.stats.inputTokens += usage.inputTokens
-          this.stats.outputTokens += usage.outputTokens
-          this.stats.cacheReadTokens += usage.cacheReadTokens || 0
-          this.stats.cacheWriteTokens += usage.cacheWriteTokens || 0
-          this.stats.reasoningTokens += usage.reasoningTokens || 0
-          this.stats.totalCredits += usage.credits || 0
-          this.events.onCreditsUpdate?.(this.stats.totalCredits)
-          this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
-          this.recordAccountSuccess(usedAccount, usage)
-          const oaiRespTime = Date.now() - startTime
-          this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: oaiRespTime })
-          this.recordRequest({ path: '/v1/chat/completions', model, accountId: usedAccount.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
-          // 记录 API Key 用量
-          if (matchedApiKey) {
-            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions')
-          }
+          this.recordSuccessfulUsage({
+            path: '/v1/chat/completions',
+            model,
+            account: usedAccount,
+            usage,
+            startTime,
+            apiKeyId: matchedApiKey?.id
+          })
 
           // 发送结束 chunk（包含完整 usage 信息）
           const hasToolCalls = pendingToolCalls.size > 0
@@ -3467,17 +3571,17 @@ export class ProxyServer {
         }
 
         this.throwIfResponseClosed(res, signal)
-        this.recordRequestSuccess()
-        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
-        this.stats.inputTokens += result.usage.inputTokens
-        this.stats.outputTokens += result.usage.outputTokens
-        this.recordAccountSuccess(usedAccount, result.usage)
-
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
-        const respTime = Date.now() - startTime
-        this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
-        this.recordRequest({ path: '/v1/messages', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
+        this.recordSuccessfulUsage({
+          path: '/v1/messages',
+          model: request.model,
+          account: usedAccount,
+          usage: result.usage,
+          startTime,
+          apiKeyId: matchedApiKey?.id,
+          simulatedCacheUsage: cacheProfile ? cacheUsage : undefined
+        })
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/messages', request.model, startTime, signal)
@@ -3695,24 +3799,15 @@ export class ProxyServer {
             currentBlockIndex++
           }
 
-          this.recordRequestSuccess()
-          this.stats.totalTokens += usage.inputTokens + usage.outputTokens
-          this.stats.inputTokens += usage.inputTokens
-          this.stats.outputTokens += usage.outputTokens
-          this.stats.totalCredits += usage.credits || 0
-          this.events.onCreditsUpdate?.(this.stats.totalCredits)
-          this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
-          this.recordAccountSuccess(usedAccount, usage)
-          this.stats.cacheReadTokens += usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens || 0
-          this.stats.cacheWriteTokens += usage.cacheWriteTokens || simulatedCacheUsage?.cacheCreationInputTokens || 0
-          this.stats.reasoningTokens += usage.reasoningTokens || 0
-          const respTime = Date.now() - startTime
-          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime })
-          this.recordRequest({ path: '/v1/messages', model, accountId: usedAccount.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
-          // 记录 API Key 用量
-          if (matchedApiKey) {
-            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages')
-          }
+          this.recordSuccessfulUsage({
+            path: '/v1/messages',
+            model,
+            account: usedAccount,
+            usage,
+            startTime,
+            apiKeyId: matchedApiKey?.id,
+            simulatedCacheUsage
+          })
 
           // 成功后更新 prompt cache tracker
           if (simulatedCacheUsage?.cacheProfile) {
@@ -4041,6 +4136,7 @@ export class ProxyServer {
     lines.push(`kiro_proxy_tokens_total{type="output"} ${s.outputTokens}`)
     lines.push(`kiro_proxy_tokens_total{type="cache_read"} ${s.cacheReadTokens}`)
     lines.push(`kiro_proxy_tokens_total{type="cache_write"} ${s.cacheWriteTokens}`)
+    lines.push(`kiro_proxy_tokens_total{type="reasoning"} ${s.reasoningTokens}`)
     lines.push('# HELP kiro_proxy_credits_total Total credits consumed')
     lines.push('# TYPE kiro_proxy_credits_total counter')
     lines.push(`kiro_proxy_credits_total ${s.totalCredits}`)
@@ -4064,6 +4160,9 @@ export class ProxyServer {
     accountId?: string
     inputTokens?: number
     outputTokens?: number
+    cacheReadTokens?: number
+    cacheWriteTokens?: number
+    reasoningTokens?: number
     credits?: number
     responseTime?: number
     success: boolean
@@ -4076,6 +4175,9 @@ export class ProxyServer {
       accountId: log.accountId || 'unknown',
       inputTokens: log.inputTokens || 0,
       outputTokens: log.outputTokens || 0,
+      cacheReadTokens: log.cacheReadTokens || 0,
+      cacheWriteTokens: log.cacheWriteTokens || 0,
+      reasoningTokens: log.reasoningTokens || 0,
       credits: log.credits,
       responseTime: log.responseTime || 0,
       success: log.success,

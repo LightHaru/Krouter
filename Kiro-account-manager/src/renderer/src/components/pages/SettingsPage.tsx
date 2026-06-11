@@ -401,18 +401,16 @@ export function SettingsPage() {
   }
 
   return (
-    <div className="flex-1 p-6 space-y-6 overflow-auto">
+    <div className="flex-1 space-y-4 overflow-auto p-4 md:space-y-6 md:p-6">
       {/* 页面头部 */}
-      <div className="page-hero p-6">
-        <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-primary/20 to-transparent rounded-full blur-2xl" />
-        <div className="absolute bottom-0 left-0 w-24 h-24 bg-gradient-to-tr from-primary/20 to-transparent rounded-full blur-2xl" />
-        <div className="relative flex items-center gap-4">
-          <div className="p-3 rounded-xl bg-primary shadow-lg shadow-primary/25">
+      <div className="page-hero p-4 md:p-6">
+        <div className="relative flex min-w-0 flex-col gap-3 min-[420px]:flex-row min-[420px]:items-center min-[420px]:gap-4">
+          <div className="w-fit shrink-0 p-3 rounded-xl bg-primary shadow-lg shadow-primary/25">
             <Settings className="h-6 w-6 text-primary-foreground" />
           </div>
-          <div>
-            <h1 className="text-2xl font-bold text-primary">{t('settings.title')}</h1>
-            <p className="text-muted-foreground">{t('settings.title') === 'Settings' ? 'Configure app features' : '配置应用的各项功能'}</p>
+          <div className="min-w-0">
+            <h1 className="break-words text-2xl font-bold leading-tight text-primary">{t('settings.title')}</h1>
+            <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground md:text-base">{t('settings.title') === 'Settings' ? 'Configure app features' : '配置应用的各项功能'}</p>
           </div>
         </div>
       </div>
@@ -428,13 +426,13 @@ export function SettingsPage() {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
               <p className="font-medium">显示语言 / Display Language</p>
               <p className="text-sm text-muted-foreground">选择界面显示语言 / Select interface language</p>
             </div>
             <select
-              className="w-[160px] h-9 px-3 rounded-lg border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"
+              className="h-9 w-full rounded-lg border bg-background px-3 text-sm focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary sm:w-[160px]"
               value={language}
               onChange={(e) => setLanguage(e.target.value as 'auto' | 'en' | 'zh')}
             >
@@ -463,8 +461,8 @@ export function SettingsPage() {
         </CardHeader>
         <CardContent className="space-y-4">
           {/* 深色模式 */}
-          <div className="flex items-center justify-between">
-            <div>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
               <p className="font-medium">{isEn ? 'Dark Mode' : '深色模式'}</p>
               <p className="text-sm text-muted-foreground">{isEn ? 'Toggle dark/light theme' : '切换深色/浅色主题'}</p>
             </div>
@@ -472,6 +470,7 @@ export function SettingsPage() {
               variant={darkMode ? "default" : "outline"}
               size="sm"
               onClick={() => setDarkMode(!darkMode)}
+              className="w-full sm:w-auto"
             >
               {darkMode ? <Moon className="h-4 w-4 mr-2" /> : <Sun className="h-4 w-4 mr-2" />}
               {darkMode ? (isEn ? 'Dark' : '深色') : (isEn ? 'Light' : '浅色')}
@@ -481,7 +480,7 @@ export function SettingsPage() {
           {/* 主题颜色 */}
           <div className="pt-2 border-t">
             <button 
-              className="flex items-center justify-between w-full text-left"
+              className="flex w-full items-center justify-between gap-3 text-left"
               onClick={() => setThemeExpanded(!themeExpanded)}
             >
               <div className="flex items-center gap-2">
@@ -1301,4 +1300,3 @@ function ConfigSyncCard({ isEn }: { isEn: boolean }): React.ReactNode {
     </Card>
   )
 }
-

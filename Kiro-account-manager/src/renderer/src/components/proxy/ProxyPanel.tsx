@@ -114,7 +114,7 @@ interface DashboardTunnelStatus {
 }
 
 // 反代请求日志：模块级持久化 + 单次订阅，避免切到其它页面 unmount 后日志清空、中间请求事件丢失
-type RecentLogEntry = { time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }
+type RecentLogEntry = { time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }
 let _proxyRecentLogs: RecentLogEntry[] = []
 let _refSetProxyRecentLogs: ((v: RecentLogEntry[]) => void) | null = null
 let _proxyResponseListenerRegistered = false
@@ -140,6 +140,7 @@ function ensureProxyResponseListenerRegistered(): void {
       inputTokens: info.inputTokens,
       outputTokens: info.outputTokens,
       cacheReadTokens: info.cacheReadTokens,
+      cacheWriteTokens: info.cacheWriteTokens,
       reasoningTokens: info.reasoningTokens,
       credits: info.credits,
       responseTime: info.responseTime,
@@ -1530,14 +1531,15 @@ export function ProxyPanel() {
           <CardContent className="pt-2">
             <div className="max-h-[150px] overflow-y-auto text-xs font-mono space-y-0.5">
               {recentLogs.slice(0, 5).map((log, idx) => (
-                <div key={idx} className="grid gap-2 py-1 px-2 rounded hover:bg-muted/50 items-center" style={{ gridTemplateColumns: '2fr 1fr 1.2fr 0.5fr 0.8fr 0.8fr 0.8fr 0.8fr 0.6fr' }}>
+                <div key={idx} className="grid gap-2 py-1 px-2 rounded hover:bg-muted/50 items-center" style={{ gridTemplateColumns: '2fr 1fr 1.2fr 0.5fr 0.8fr 0.8fr 0.9fr 0.8fr 0.8fr 0.6fr' }}>
                   <span className="text-muted-foreground whitespace-nowrap text-left">{log.time}</span>
                   <span className="truncate text-left" title={log.path}>{log.path}</span>
                   <span className="truncate text-left text-muted-foreground" title={log.model}>{log.model ? log.model.replace('anthropic.', '').replace('-v1:0', '') : '-'}</span>
                   <span className={`text-center ${log.status >= 400 ? 'text-destructive' : 'text-success'}`}>{log.status}</span>
                   <span className="text-muted-foreground text-right">{log.inputTokens ? log.inputTokens.toLocaleString() : '-'}</span>
                   <span className="text-muted-foreground text-right">{log.outputTokens ? log.outputTokens.toLocaleString() : '-'}</span>
-                  <span className="text-success text-right">{log.cacheReadTokens ? log.cacheReadTokens.toLocaleString() : '-'}</span>
+                  <span className="text-success text-right" title={`${isEn ? 'Cache Read/Write' : 'Cache đọc/ghi'}`}>{log.cacheReadTokens || log.cacheWriteTokens ? `${(log.cacheReadTokens || 0).toLocaleString()}/${(log.cacheWriteTokens || 0).toLocaleString()}` : '-'}</span>
+                  <span className="text-violet-500 text-right">{log.reasoningTokens ? log.reasoningTokens.toLocaleString() : '-'}</span>
                   <span className="text-muted-foreground text-right">{log.credits ? log.credits.toFixed(4) : '-'}</span>
                   <span className="text-muted-foreground text-right">{log.responseTime ? `${(log.responseTime / 1000).toFixed(1)}s` : '-'}</span>
                 </div>

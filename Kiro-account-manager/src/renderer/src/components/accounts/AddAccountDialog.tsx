@@ -79,13 +79,21 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab } = useAccountsStore()
 
   // 检查账户是否已存在（同userId 或 同邮箱+同provider 才算重复）
-  const isAccountExists = (email: string, userId: string, provider?: string): boolean => {
+  const isAccountExists = (email: string, userId?: string, provider?: string, profileArn?: string, token?: string, kiroApiKey?: string): boolean => {
+    const normalizedEmail = email.trim().toLowerCase()
+    const normalizedProvider = String(provider || '').trim().toLowerCase()
+    const normalizedProfileArn = String(profileArn || '').trim().toLowerCase()
+    const normalizedToken = String(token || '').trim()
+    const normalizedApiKey = String(kiroApiKey || '').trim()
     return Array.from(accounts.values()).some(acc => {
       // userId 相同则重复（主要判断依据）
       if (userId && acc.userId === userId) return true
+      if (normalizedProfileArn && acc.profileArn?.trim().toLowerCase() === normalizedProfileArn) return true
+      if (normalizedToken && acc.credentials.refreshToken === normalizedToken) return true
+      if (normalizedApiKey && acc.credentials.kiroApiKey === normalizedApiKey) return true
       // email 非空且相同，且 provider 相同则重复（允许同邮箱不同登录方式）
       // 企业账号可能没有 email，所以 email 为空时不用 email 判断
-      if (email && acc.email === email && acc.credentials.provider === provider) return true
+      if (normalizedEmail && acc.email.trim().toLowerCase() === normalizedEmail && String(acc.credentials.provider || acc.idp || '').trim().toLowerCase() === normalizedProvider) return true
       return false
     })
   }
@@ -293,7 +301,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         const providerName = tokenData.provider || 'BuilderId'
         
         // 检查账户是否已存在
-        if (isAccountExists(email, userId, providerName)) {
+        if (isAccountExists(email, userId, providerName, result.data.profileArn || tokenData.profileArn, tokenData.refreshToken)) {
           setError(isEn ? 'This account already exists' : '该账号已存在，无需重复添加')
           return
         }
@@ -687,7 +695,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           const { email, userId } = result.data
           
           // 检查账户是否已存在（已存在的也从输入框中移除）
-          if (email && userId && isAccountExists(email, userId, 'BuilderId')) {
+          if (email && userId && isAccountExists(email, userId, 'BuilderId', (result.data as { profileArn?: string }).profileArn, result.data.refreshToken)) {
             importResult.errors.push(`#${index + 1}: ${email} ${isEn ? 'already exists' : '已存在'}`)
             return
           }
@@ -885,7 +893,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           const { email, userId } = result.data
           const provider = (cred.provider || 'BuilderId') as 'BuilderId' | 'Enterprise' | 'Github' | 'Google'
           
-          if (isAccountExists(email, userId, provider)) {
+          if (isAccountExists(email, userId, provider, result.data.profileArn || cred.profileArn, cred.refreshToken)) {
             // 已存在的不记入失败，也从输入框中移除
             importResult.errors.push(`#${index + 1}: ${email} ${isEn ? 'already exists' : '已存在'}`)
             return
@@ -1048,7 +1056,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         const providerName = provider || 'BuilderId'
         
         // 检查账户是否已存在
-        if (isAccountExists(email, userId, providerName)) {
+        if (isAccountExists(email, userId, providerName, result.data.profileArn || normalizeProfileArnInput(profileArn), refreshToken)) {
           setError(isEn ? 'This account already exists' : '该账号已存在，无需重复添加')
           return
         }
@@ -1146,7 +1154,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         const userId = result.data.userId || `kiro-api-key:${key.slice(-12)}`
         const providerName = 'KiroApiKey'
 
-        if (isAccountExists(email, userId, providerName)) {
+        if (isAccountExists(email, userId, providerName, result.data.profileArn, undefined, key)) {
           setError(isEn ? 'This account already exists' : 'Tài khoản này đã tồn tại')
           return
         }

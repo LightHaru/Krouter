@@ -2,6 +2,22 @@
 
 All notable Krouter changes are tracked here.
 
+## 1.8.9 - 2026-06-11
+
+### Added
+
+- Added VPS account sync passwords for local-to-VPS account transfer through changing tunnel URLs without using the dashboard admin password.
+- Added `krouter sync-password` and `krouter sync-password status` to create and inspect the account sync password from the terminal.
+- Added a local registration-page sync panel that accepts the current Krouter tunnel URL plus sync password and tags synced local accounts as `Da dong bo`.
+
+### Changed
+
+- Remote account sync now uses a dedicated `/api/account-sync/merge` endpoint with duplicate detection and returns the local account IDs that were accepted or already present.
+
+### Fixed
+
+- Fixed remote sync failures returning unclear TypeError messages when sync input is missing or malformed.
+
 ## 1.8.8 - 2026-06-09
 
 ### Added

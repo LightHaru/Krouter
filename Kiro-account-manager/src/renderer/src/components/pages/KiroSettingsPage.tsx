@@ -345,28 +345,26 @@ export function KiroSettingsPage() {
     <div className="flex-1 space-y-4 overflow-auto p-4 md:space-y-6 md:p-6">
       {/* 页面头部 */}
       <div className="page-hero p-4 md:p-6">
-        <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-primary/20 to-transparent rounded-full blur-2xl" />
-        <div className="absolute bottom-0 left-0 w-24 h-24 bg-gradient-to-tr from-primary/20 to-transparent rounded-full blur-2xl" />
         <div className="relative flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
+          <div className="flex min-w-0 flex-col gap-3 min-[420px]:flex-row min-[420px]:items-center min-[420px]:gap-4">
             <div className="w-fit shrink-0 p-3 rounded-xl bg-primary shadow-lg shadow-primary/25">
               <Sparkles className="h-6 w-6 text-primary-foreground" />
             </div>
             <div className="min-w-0">
-              <h1 className="text-2xl font-bold text-primary">{isEn ? 'Kiro Settings' : 'Kiro 设置'}</h1>
-              <p className="text-muted-foreground">{isEn ? 'Manage Kiro IDE config, MCP servers and user rules' : '管理 Kiro IDE 的配置、MCP 服务器和用户规则'}</p>
+              <h1 className="break-words text-2xl font-bold leading-tight text-primary">{isEn ? 'Kiro Settings' : 'Kiro 设置'}</h1>
+              <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground md:text-base">{isEn ? 'Manage Kiro IDE config, MCP servers and user rules' : '管理 Kiro IDE 的配置、MCP 服务器和用户规则'}</p>
             </div>
           </div>
-          <div className="flex w-full flex-wrap gap-2 sm:w-auto lg:justify-end">
-            <Button variant="outline" size="sm" onClick={loadKiroSettings} className="min-w-[7rem] flex-1 bg-background/50 backdrop-blur-sm sm:flex-none">
+          <div className="grid w-full grid-cols-1 gap-2 min-[520px]:grid-cols-3 lg:w-auto lg:min-w-[23rem]">
+            <Button variant="outline" size="sm" onClick={loadKiroSettings} className="w-full bg-background/50 backdrop-blur-sm">
               <RefreshCw className="h-4 w-4 mr-2" />
               {isEn ? 'Refresh' : '刷新'}
             </Button>
-            <Button variant="outline" size="sm" onClick={openKiroSettingsFile} className="min-w-[7rem] flex-1 bg-background/50 backdrop-blur-sm sm:flex-none">
+            <Button variant="outline" size="sm" onClick={openKiroSettingsFile} className="w-full bg-background/50 backdrop-blur-sm">
               <ExternalLink className="h-4 w-4 mr-2" />
               {isEn ? 'Open File' : '打开设置文件'}
             </Button>
-            <Button size="sm" onClick={saveSettings} disabled={saving} className="min-w-[7rem] flex-1 sm:flex-none">
+            <Button size="sm" onClick={saveSettings} disabled={saving} className="w-full">
               <Save className="h-4 w-4 mr-2" />
               {saving ? (isEn ? 'Saving...' : '保存中...') : (isEn ? 'Save' : '保存设置')}
             </Button>
@@ -451,7 +449,7 @@ export function KiroSettingsPage() {
 
             {/* Toggle Options */}
             <div className="border-t pt-4 space-y-4">
-              <div className="flex items-center justify-between p-3 rounded-lg hover:bg-muted/50 transition-colors">
+              <div className="flex flex-col gap-3 p-3 rounded-lg hover:bg-muted/50 transition-colors sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <p className="font-medium">{isEn ? 'Enable Tab Autocomplete' : 'Tab 自动补全'}</p>
                   <p className="text-sm text-muted-foreground">{isEn ? 'Tab Autocomplete allows Kiro Agent to provide code suggestions in the editor as you type.' : 'Tab 自动补全允许 Kiro Agent 在输入时提供代码建议'}</p>
@@ -462,7 +460,7 @@ export function KiroSettingsPage() {
                 />
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg hover:bg-muted/50 transition-colors">
+              <div className="flex flex-col gap-3 p-3 rounded-lg hover:bg-muted/50 transition-colors sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <p className="font-medium">{isEn ? 'Usage Summary' : '使用统计'}</p>
                   <p className="text-sm text-muted-foreground">{isEn ? 'Display usage summary and elapsed time for agent executions.' : '显示 Agent 执行的用量摘要和耗时'}</p>
@@ -473,7 +471,7 @@ export function KiroSettingsPage() {
                 />
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg hover:bg-muted/50 transition-colors">
+              <div className="flex flex-col gap-3 p-3 rounded-lg hover:bg-muted/50 transition-colors sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <p className="font-medium">{isEn ? 'Code References: Reference Tracker' : '代码引用追踪'}</p>
                   <p className="text-sm text-muted-foreground">{isEn ? 'Allow Kiro to generate code with code references. Sometimes code generated by Kiro may be similar to publicly available code.' : '允许 Kiro 生成带代码引用的代码。Kiro 生成的代码可能与公开可用代码相似。'}</p>
@@ -484,7 +482,7 @@ export function KiroSettingsPage() {
                 />
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg hover:bg-muted/50 transition-colors">
+              <div className="flex flex-col gap-3 p-3 rounded-lg hover:bg-muted/50 transition-colors sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <p className="font-medium">{isEn ? 'Enable Codebase Indexing' : '代码库索引'}</p>
                   <p className="text-sm text-muted-foreground">{isEn ? 'Enable Repo Indexing (Experimental). This is an experimental feature which does not work with multi-folder workspaces.' : '启用仓库索引（实验性）。这是一个实验性功能，不支持多文件夹工作区。'}</p>
@@ -495,7 +493,7 @@ export function KiroSettingsPage() {
                 />
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg hover:bg-muted/50 transition-colors">
+              <div className="flex flex-col gap-3 p-3 rounded-lg hover:bg-muted/50 transition-colors sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <p className="font-medium">{isEn ? 'Enable Debug Logs' : '调试日志'}</p>
                   <p className="text-sm text-muted-foreground">{isEn ? 'Enable Kiro Debug Logs in the Output panel.' : '在输出面板启用 Kiro 调试日志'}</p>
@@ -511,7 +509,7 @@ export function KiroSettingsPage() {
             <div className="border-t pt-4">
               <p className="font-medium mb-3">{isEn ? 'Notifications' : '通知设置'}</p>
               <div className="space-y-3">
-                <div className="flex items-center justify-between p-3 rounded-lg hover:bg-muted/50 transition-colors">
+                <div className="flex flex-col gap-3 p-3 rounded-lg hover:bg-muted/50 transition-colors sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <p className="font-medium">{isEn ? 'Agent: Action Required' : 'Agent: 需要操作'}</p>
                     <p className="text-sm text-muted-foreground">{isEn ? 'Show desktop notification when the agent requires input, e.g. for a shell command.' : 'Agent 需要输入时显示桌面通知，如执行 Shell 命令时'}</p>
@@ -521,7 +519,7 @@ export function KiroSettingsPage() {
                     onChange={(checked) => setSettings(prev => ({ ...prev, notificationsActionRequired: checked }))}
                   />
                 </div>
-                <div className="flex items-center justify-between p-3 rounded-lg hover:bg-muted/50 transition-colors">
+                <div className="flex flex-col gap-3 p-3 rounded-lg hover:bg-muted/50 transition-colors sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <p className="font-medium">{isEn ? 'Agent: Failure' : 'Agent: 失败'}</p>
                     <p className="text-sm text-muted-foreground">{isEn ? 'Show desktop notification when the agent encounters an unexpected failure.' : 'Agent 遇到意外失败时显示桌面通知'}</p>
@@ -531,7 +529,7 @@ export function KiroSettingsPage() {
                     onChange={(checked) => setSettings(prev => ({ ...prev, notificationsFailure: checked }))}
                   />
                 </div>
-                <div className="flex items-center justify-between p-3 rounded-lg hover:bg-muted/50 transition-colors">
+                <div className="flex flex-col gap-3 p-3 rounded-lg hover:bg-muted/50 transition-colors sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <p className="font-medium">{isEn ? 'Agent: Success' : 'Agent: 成功'}</p>
                     <p className="text-sm text-muted-foreground">{isEn ? 'Show desktop notifications when the agent successfully completes a task.' : 'Agent 成功完成任务时显示桌面通知'}</p>
@@ -541,7 +539,7 @@ export function KiroSettingsPage() {
                     onChange={(checked) => setSettings(prev => ({ ...prev, notificationsSuccess: checked }))}
                   />
                 </div>
-                <div className="flex items-center justify-between p-3 rounded-lg hover:bg-muted/50 transition-colors">
+                <div className="flex flex-col gap-3 p-3 rounded-lg hover:bg-muted/50 transition-colors sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <p className="font-medium">{isEn ? 'Billing' : '账单'}</p>
                     <p className="text-sm text-muted-foreground">{isEn ? 'Show in-app notifications for billing and usage events (usage resets, low resources, overages).' : '显示账单和用量事件的应用内通知（用量重置、资源不足、超额）'}</p>
@@ -560,8 +558,8 @@ export function KiroSettingsPage() {
       {/* MCP 设置 */}
       <Card className="hover-lift">
         <CardHeader className="pb-2 cursor-pointer hover:bg-muted/30 transition-colors rounded-t-lg" onClick={() => toggleSection('mcp')}>
-          <CardTitle className="text-base flex items-center justify-between">
-            <div className="flex items-center gap-3">
+          <CardTitle className="text-base flex items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-3">
               <div className="p-2 rounded-lg bg-primary/10">
                 <Zap className="h-4 w-4 text-primary" />
               </div>
@@ -575,8 +573,8 @@ export function KiroSettingsPage() {
         </CardHeader>
         {expandedSections.mcp && (
           <CardContent className="space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
                 <p className="font-medium">{isEn ? 'Enable MCP' : '启用 MCP'}</p>
                 <p className="text-sm text-muted-foreground">{isEn ? 'Allow connections to external tools and data sources' : '允许连接外部工具和数据源'}</p>
               </div>
@@ -594,12 +592,12 @@ export function KiroSettingsPage() {
               ) : (
                 <div className="space-y-2">
                   {Object.entries(mcpConfig.mcpServers).map(([name, server]) => (
-                    <div key={name} className="flex items-center justify-between p-2 bg-muted rounded-md">
-                      <div className="flex-1">
+                    <div key={name} className="flex flex-col gap-2 p-2 bg-muted rounded-md sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0 flex-1">
                         <p className="font-medium text-sm">{name}</p>
-                        <p className="text-xs text-muted-foreground font-mono">{server.command}</p>
+                        <p className="truncate text-xs text-muted-foreground font-mono">{server.command}</p>
                       </div>
-                      <div className="flex gap-1">
+                      <div className="flex shrink-0 gap-1">
                         <button
                           className="p-1 hover:bg-background rounded transition-colors"
                           onClick={() => setEditingMcp({ name, server })}
@@ -621,16 +619,16 @@ export function KiroSettingsPage() {
               )}
             </div>
 
-            <div className="flex gap-2 pt-2">
-              <Button variant="outline" size="sm" onClick={() => setEditingMcp({})}>
+            <div className="flex flex-col gap-2 pt-2 sm:flex-row sm:flex-wrap">
+              <Button variant="outline" size="sm" onClick={() => setEditingMcp({})} className="w-full sm:w-auto">
                 <Plus className="h-4 w-4 mr-2" />
                 {isEn ? 'Add MCP Server' : '添加 MCP 服务器'}
               </Button>
-              <Button variant="outline" size="sm" onClick={() => openMcpConfig('user')}>
+              <Button variant="outline" size="sm" onClick={() => openMcpConfig('user')} className="w-full sm:w-auto">
                 <FolderOpen className="h-4 w-4 mr-2" />
                 {isEn ? 'User MCP Config' : '用户 MCP 配置'}
               </Button>
-              <Button variant="outline" size="sm" onClick={() => openMcpConfig('workspace')}>
+              <Button variant="outline" size="sm" onClick={() => openMcpConfig('workspace')} className="w-full sm:w-auto">
                 <FolderOpen className="h-4 w-4 mr-2" />
                 {isEn ? 'Workspace MCP Config' : '工作区 MCP 配置'}
               </Button>
@@ -642,8 +640,8 @@ export function KiroSettingsPage() {
       {/* Steering 用户规则 */}
       <Card className="hover-lift">
         <CardHeader className="pb-2 cursor-pointer hover:bg-muted/30 transition-colors rounded-t-lg" onClick={() => toggleSection('steering')}>
-          <CardTitle className="text-base flex items-center justify-between">
-            <div className="flex items-center gap-3">
+          <CardTitle className="text-base flex items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-3">
               <div className="p-2 rounded-lg bg-primary/10">
                 <FileText className="h-4 w-4 text-primary" />
               </div>
@@ -668,10 +666,10 @@ export function KiroSettingsPage() {
                 {steeringFiles.map((file, index) => (
                   <div
                     key={index}
-                    className="flex items-center gap-2 p-2 bg-muted rounded-md"
+                    className="flex flex-col gap-2 p-2 bg-muted rounded-md sm:flex-row sm:items-center"
                   >
-                    <FileText className="h-4 w-4 text-muted-foreground" />
-                    <span className="text-sm font-mono flex-1">{file}</span>
+                    <FileText className="hidden h-4 w-4 shrink-0 text-muted-foreground sm:block" />
+                    <span className="min-w-0 flex-1 truncate text-sm font-mono" title={file}>{file}</span>
                     <button
                       className="p-1 hover:bg-background rounded transition-colors"
                       onClick={() => openSteeringFile(file)}
@@ -698,12 +696,12 @@ export function KiroSettingsPage() {
               </div>
             )}
 
-            <div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={createDefaultRules}>
+            <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+              <Button variant="outline" size="sm" onClick={createDefaultRules} className="w-full sm:w-auto">
                 <Plus className="h-4 w-4 mr-2" />
                 {isEn ? 'Create Rules' : '创建规则文件'}
               </Button>
-              <Button variant="outline" size="sm" onClick={openSteeringFolder}>
+              <Button variant="outline" size="sm" onClick={openSteeringFolder} className="w-full sm:w-auto">
                 <FolderOpen className="h-4 w-4 mr-2" />
                 {isEn ? 'Open Steering Folder' : '打开 Steering 目录'}
               </Button>
@@ -715,8 +713,8 @@ export function KiroSettingsPage() {
       {/* 命令设置 */}
       <Card className="hover-lift">
         <CardHeader className="pb-2 cursor-pointer hover:bg-muted/30 transition-colors rounded-t-lg" onClick={() => toggleSection('commands')}>
-          <CardTitle className="text-base flex items-center justify-between">
-            <div className="flex items-center gap-3">
+          <CardTitle className="text-base flex items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-3">
               <div className="p-2 rounded-lg bg-primary/10">
                 <Terminal className="h-4 w-4 text-primary" />
               </div>
@@ -737,22 +735,22 @@ export function KiroSettingsPage() {
               <div className="space-y-2">
                 {settings.trustedCommands.map((cmd, index) => (
                   <div key={index} className="flex items-center gap-2">
-                    <code className="flex-1 px-2 py-1 bg-muted rounded text-sm">{cmd}</code>
+                    <code className="min-w-0 flex-1 truncate px-2 py-1 bg-muted rounded text-sm" title={cmd}>{cmd}</code>
                     <Button variant="ghost" size="sm" onClick={() => removeTrustedCommand(index)}>
                       <Trash2 className="h-4 w-4 text-destructive" />
                     </Button>
                   </div>
                 ))}
-                <div className="flex gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row">
                   <input
                     type="text"
                     value={newTrustedCommand}
                     onChange={(e) => setNewTrustedCommand(e.target.value)}
                     placeholder={isEn ? 'e.g.: npm *' : '如: npm *'}
-                    className="flex-1 px-3 py-1.5 rounded-md border bg-background text-sm"
+                    className="min-w-0 flex-1 px-3 py-1.5 rounded-md border bg-background text-sm"
                     onKeyDown={(e) => e.key === 'Enter' && addTrustedCommand()}
                   />
-                  <Button variant="outline" size="sm" onClick={addTrustedCommand}>
+                  <Button variant="outline" size="sm" onClick={addTrustedCommand} className="w-full sm:w-auto">
                     <Plus className="h-4 w-4" />
                   </Button>
                 </div>
@@ -768,8 +766,8 @@ export function KiroSettingsPage() {
               <p className="text-sm text-muted-foreground mb-3">{isEn ? 'Tools to auto-accept if requested by the Agent. Each tool name maps to a boolean indicating whether it should be trusted.' : '当 Agent 请求使用这些工具时自动批准。每个工具名称对应是否信任的布尔值。'}</p>
               <div className="space-y-2">
                 {Object.entries(settings.trustedTools).map(([name, trusted]) => (
-                  <div key={name} className="flex items-center gap-2">
-                    <code className="flex-1 px-2 py-1 bg-muted rounded text-sm">{name}</code>
+                  <div key={name} className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <code className="min-w-0 flex-1 truncate px-2 py-1 bg-muted rounded text-sm" title={name}>{name}</code>
                     <Toggle
                       checked={trusted}
                       onChange={(checked) => setSettings(prev => ({
@@ -788,13 +786,13 @@ export function KiroSettingsPage() {
                     </Button>
                   </div>
                 ))}
-                <div className="flex gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row">
                   <input
                     type="text"
                     value={newTrustedToolName}
                     onChange={(e) => setNewTrustedToolName(e.target.value)}
                     placeholder={isEn ? 'Tool name' : '工具名称'}
-                    className="flex-1 px-3 py-1.5 rounded-md border bg-background text-sm"
+                    className="min-w-0 flex-1 px-3 py-1.5 rounded-md border bg-background text-sm"
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && newTrustedToolName.trim()) {
                         setSettings(prev => ({
@@ -805,7 +803,7 @@ export function KiroSettingsPage() {
                       }
                     }}
                   />
-                  <Button variant="outline" size="sm" onClick={() => {
+                  <Button variant="outline" size="sm" className="w-full sm:w-auto" onClick={() => {
                     if (newTrustedToolName.trim()) {
                       setSettings(prev => ({
                         ...prev,
@@ -830,22 +828,22 @@ export function KiroSettingsPage() {
               <div className="space-y-2">
                 {settings.commandDenylist.map((cmd, index) => (
                   <div key={index} className="flex items-center gap-2">
-                    <code className="flex-1 px-2 py-1 bg-muted rounded text-sm">{cmd}</code>
+                    <code className="min-w-0 flex-1 truncate px-2 py-1 bg-muted rounded text-sm" title={cmd}>{cmd}</code>
                     <Button variant="ghost" size="sm" onClick={() => removeDenyCommand(index)}>
                       <Trash2 className="h-4 w-4 text-destructive" />
                     </Button>
                   </div>
                 ))}
-                <div className="flex gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row">
                   <input
                     type="text"
                     value={newDenyCommand}
                     onChange={(e) => setNewDenyCommand(e.target.value)}
                     placeholder={isEn ? 'e.g.: rm -rf *' : '如: rm -rf *'}
-                    className="flex-1 px-3 py-1.5 rounded-md border bg-background text-sm"
+                    className="min-w-0 flex-1 px-3 py-1.5 rounded-md border bg-background text-sm"
                     onKeyDown={(e) => e.key === 'Enter' && addDenyCommand()}
                   />
-                  <Button variant="outline" size="sm" onClick={addDenyCommand}>
+                  <Button variant="outline" size="sm" onClick={addDenyCommand} className="w-full sm:w-auto">
                     <Plus className="h-4 w-4" />
                   </Button>
                 </div>
