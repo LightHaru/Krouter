@@ -2,6 +2,12 @@
 
 All notable Krouter changes are tracked here.
 
+## 1.8.10 - 2026-06-11
+
+### Fixed
+
+- Fixed VPS account sync skipping distinct local accounts when both accounts only had the fixed placeholder `profile/AAAACCCCXXXX` ARN. The sync duplicate check now ignores placeholder profile ARNs and still deduplicates by real email/provider, user ID, refresh token, and API key.
+
 ## 1.8.9 - 2026-06-11
 
 ### Added

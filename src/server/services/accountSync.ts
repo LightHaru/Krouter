@@ -75,6 +75,11 @@ function accountProvider(account: StoredRecord): string {
   return clean(credentials.provider || account.idp || credentials.authMethod || 'unknown')
 }
 
+function isPlaceholderProfileArn(value: string): boolean {
+  if (!value) return true
+  return value.includes('aaaaccccxxxx') || value.includes('placeholder')
+}
+
 function duplicateKeys(account: StoredRecord): string[] {
   const credentials = accountCredentials(account)
   const provider = accountProvider(account)
@@ -87,7 +92,7 @@ function duplicateKeys(account: StoredRecord): string[] {
 
   if (userId) keys.push(`user:${provider}:${userId}`)
   if (email) keys.push(`email:${provider}:${email}`)
-  if (profileArn) keys.push(`profile:${profileArn}`)
+  if (profileArn && !isPlaceholderProfileArn(profileArn)) keys.push(`profile:${profileArn}`)
   if (refreshToken) keys.push(`refresh:${crypto.createHash('sha256').update(refreshToken).digest('hex')}`)
   if (kiroApiKey) keys.push(`api-key:${crypto.createHash('sha256').update(kiroApiKey).digest('hex')}`)
   return keys
