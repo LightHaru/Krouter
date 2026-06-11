@@ -143,6 +143,8 @@ interface RemoteAccountSyncResult {
   added?: number
   skipped?: number
   remoteTotal?: number
+  addedAccountIds?: string[]
+  skippedAccountIds?: string[]
   skippedAccounts?: Array<{
     id: string
     email?: string
@@ -150,6 +152,13 @@ interface RemoteAccountSyncResult {
     reason: string
   }>
   syncedAccountIds?: string[]
+  verifiedAccountIds?: string[]
+  missingAccountIds?: string[]
+  remoteAccounts?: Array<{
+    id: string
+    email?: string
+    provider?: string
+  }>
   error?: string
 }
 

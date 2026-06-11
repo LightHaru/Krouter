@@ -33,6 +33,8 @@ describe('mergePeerAccountData', () => {
 
     expect(result.added).toBe(1)
     expect(result.skipped).toBe(0)
+    expect(result.addedAccountIds).toEqual(['a1'])
+    expect(result.skippedAccountIds).toEqual([])
     expect(result.syncedAccountIds).toEqual(['a1'])
     expect(Object.keys(result.data.accounts as Record<string, unknown>)).toEqual(['a1'])
   })
@@ -44,6 +46,8 @@ describe('mergePeerAccountData', () => {
 
     expect(result.added).toBe(0)
     expect(result.skipped).toBe(1)
+    expect(result.addedAccountIds).toEqual([])
+    expect(result.skippedAccountIds).toEqual(['l1'])
     expect(result.syncedAccountIds).toEqual(['l1'])
     expect(result.skippedAccounts[0]).toMatchObject({ id: 'l1', email: 'same@example.com', existingId: 'r1', reason: 'account_exists' })
     expect(Object.keys(result.data.accounts as Record<string, unknown>)).toEqual(['r1'])
@@ -70,6 +74,8 @@ describe('mergePeerAccountData', () => {
 
     expect(result.added).toBe(0)
     expect(result.skipped).toBe(2)
+    expect(result.addedAccountIds).toEqual([])
+    expect(result.skippedAccountIds).toEqual(['l1', 'l2'])
     expect(result.syncedAccountIds).toEqual(['l1', 'l2'])
     expect(Object.keys(result.data.accounts as Record<string, unknown>).sort()).toEqual(['r1', 'r2'])
   })
@@ -94,6 +100,8 @@ describe('mergePeerAccountData', () => {
 
     expect(result.added).toBe(1)
     expect(result.skipped).toBe(0)
+    expect(result.addedAccountIds).toEqual(['l1'])
+    expect(result.skippedAccountIds).toEqual([])
     expect(result.syncedAccountIds).toEqual(['l1'])
     expect(Object.keys(result.data.accounts as Record<string, unknown>).sort()).toEqual(['l1', 'r1'])
   })

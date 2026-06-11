@@ -17,12 +17,20 @@ export interface AccountMergeSkip {
   reason: string
 }
 
+export interface AccountSyncAccountSummary {
+  id: string
+  email?: string
+  provider?: string
+}
+
 export interface AccountMergeResult {
   success: true
   data: StoredRecord
   totalIncoming: number
   added: number
   skipped: number
+  addedAccountIds: string[]
+  skippedAccountIds: string[]
   skippedAccounts: AccountMergeSkip[]
   syncedAccountIds: string[]
 }
@@ -33,8 +41,11 @@ export interface AccountMergeResponse {
   added: number
   skipped: number
   remoteTotal?: number
+  addedAccountIds?: string[]
+  skippedAccountIds?: string[]
   skippedAccounts: AccountMergeSkip[]
   syncedAccountIds?: string[]
+  remoteAccounts?: AccountSyncAccountSummary[]
 }
 
 export interface RemoteSyncResult {
@@ -44,8 +55,13 @@ export interface RemoteSyncResult {
   added?: number
   skipped?: number
   remoteTotal?: number
+  addedAccountIds?: string[]
+  skippedAccountIds?: string[]
   skippedAccounts?: AccountMergeSkip[]
   syncedAccountIds?: string[]
+  verifiedAccountIds?: string[]
+  missingAccountIds?: string[]
+  remoteAccounts?: AccountSyncAccountSummary[]
   error?: string
 }
 
@@ -109,6 +125,50 @@ function buildDuplicateIndex(accounts: Record<string, StoredRecord>): Map<string
   return index
 }
 
+export function summarizeAccounts(accounts: Record<string, unknown>): AccountSyncAccountSummary[] {
+  return Object.entries(accounts)
+    .filter((entry): entry is [string, StoredRecord] => isRecord(entry[1]))
+    .map(([id, account]) => ({
+      id: String(account.id || id),
+      email: typeof account.email === 'string' ? account.email : undefined,
+      provider: accountProvider(account) || undefined
+    }))
+}
+
+function accountPresenceKey(account: StoredRecord): string | null {
+  const email = clean(account.email)
+  if (!email) return null
+  return `${accountProvider(account)}:${email}`
+}
+
+function verifiedAccountIdsFromRemote(
+  incomingAccounts: Record<string, StoredRecord>,
+  remoteAccounts: AccountSyncAccountSummary[] | undefined
+): { verifiedAccountIds: string[]; missingAccountIds: string[] } {
+  if (!remoteAccounts) return { verifiedAccountIds: [], missingAccountIds: [] }
+  const remoteKeys = new Set(
+    remoteAccounts
+      .map((account) => {
+        const email = clean(account.email)
+        if (!email) return null
+        return `${clean(account.provider || 'unknown')}:${email}`
+      })
+      .filter((value): value is string => Boolean(value))
+  )
+  const verifiedAccountIds: string[] = []
+  const missingAccountIds: string[] = []
+  for (const [rawId, account] of Object.entries(incomingAccounts)) {
+    const sourceId = String(account.id || rawId)
+    const key = accountPresenceKey(account)
+    if (key && remoteKeys.has(key)) {
+      verifiedAccountIds.push(sourceId)
+    } else {
+      missingAccountIds.push(sourceId)
+    }
+  }
+  return { verifiedAccountIds, missingAccountIds }
+}
+
 export function mergePeerAccountData(currentRaw: unknown, incomingRaw: unknown): AccountMergeResult {
   const current = isRecord(currentRaw) ? currentRaw : {}
   const incoming = isRecord(incomingRaw) ? incomingRaw : {}
@@ -122,6 +182,8 @@ export function mergePeerAccountData(currentRaw: unknown, incomingRaw: unknown):
   const accounts: Record<string, StoredRecord> = { ...currentAccounts }
   const duplicateIndex = buildDuplicateIndex(accounts)
   const skippedAccounts: AccountMergeSkip[] = []
+  const addedAccountIds: string[] = []
+  const skippedAccountIds: string[] = []
   const syncedAccountIds: string[] = []
   let added = 0
 
@@ -137,6 +199,7 @@ export function mergePeerAccountData(currentRaw: unknown, incomingRaw: unknown):
         existingId,
         reason: 'account_exists'
       })
+      skippedAccountIds.push(sourceId)
       syncedAccountIds.push(sourceId)
       continue
     }
@@ -148,6 +211,7 @@ export function mergePeerAccountData(currentRaw: unknown, incomingRaw: unknown):
       if (!duplicateIndex.has(key)) duplicateIndex.set(key, targetId)
     }
     added++
+    addedAccountIds.push(sourceId)
     syncedAccountIds.push(sourceId)
   }
 
@@ -162,6 +226,8 @@ export function mergePeerAccountData(currentRaw: unknown, incomingRaw: unknown):
     totalIncoming: Object.keys(incomingAccounts).length,
     added,
     skipped: skippedAccounts.length,
+    addedAccountIds,
+    skippedAccountIds,
     skippedAccounts,
     syncedAccountIds
   }
@@ -238,8 +304,12 @@ export async function pushAccountDataToRemote(input: RemoteSyncInput = {}, local
         added: remoteResult.added,
         skipped: remoteResult.skipped,
         remoteTotal: remoteResult.remoteTotal,
+        addedAccountIds: remoteResult.addedAccountIds || [],
+        skippedAccountIds: remoteResult.skippedAccountIds || [],
         skippedAccounts: remoteResult.skippedAccounts,
-        syncedAccountIds: remoteResult.syncedAccountIds || []
+        syncedAccountIds: remoteResult.syncedAccountIds || [],
+        remoteAccounts: remoteResult.remoteAccounts,
+        ...verifiedAccountIdsFromRemote(payload.accounts, remoteResult.remoteAccounts)
       }
     }
 
@@ -273,8 +343,12 @@ export async function pushAccountDataToRemote(input: RemoteSyncInput = {}, local
       added: remoteResult.added,
       skipped: remoteResult.skipped,
       remoteTotal: remoteResult.remoteTotal,
+      addedAccountIds: remoteResult.addedAccountIds || [],
+      skippedAccountIds: remoteResult.skippedAccountIds || [],
       skippedAccounts: remoteResult.skippedAccounts,
-      syncedAccountIds: remoteResult.syncedAccountIds || []
+      syncedAccountIds: remoteResult.syncedAccountIds || [],
+      remoteAccounts: remoteResult.remoteAccounts,
+      ...verifiedAccountIdsFromRemote(payload.accounts, remoteResult.remoteAccounts)
     }
   } catch (error) {
     return {

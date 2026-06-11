@@ -76,6 +76,11 @@ function secretDuplicateValue(value: unknown): string {
   return String(value || '').trim()
 }
 
+export function isPlaceholderProfileArn(value: unknown): boolean {
+  const normalized = cleanDuplicateValue(value)
+  return !normalized || normalized.includes('aaaaccccxxxx') || normalized.includes('placeholder')
+}
+
 function accountDuplicateKeys(account: Partial<Account>): string[] {
   const credentials = (account.credentials || {}) as Partial<Account['credentials']>
   const provider = cleanDuplicateValue(credentials.provider || account.idp || credentials.authMethod || 'unknown')
@@ -87,7 +92,7 @@ function accountDuplicateKeys(account: Partial<Account>): string[] {
   const keys: string[] = []
   if (userId) keys.push(`user:${provider}:${userId}`)
   if (email) keys.push(`email:${provider}:${email}`)
-  if (profileArn) keys.push(`profile:${profileArn}`)
+  if (profileArn && !isPlaceholderProfileArn(profileArn)) keys.push(`profile:${profileArn}`)
   if (refreshToken) keys.push(`refresh:${refreshToken}`)
   if (kiroApiKey) keys.push(`api-key:${kiroApiKey}`)
   return keys
