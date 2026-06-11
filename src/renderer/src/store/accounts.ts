@@ -68,6 +68,47 @@ type ProxyAccountUpdate = {
   lastUsed?: number
 }
 
+function cleanDuplicateValue(value: unknown): string {
+  return String(value || '').trim().toLowerCase()
+}
+
+function secretDuplicateValue(value: unknown): string {
+  return String(value || '').trim()
+}
+
+function accountDuplicateKeys(account: Partial<Account>): string[] {
+  const credentials = (account.credentials || {}) as Partial<Account['credentials']>
+  const provider = cleanDuplicateValue(credentials.provider || account.idp || credentials.authMethod || 'unknown')
+  const email = cleanDuplicateValue(account.email)
+  const userId = cleanDuplicateValue(account.userId)
+  const profileArn = cleanDuplicateValue(account.profileArn)
+  const refreshToken = secretDuplicateValue(credentials.refreshToken)
+  const kiroApiKey = secretDuplicateValue(credentials.kiroApiKey)
+  const keys: string[] = []
+  if (userId) keys.push(`user:${provider}:${userId}`)
+  if (email) keys.push(`email:${provider}:${email}`)
+  if (profileArn) keys.push(`profile:${profileArn}`)
+  if (refreshToken) keys.push(`refresh:${refreshToken}`)
+  if (kiroApiKey) keys.push(`api-key:${kiroApiKey}`)
+  return keys
+}
+
+function findDuplicateAccountId(
+  accounts: Map<string, Account>,
+  candidate: Partial<Account>,
+  excludeId?: string
+): string | null {
+  const candidateKeys = new Set(accountDuplicateKeys(candidate))
+  if (candidateKeys.size === 0) return null
+  for (const [id, account] of accounts) {
+    if (excludeId && id === excludeId) continue
+    for (const key of accountDuplicateKeys(account)) {
+      if (candidateKeys.has(key)) return id
+    }
+  }
+  return null
+}
+
 // ============ getFilteredAccounts / getStats 引用缓存 ============
 // 大账号量场景下这两个 selector 每次 re-render 都跑 O(n) 计算（filter + sort）
 // 通过引用比较缓存输入快照，命中时直接返回上次结果，将 N×n 计算降至 1×n
@@ -687,6 +728,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   // ==================== 账号 CRUD ====================
 
   addAccount: (accountData) => {
+    const duplicateId = findDuplicateAccountId(get().accounts, accountData)
+    if (duplicateId) {
+      console.warn('[AccountsStore] Account already exists, skipped duplicate add:', accountData.email || duplicateId)
+      return duplicateId
+    }
+
     const id = uuidv4()
     const now = Date.now()
     deletedAccountIds.delete(id)
@@ -1282,6 +1329,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     // 批量构造账号对象 + 一次 set，避免 N 次 new Map(O(n²)) 与 N 次 re-render
     const newAccounts: Account[] = []
+    const workingAccounts = new Map(get().accounts)
     for (const item of items) {
       try {
         const now = Date.now()
@@ -1320,7 +1368,17 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           status: 'unknown',
           lastUsedAt: now
         }
+        const duplicateId = findDuplicateAccountId(workingAccounts, account)
+        if (duplicateId) {
+          result.failed++
+          result.errors.push({
+            id: item.email,
+            error: 'Account already exists'
+          })
+          continue
+        }
         newAccounts.push(account)
+        workingAccounts.set(account.id, account)
         result.success++
       } catch (error) {
         result.failed++
@@ -1349,7 +1407,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   importFromExportData: (data) => {
     const result: BatchOperationResult = { success: 0, failed: 0, errors: [] }
-    const { accounts: existingAccounts } = get()
+    const workingAccounts = new Map(get().accounts)
+    const existingAccounts = workingAccounts
     
     // 检查账户是否已存在（同邮箱+同provider 或 同userId 才算重复）
     const isAccountExists = (email: string, userId?: string, provider?: string): boolean => {
@@ -1380,12 +1439,14 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     for (const accountData of uniqueAccounts) {
       // 检查本地是否已存在（传入 provider 参数）
-      if (isAccountExists(accountData.email, accountData.userId, accountData.credentials?.provider)) {
+      if (isAccountExists(accountData.email, accountData.userId, accountData.credentials?.provider) || findDuplicateAccountId(workingAccounts, accountData)) {
         skipped++
         continue
       }
       try {
-        accountsToAdd.push({ ...accountData, isActive: false })
+        const accountToAdd = { ...accountData, isActive: false }
+        accountsToAdd.push(accountToAdd)
+        workingAccounts.set(accountToAdd.id, accountToAdd)
         result.success++
       } catch (error) {
         result.failed++

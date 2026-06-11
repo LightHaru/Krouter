@@ -525,6 +525,39 @@ async function restartTunnel(localUrl) {
   await startTunnel(localUrl)
 }
 
+function formatDateTime(value) {
+  if (!value) return '-'
+  try {
+    return new Date(Number(value)).toLocaleString()
+  } catch {
+    return '-'
+  }
+}
+
+async function printSyncPasswordStatus() {
+  const status = await ipc('accountSyncGetStatus')
+  console.log(line('Sync password', status.enabled ? `${COLORS.green}DA TAO${COLORS.reset}` : `${COLORS.yellow}CHUA TAO${COLORS.reset}`))
+  if (status.createdAt) console.log(line('Tao luc', formatDateTime(status.createdAt)))
+  if (status.updatedAt) console.log(line('Cap nhat', formatDateTime(status.updatedAt)))
+  if (!status.enabled) console.log(`${COLORS.yellow}Chay: ${COMMAND_NAME} sync-password${COLORS.reset}`)
+  return status
+}
+
+async function generateSyncPassword() {
+  const result = await ipc('accountSyncGeneratePassword')
+  if (!result?.success || !result.password) {
+    throw new Error(result?.error || 'Tao mat khau dong bo that bai')
+  }
+  const tunnel = await getTunnelStatus().catch(() => null)
+  boxedTitle('Account sync password', 'Dung tren may local de dong bo account len VPS')
+  console.log(line('Tunnel URL', `${COLORS.green}${activeDashboardUrl(tunnel)}${COLORS.reset}`))
+  console.log(line('Sync password', `${COLORS.yellow}${result.password}${COLORS.reset}`))
+  console.log(line('Trang thai', `${COLORS.green}DA BAT${COLORS.reset}`))
+  console.log(`${COLORS.yellow}Mat khau chi hien thi lan nay. Neu mat, chay lai lenh nay de tao mat khau moi.${COLORS.reset}`)
+  console.log(horizontal())
+  return result
+}
+
 async function stopServer() {
   const pid = readPid()
   if (!pid || !isPidRunning(pid)) {
@@ -562,6 +595,7 @@ async function menu() {
       console.log(`${COLORS.bold}3.${COLORS.reset} Tao lai tunnel public`)
       console.log(`${COLORS.bold}4.${COLORS.reset} Tat tunnel`)
       console.log(`${COLORS.bold}5.${COLORS.reset} Mo dashboard`)
+      console.log(`${COLORS.bold}6.${COLORS.reset} Tao mat khau dong bo account`)
       console.log(`${COLORS.bold}0.${COLORS.reset} Thoat`)
       const choice = await ask(rl, '\nChon: ', '0')
       try {
@@ -580,6 +614,9 @@ async function menu() {
           await waitForEnter(rl)
         } else if (choice === '5') {
           openBrowser(DASHBOARD_URL)
+          await waitForEnter(rl)
+        } else if (choice === '6') {
+          await generateSyncPassword()
           await waitForEnter(rl)
         } else if (choice === '0' || /^q/i.test(choice)) {
           return
@@ -604,6 +641,8 @@ function usage() {
   console.log(`  ${COMMAND_NAME} setup`)
   console.log(`  ${COMMAND_NAME} status`)
   console.log(`  ${COMMAND_NAME} links`)
+  console.log(`  ${COMMAND_NAME} sync-password`)
+  console.log(`  ${COMMAND_NAME} sync-password status`)
   console.log(`  ${COMMAND_NAME} tunnel start [local-url]`)
   console.log(`  ${COMMAND_NAME} tunnel restart [local-url]`)
   console.log(`  ${COMMAND_NAME} tunnel stop`)
@@ -647,6 +686,10 @@ async function main() {
 
   if (command === 'status') return printStatus()
   if (command === 'links' || command === 'url' || command === 'link') return printLinks()
+  if (command === 'sync-password') {
+    if (subcommand === 'status') return printSyncPasswordStatus()
+    return generateSyncPassword()
+  }
   if (command === 'tunnel' && subcommand === 'start') return startTunnel(rest[0])
   if (command === 'tunnel' && subcommand === 'restart') return restartTunnel(rest[0])
   if (command === 'tunnel' && subcommand === 'stop') return stopTunnel()

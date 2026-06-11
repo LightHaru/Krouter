@@ -237,6 +237,7 @@ function injectProxySession(url: string): string {
 
 type RegMode = 'manual' | 'outlook' | 'tempmail' | 'tingamefi' | 'proton' | 'mixed'
 type AutoEmailSource = 'outlook' | 'tempmail' | 'tingamefi' | 'proton'
+type RegistrationNetworkSource = 'server' | 'client-proxy'
 /**
  * Phase 状态机：
  * - idle：未开始
@@ -275,6 +276,14 @@ interface RegResult {
   provider?: string
   verify?: Record<string, unknown>
   fingerprint?: FingerprintSnapshot
+}
+
+function makeFailedRegResult(error: unknown, email = ''): RegResult {
+  return {
+    status: 'failed',
+    email,
+    error: error instanceof Error ? error.message : String(error || 'unknown')
+  }
 }
 
 type ImportedAccountData = Omit<Account, 'id' | 'createdAt' | 'isActive'>
@@ -450,6 +459,59 @@ function BatchItemRow({
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+function RegistrationErrorDiagnosisPanel({
+  error,
+  className,
+  compact = false
+}: {
+  error?: string
+  className?: string
+  compact?: boolean
+}): React.ReactNode {
+  if (!error) return null
+  const diag = diagnoseRegError(error)
+
+  return (
+    <div className={cn('rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 space-y-2', className)}>
+      <div className="flex items-start gap-2">
+        <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-red-600" />
+        <div className="min-w-0">
+          <div className={cn('font-medium text-red-700 dark:text-red-400', compact ? 'text-xs' : 'text-sm')}>
+            {diag.title}
+          </div>
+          <div className={cn('mt-1 text-muted-foreground', compact ? 'text-[11px]' : 'text-xs')}>
+            {diag.category === 'risk_control'
+              ? 'AWS/Kiro da chan yeu cau dang ky. Hay dung batch, giam toc do va kiem tra email/cau hinh proxy truoc khi thu tiep.'
+              : 'Krouter da phan loai loi va goi y cach xu ly ben duoi.'}
+          </div>
+        </div>
+      </div>
+
+      {diag.reasons.length > 0 && (
+        <div className={cn('text-foreground/80', compact ? 'text-[11px]' : 'text-xs')}>
+          <div className="text-muted-foreground">Nguyen nhan co the:</div>
+          <ul className="list-disc pl-4 space-y-0.5">
+            {diag.reasons.map((reason, index) => <li key={index}>{reason}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {diag.suggestions.length > 0 && (
+        <div className={cn('text-foreground/80', compact ? 'text-[11px]' : 'text-xs')}>
+          <div className="text-muted-foreground">De xuat:</div>
+          <ul className="list-disc pl-4 space-y-0.5">
+            {diag.suggestions.map((suggestion, index) => <li key={index}>{suggestion}</li>)}
+          </ul>
+        </div>
+      )}
+
+      <div className="break-all border-t border-red-500/20 pt-2 font-mono text-[10px] text-muted-foreground">
+        Raw: {error}
+      </div>
     </div>
   )
 }
@@ -698,6 +760,9 @@ export type ProPlanType = 'Q_DEVELOPER_STANDALONE_PRO' | 'Q_DEVELOPER_STANDALONE
 
 interface RegisterConfig {
   mode: RegMode
+  networkSource?: RegistrationNetworkSource
+  clientProxyUrl?: string
+  clientProxyUpstream?: string
   outlookData: string
   fullName: string
   batchCount: number
@@ -736,6 +801,238 @@ function saveConfig(cfg: RegisterConfig): void {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)) } catch { /* ignore */ }
 }
 
+const REMOTE_SYNC_STORAGE_KEY = 'kiro-register-remote-sync'
+const SYNCED_REMOTE_TAG_NAME = '\u0110\u00e3 \u0111\u1ed3ng b\u1ed9'
+
+interface RemoteSyncConfig {
+  targetUrl: string
+  syncPassword: string
+}
+
+interface RemoteSyncUiResult {
+  success: boolean
+  message: string
+  added?: number
+  skipped?: number
+  totalIncoming?: number
+  remoteTotal?: number
+  tagged?: number
+}
+
+function loadRemoteSyncConfig(): RemoteSyncConfig {
+  try {
+    const raw = localStorage.getItem(REMOTE_SYNC_STORAGE_KEY)
+    const parsed = raw ? JSON.parse(raw) as Partial<RemoteSyncConfig> : {}
+    return {
+      targetUrl: parsed.targetUrl || '',
+      syncPassword: parsed.syncPassword || ''
+    }
+  } catch {
+    return { targetUrl: '', syncPassword: '' }
+  }
+}
+
+function saveRemoteSyncConfig(cfg: RemoteSyncConfig): void {
+  try { localStorage.setItem(REMOTE_SYNC_STORAGE_KEY, JSON.stringify(cfg)) } catch { /* ignore */ }
+}
+
+function RegistrationNetworkSourcePanel({
+  isEn,
+  isDisabled,
+  networkSource,
+  setNetworkSource,
+  clientProxyUrl,
+  setClientProxyUrl,
+  clientProxyUpstream,
+  setClientProxyUpstream
+}: {
+  isEn: boolean
+  isDisabled: boolean
+  networkSource: RegistrationNetworkSource
+  setNetworkSource: (value: RegistrationNetworkSource) => void
+  clientProxyUrl: string
+  setClientProxyUrl: (value: string) => void
+  clientProxyUpstream: string
+  setClientProxyUpstream: (value: string) => void
+}): React.ReactNode {
+  return (
+    <div className="rounded-lg border bg-muted/20 p-3 space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <Network className="h-4 w-4 text-primary" />
+          <div>
+            <div className="text-sm font-medium">{isEn ? 'Registration IP source' : 'Nguon IP dang ky'}</div>
+            <div className="text-xs text-muted-foreground">
+              {isEn ? 'Choose where the registration request exits.' : 'Chon noi request dang ky di ra Internet.'}
+            </div>
+          </div>
+        </div>
+        <Badge variant="outline" className={networkSource === 'client-proxy' ? 'border-primary/40 text-primary' : ''}>
+          {networkSource === 'client-proxy' ? (isEn ? 'Client route' : 'May ca nhan') : (isEn ? 'Backend route' : 'Backend/VPS')}
+        </Badge>
+      </div>
+
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <button
+          type="button"
+          disabled={isDisabled}
+          onClick={() => setNetworkSource('server')}
+          className={cn(
+            'rounded-md border px-3 py-2 text-left transition-colors disabled:opacity-50',
+            networkSource === 'server'
+              ? 'border-primary bg-primary/10 text-primary'
+              : 'border-border bg-background hover:border-primary/40'
+          )}
+        >
+          <div className="text-sm font-medium">{isEn ? 'Backend / VPS' : 'Backend / VPS'}</div>
+          <div className="text-xs text-muted-foreground">
+            {isEn ? 'Use the machine running Krouter backend.' : 'Dung IP cua may dang chay backend Krouter.'}
+          </div>
+        </button>
+        <button
+          type="button"
+          disabled={isDisabled}
+          onClick={() => setNetworkSource('client-proxy')}
+          className={cn(
+            'rounded-md border px-3 py-2 text-left transition-colors disabled:opacity-50',
+            networkSource === 'client-proxy'
+              ? 'border-primary bg-primary/10 text-primary'
+              : 'border-border bg-background hover:border-primary/40'
+          )}
+        >
+          <div className="text-sm font-medium">{isEn ? 'Personal machine' : 'May ca nhan'}</div>
+          <div className="text-xs text-muted-foreground">
+            {isEn ? 'Use a proxy/helper running on your PC.' : 'Dung proxy/helper dang chay tren may ca nhan.'}
+          </div>
+        </button>
+      </div>
+
+      {networkSource === 'client-proxy' && (
+        <div className="space-y-3 rounded-md border border-dashed bg-background/70 p-3">
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+            <div className="space-y-1.5 md:col-span-2">
+              <Label className="text-xs">{isEn ? 'Client proxy/helper URL' : 'Client proxy/helper URL'}</Label>
+              <Input
+                value={clientProxyUrl}
+                onChange={(event) => setClientProxyUrl(event.target.value)}
+                placeholder="http://user:pass@your-pc-ip:8080 or socks5://127.0.0.1:1080"
+                disabled={isDisabled}
+                className="font-mono text-xs"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">{isEn ? 'Upstream proxy (optional)' : 'Upstream proxy (optional)'}</Label>
+              <Input
+                value={clientProxyUpstream}
+                onChange={(event) => setClientProxyUpstream(event.target.value)}
+                placeholder="http://relay:port"
+                disabled={isDisabled}
+                className="font-mono text-xs"
+              />
+            </div>
+          </div>
+          <div className="flex items-start gap-2 text-xs text-muted-foreground">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
+            <span>
+              {isEn
+                ? 'The browser alone cannot lend its IP to the VPS backend. This mode requires a reachable proxy/helper on your personal machine and will not silently fall back to the VPS IP.'
+                : 'Trinh duyet khong the tu cho VPS muon IP. Che do nay can proxy/helper tren may ca nhan va khong tu roi ve IP VPS.'}
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function RemoteKrouterSyncPanel({
+  isEn,
+  accountCount,
+  targetUrl,
+  setTargetUrl,
+  syncPassword,
+  setSyncPassword,
+  isSyncing,
+  result,
+  onSync
+}: {
+  isEn: boolean
+  accountCount: number
+  targetUrl: string
+  setTargetUrl: (value: string) => void
+  syncPassword: string
+  setSyncPassword: (value: string) => void
+  isSyncing: boolean
+  result: RemoteSyncUiResult | null
+  onSync: () => void
+}): React.ReactNode {
+  const disabled = isSyncing || !targetUrl.trim() || !syncPassword
+  return (
+    <Card className="hover-lift">
+      <CardHeader className="pb-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <CardTitle className="text-base flex items-center gap-2">
+            <Upload className="h-4 w-4 text-primary" />
+            {isEn ? 'Sync local accounts to VPS' : 'Dong bo tai khoan local len VPS'}
+          </CardTitle>
+          <Badge variant="outline">{accountCount} {isEn ? 'local accounts' : 'tai khoan local'}</Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+          <div className="space-y-1.5 md:col-span-2">
+            <Label className="text-xs">{isEn ? 'VPS Krouter tunnel URL' : 'URL tunnel Krouter VPS'}</Label>
+            <Input
+              value={targetUrl}
+              onChange={(event) => setTargetUrl(event.target.value)}
+              placeholder="https://your-krouter.trycloudflare.com"
+              className="font-mono text-xs"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">{isEn ? 'Account sync password' : 'Mat khau dong bo account'}</Label>
+            <Input
+              value={syncPassword}
+              onChange={(event) => setSyncPassword(event.target.value)}
+              placeholder="ksync-..."
+              type="password"
+              className="font-mono text-xs"
+            />
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" onClick={onSync} disabled={disabled}>
+            {isSyncing ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Upload className="h-4 w-4 mr-2" />}
+            {isEn ? 'Sync to VPS' : 'Dong bo len VPS'}
+          </Button>
+          <span className="text-xs text-muted-foreground">
+            {isEn
+              ? `Run ${'krouter sync-password'} on the VPS, then paste the current tunnel URL here. Existing accounts are skipped.`
+              : `Chay ${'krouter sync-password'} tren VPS, dan link tunnel hien tai vao day. Tai khoan da co se duoc bo qua.`}
+          </span>
+        </div>
+
+        {result && (
+          <div className={cn(
+            'rounded-md border px-3 py-2 text-xs',
+            result.success
+              ? 'border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/20 dark:text-emerald-300'
+              : 'border-red-300 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/20 dark:text-red-300'
+          )}>
+            <div className="font-medium">{result.message}</div>
+            {result.success && (
+              <div className="mt-1 text-muted-foreground">
+                {isEn ? 'Added' : 'Da them'}: {result.added ?? 0} - {isEn ? 'Skipped existing' : 'Bo qua trung'}: {result.skipped ?? 0} - {isEn ? 'Tagged locally' : 'Da gan tag local'}: {result.tagged ?? 0} - {isEn ? 'Remote total' : 'Tong tren VPS'}: {result.remoteTotal ?? '-'}
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
 export function RegisterPage(): React.JSX.Element {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
@@ -746,6 +1043,14 @@ export function RegisterPage(): React.JSX.Element {
   const [logs, setLogs] = useState<string[]>(_logs)
   const [result, _setResult] = useState<RegResult | null>(_result)
   const [imported, setImported] = useState(false)
+  const [networkSource, setNetworkSource] = useState<RegistrationNetworkSource>(saved.networkSource === 'client-proxy' ? 'client-proxy' : 'server')
+  const [clientProxyUrl, setClientProxyUrl] = useState(saved.clientProxyUrl || '')
+  const [clientProxyUpstream, setClientProxyUpstream] = useState(saved.clientProxyUpstream || '')
+  const remoteSyncSaved = useRef(loadRemoteSyncConfig()).current
+  const [remoteSyncUrl, setRemoteSyncUrl] = useState(remoteSyncSaved.targetUrl)
+  const [remoteSyncPassword, setRemoteSyncPassword] = useState(remoteSyncSaved.syncPassword)
+  const [remoteSyncRunning, setRemoteSyncRunning] = useState(false)
+  const [remoteSyncResult, setRemoteSyncResult] = useState<RemoteSyncUiResult | null>(null)
 
   const setPhase = useCallback((p: Phase) => { _phase = p; _refSetPhase?.(p) }, [])
   const setResult = useCallback((r: RegResult | null) => { _result = r; _refSetResult?.(r) }, [])
@@ -799,8 +1104,96 @@ export function RegisterPage(): React.JSX.Element {
     _refSetLogs?.(next)
   }, [])
 
+  useEffect(() => {
+    saveRemoteSyncConfig({
+      targetUrl: remoteSyncUrl,
+      syncPassword: remoteSyncPassword
+    })
+  }, [remoteSyncUrl, remoteSyncPassword])
+
+  const tagSyncedLocalAccounts = useCallback((ids: string[] | undefined): number => {
+    const state = useAccountsStore.getState()
+    const localIds = (ids || []).filter((id) => state.accounts.has(id))
+    if (localIds.length === 0) return 0
+    const existingTag = Array.from(state.tags.values()).find((tag) => tag.name.trim().toLowerCase() === SYNCED_REMOTE_TAG_NAME.toLowerCase())
+    const tagId = existingTag?.id || state.addTag({ name: SYNCED_REMOTE_TAG_NAME, color: '#10b981' })
+    useAccountsStore.getState().addTagToAccounts(localIds, tagId)
+    return localIds.length
+  }, [])
+
+  const handleRemoteSync = useCallback(async (): Promise<void> => {
+    if (!remoteSyncUrl.trim()) {
+      setRemoteSyncResult({ success: false, message: isEn ? 'Remote Krouter URL is required.' : 'Can nhap URL Krouter VPS.' })
+      return
+    }
+    if (!remoteSyncPassword) {
+      setRemoteSyncResult({ success: false, message: isEn ? 'Account sync password is required.' : 'Can nhap mat khau dong bo account.' })
+      return
+    }
+    if (typeof window.api.syncAccountsToRemote !== 'function') {
+      setRemoteSyncResult({ success: false, message: isEn ? 'This runtime does not support remote sync.' : 'Runtime nay chua ho tro dong bo remote.' })
+      return
+    }
+
+    setRemoteSyncRunning(true)
+    setRemoteSyncResult(null)
+    try {
+      await useAccountsStore.getState().flushSaveImmediately()
+      const response = await window.api.syncAccountsToRemote({
+        targetUrl: remoteSyncUrl.trim(),
+        syncPassword: remoteSyncPassword,
+        timeoutMs: 30000
+      })
+      if (!response.success) {
+        const message = response.error || (isEn ? 'Remote sync failed.' : 'Dong bo len VPS that bai.')
+        setRemoteSyncResult({ success: false, message })
+        addLog(`[RemoteSync] ${message}`)
+        return
+      }
+      const message = isEn
+        ? `Synced to ${response.targetUrl || remoteSyncUrl.trim()}`
+        : `Da dong bo len ${response.targetUrl || remoteSyncUrl.trim()}`
+      const tagged = tagSyncedLocalAccounts(response.syncedAccountIds)
+      if (tagged > 0) await useAccountsStore.getState().flushSaveImmediately()
+      setRemoteSyncResult({
+        success: true,
+        message,
+        added: response.added,
+        skipped: response.skipped,
+        totalIncoming: response.totalIncoming,
+        remoteTotal: response.remoteTotal,
+        tagged
+      })
+      addLog(`[RemoteSync] added=${response.added ?? 0}, skipped=${response.skipped ?? 0}, tagged=${tagged}, remoteTotal=${response.remoteTotal ?? '-'}`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setRemoteSyncResult({ success: false, message })
+      addLog(`[RemoteSync] ${message}`)
+    } finally {
+      setRemoteSyncRunning(false)
+    }
+  }, [addLog, isEn, remoteSyncUrl, remoteSyncPassword, tagSyncedLocalAccounts])
+
   const addImportedAccountWithLiveness = useCallback(async (accountData: ImportedAccountData): Promise<ImportWithLivenessResult> => {
     let lastError = accountData.lastError
+    const incomingEmail = accountData.email.trim().toLowerCase()
+    const incomingProvider = String(accountData.credentials.provider || accountData.idp || '').trim().toLowerCase()
+    const incomingRefreshToken = String(accountData.credentials.refreshToken || '').trim()
+    const incomingProfileArn = String(accountData.profileArn || '').trim().toLowerCase()
+    const duplicate = Array.from(accounts.values()).find((account) => {
+      if (incomingRefreshToken && account.credentials.refreshToken === incomingRefreshToken) return true
+      if (incomingProfileArn && account.profileArn?.trim().toLowerCase() === incomingProfileArn) return true
+      return Boolean(
+        incomingEmail &&
+        account.email.trim().toLowerCase() === incomingEmail &&
+        String(account.credentials.provider || account.idp || '').trim().toLowerCase() === incomingProvider
+      )
+    })
+    if (duplicate) {
+      const message = isEn ? 'This account already exists' : 'Tai khoan da ton tai'
+      addLog(`[Nhap] ${accountData.email}: ${message}`)
+      return { ok: false, error: message }
+    }
 
     if (accountData.credentials.accessToken) {
       const provider = accountData.credentials.provider || accountData.idp
@@ -867,7 +1260,7 @@ export function RegisterPage(): React.JSX.Element {
     })
 
     return { ok: true, accountId }
-  }, [addAccount, addLog])
+  }, [accounts, addAccount, addLog, isEn])
 
   useEffect(() => {
     const el = logContainerRef.current
@@ -967,7 +1360,18 @@ export function RegisterPage(): React.JSX.Element {
     if (fullName.trim()) config.fullName = fullName.trim()
 
     // 代理池注入：如果代理池启用且有可用代理，自动取一个并传入 config
-    const proxyInfo = getRegistrationProxy()
+    if (networkSource === 'client-proxy') {
+      const route = resolveRegistrationNetworkRoute()
+      if (!route.success) {
+        addLog(`[Network] ${route.error}`)
+        setResult(makeFailedRegResult(route.error))
+        setPhase('idle')
+        return
+      }
+      Object.assign(config, route.patch)
+      route.logLines.forEach(addLog)
+    }
+    const proxyInfo = networkSource === 'client-proxy' ? null : getRegistrationProxy()
     if (proxyInfo) {
       const proxiedUrl = injectProxySession(proxyInfo.proxy)
       config.proxy = proxiedUrl
@@ -976,13 +1380,14 @@ export function RegisterPage(): React.JSX.Element {
       if (proxiedUrl === proxyInfo.proxy) {
         addLog('[Proxy] This proxy URL has no {session} placeholder or supported session username pattern; if the provider assigns a fixed endpoint, the exit IP can remain unchanged.')
       }
-    } else {
+    } else if (networkSource !== 'client-proxy') {
       addLog('[Proxy] Proxy pool is disabled or has no usable proxy; registration will use direct/system network, so the exit IP can remain unchanged.')
     }
 
     const res = await window.api.registrationManualPhase1(config)
     if (!res.success) {
       addLog(`${t('register.logInitFailed')} ${res.error}`)
+      setResult(makeFailedRegResult(res.error, preEmail))
       setPhase('idle')
       return
     }
@@ -999,6 +1404,7 @@ export function RegisterPage(): React.JSX.Element {
         setPhase('otp')
       } else {
         addLog(`${t('register.logFailed')} ${phase2Res.error}`)
+        setResult(makeFailedRegResult(phase2Res.error, preEmail))
         setPhase('idle')
       }
     }
@@ -1015,6 +1421,7 @@ export function RegisterPage(): React.JSX.Element {
       setPhase('otp')
     } else {
       addLog(`${t('register.logFailed')} ${res.error}`)
+      setResult(makeFailedRegResult(res.error, email.trim()))
       setPhase('idle')
     }
   }
@@ -1057,6 +1464,7 @@ export function RegisterPage(): React.JSX.Element {
       }
     } else {
       addLog(`${t('register.logFailed')} ${res.error}`)
+      setResult(makeFailedRegResult(res.error, email.trim()))
       setPhase('idle')
     }
   }
@@ -1099,7 +1507,18 @@ export function RegisterPage(): React.JSX.Element {
     }
 
     // 代理池注入
-    const proxyInfo = getRegistrationProxy()
+    if (networkSource === 'client-proxy') {
+      const route = resolveRegistrationNetworkRoute()
+      if (!route.success) {
+        addLog(`[Network] ${route.error}`)
+        setResult(makeFailedRegResult(route.error))
+        setPhase('idle')
+        return
+      }
+      Object.assign(config, route.patch)
+      route.logLines.forEach(addLog)
+    }
+    const proxyInfo = networkSource === 'client-proxy' ? null : getRegistrationProxy()
     if (proxyInfo) {
       const proxiedUrl = injectProxySession(proxyInfo.proxy)
       config.proxy = proxiedUrl
@@ -1108,7 +1527,7 @@ export function RegisterPage(): React.JSX.Element {
       if (proxiedUrl === proxyInfo.proxy) {
         addLog('[Proxy] This proxy URL has no {session} placeholder or supported session username pattern; if the provider assigns a fixed endpoint, the exit IP can remain unchanged.')
       }
-    } else {
+    } else if (networkSource !== 'client-proxy') {
       addLog('[Proxy] Proxy pool is disabled or has no usable proxy; registration will use direct/system network, so the exit IP can remain unchanged.')
     }
 
@@ -1118,10 +1537,12 @@ export function RegisterPage(): React.JSX.Element {
         await onRegComplete(res.result as RegResult)
       } else if (!res.success) {
         addLog(`${t('register.logStartFailed')} ${res.error}`)
+        setResult(makeFailedRegResult(res.error))
         setPhase('idle')
       }
     } catch (error) {
       addLog(`${t('register.logStartFailed')} ${error instanceof Error ? error.message : String(error)}`)
+      setResult(makeFailedRegResult(error))
       setPhase('idle')
     }
   }
@@ -1209,6 +1630,7 @@ export function RegisterPage(): React.JSX.Element {
 
   // 'isRunning' 表示注册流程主线进行中（不含 idle/email/otp 等待用户输入态、也不含完成态）
   const isRunning = phase === 'initializing' || phase === 'running' || phase === 'importing' || phase === 'fetching-link'
+  const isClientRouteMissing = networkSource === 'client-proxy' && !clientProxyUrl.trim()
   // manualSteps / currentStep 在下方"批量注册"区块的 state 定义之后计算
 
   // ============ 批量注册 ============
@@ -1267,11 +1689,21 @@ export function RegisterPage(): React.JSX.Element {
   const lastAutoImportError = useRef('')
   const proxyPreflightNoticeShown = useRef(false)
   const batchPinnedProxy = useRef<{ entry: ProxyEntry; url: string; upstreamProxy: string } | null>(null)
+  const batchClientProxyRoute = useRef<{ url: string; upstreamProxy: string } | null>(null)
   const validateBatchNetworkRoute = useCallback(async (
     timeoutMs = 8000
   ): Promise<{ success: boolean; latencyMs?: number; externalIp?: string; route?: string; error?: string }> => {
     const pinned = batchPinnedProxy.current
+    const clientRoute = batchClientProxyRoute.current
     const safeTimeoutMs = Math.max(5000, timeoutMs)
+    if (clientRoute) {
+      return window.api.proxyPoolValidate({
+        url: clientRoute.url,
+        upstreamProxy: clientRoute.upstreamProxy || undefined,
+        testUrl: 'https://api.ipify.org?format=json',
+        timeoutMs: safeTimeoutMs
+      })
+    }
     return pinned
       ? window.api.proxyPoolValidate({
           url: pinned.url,
@@ -1284,6 +1716,63 @@ export function RegisterPage(): React.JSX.Element {
           timeoutMs: safeTimeoutMs
         })
   }, [])
+
+  const resolveRegistrationNetworkRoute = useCallback((): {
+    success: boolean
+    patch?: { proxy?: string; upstreamProxy?: string; strictProxy?: boolean }
+    logLines: string[]
+    error?: string
+  } => {
+    if (networkSource === 'client-proxy') {
+      const rawUrl = clientProxyUrl.trim()
+      if (!rawUrl) {
+        return {
+          success: false,
+          logLines: [],
+          error: isEn
+            ? 'Client IP mode needs a proxy/helper URL from your personal machine.'
+            : 'Che do IP may ca nhan can proxy/helper URL chay tren may ca nhan.'
+        }
+      }
+      const proxy = injectProxySession(rawUrl)
+      const masked = proxy.replace(/:([^:@/]+)@/, ':***@')
+      return {
+        success: true,
+        patch: {
+          proxy,
+          upstreamProxy: clientProxyUpstream.trim(),
+          strictProxy: true
+        },
+        logLines: [
+          `[Network] Client proxy/helper mode: ${masked}`,
+          '[Network] Strict route is enabled; registration will stop instead of falling back to VPS/server IP if the client route fails.'
+        ]
+      }
+    }
+
+    const proxyInfo = getRegistrationProxy()
+    if (proxyInfo) {
+      const proxiedUrl = injectProxySession(proxyInfo.proxy)
+      const logs = [`[Proxy] Sử dụng kho proxy: ${proxiedUrl.replace(/:([^:@/]+)@/, ':***@')}`]
+      if (proxiedUrl === proxyInfo.proxy) {
+        logs.push('[Proxy] This proxy URL has no {session} placeholder or supported session username pattern; if the provider assigns a fixed endpoint, the exit IP can remain unchanged.')
+      }
+      return {
+        success: true,
+        patch: {
+          proxy: proxiedUrl,
+          upstreamProxy: proxyInfo.upstreamProxy
+        },
+        logLines: logs
+      }
+    }
+
+    return {
+      success: true,
+      patch: {},
+      logLines: ['[Proxy] Proxy pool is disabled or has no usable proxy; registration will use backend/server direct network, so the exit IP can be the VPS/local backend IP.']
+    }
+  }, [networkSource, clientProxyUrl, clientProxyUpstream, getRegistrationProxy, isEn])
 
   const requestBatchStopForTerminalError = useCallback((err: string | undefined, context: string): boolean => {
     const terminal = getTerminalBatchError(err)
@@ -1366,6 +1855,9 @@ export function RegisterPage(): React.JSX.Element {
     } catch { /* ignore */ }
     return {
       mode,
+      networkSource,
+      clientProxyUrl,
+      clientProxyUpstream,
       outlookData,
       fullName,
       batchCount,
@@ -1386,12 +1878,15 @@ export function RegisterPage(): React.JSX.Element {
       manualAnonymousEmail: anonymousEmail,
       mixedEnabledSources: mixed
     }
-  }, [mode, outlookData, fullName, batchCount, batchInterval, batchAutoImport, batchRetries, batchConcurrency, autoFetchProLink, proPlanType, tempMailEmail, tempMailEpin, tempMailDomain, tingamefiMailApiUrl, tingamefiMailAdminPassword, tingamefiMailDomain, protonBaseEmail, parentEmail, anonymousEmail])
+  }, [mode, networkSource, clientProxyUrl, clientProxyUpstream, outlookData, fullName, batchCount, batchInterval, batchAutoImport, batchRetries, batchConcurrency, autoFetchProLink, proPlanType, tempMailEmail, tempMailEpin, tempMailDomain, tingamefiMailApiUrl, tingamefiMailAdminPassword, tingamefiMailDomain, protonBaseEmail, parentEmail, anonymousEmail])
 
   const applyTemplate = useCallback((tpl: RegisterTemplate) => {
     const c = tpl.config
     // 兼容老模板：mode === 'moemail' 时回退到 outlook
     setMode((c.mode === ('moemail' as RegMode) ? 'outlook' : c.mode) as RegMode)
+    setNetworkSource(c.networkSource === 'client-proxy' ? 'client-proxy' : 'server')
+    setClientProxyUrl(c.clientProxyUrl || '')
+    setClientProxyUpstream(c.clientProxyUpstream || '')
     setOutlookData(c.outlookData || '')
     setFullName(c.fullName || '')
     setBatchCount(c.batchCount ?? 1)
@@ -1583,6 +2078,9 @@ export function RegisterPage(): React.JSX.Element {
   useEffect(() => {
     saveConfig({
       mode,
+      networkSource,
+      clientProxyUrl,
+      clientProxyUpstream,
       outlookData,
       fullName,
       batchCount,
@@ -1602,7 +2100,7 @@ export function RegisterPage(): React.JSX.Element {
       manualParentEmail: parentEmail,
       manualAnonymousEmail: anonymousEmail
     })
-  }, [mode, outlookData, fullName, batchCount, batchInterval, batchAutoImport, batchRetries, batchConcurrency, autoFetchProLink, proPlanType, tempMailEmail, tempMailEpin, tempMailDomain, tingamefiMailApiUrl, tingamefiMailAdminPassword, tingamefiMailDomain, protonBaseEmail, parentEmail, anonymousEmail])
+  }, [mode, networkSource, clientProxyUrl, clientProxyUpstream, outlookData, fullName, batchCount, batchInterval, batchAutoImport, batchRetries, batchConcurrency, autoFetchProLink, proPlanType, tempMailEmail, tempMailEpin, tempMailDomain, tingamefiMailApiUrl, tingamefiMailAdminPassword, tingamefiMailDomain, protonBaseEmail, parentEmail, anonymousEmail])
 
   // 匿名邮箱预览计算 — 以 anonymousEmail/parentEmail/accounts 为依赖实时冷算下一个变体
   const anonymousPreview = useMemo(() => {
@@ -2029,7 +2527,22 @@ export function RegisterPage(): React.JSX.Element {
       const liveProxyPoolConfig = liveProxyState.proxyPoolConfig
       const liveProxyPool = liveProxyState.proxyPool
       let pickedProxy: ReturnType<typeof pickNextProxy> = null
-      if (!liveProxyPoolConfig.enabled) {
+      if (networkSource === 'client-proxy') {
+        const clientRoute = batchClientProxyRoute.current
+        if (!clientRoute) {
+          requestBatchStopForProxyConfigError('Client proxy/helper route was not pinned before batch launch')
+          return { success: false, result: { status: 'failed', email: '', error: 'No client proxy/helper route' } as RegResult }
+        }
+        enrichedConfig.proxy = clientRoute.url
+        enrichedConfig.strictProxy = true
+        if (clientRoute.upstreamProxy) {
+          enrichedConfig.upstreamProxy = clientRoute.upstreamProxy
+        }
+        if (!proxyPreflightNoticeShown.current) {
+          proxyPreflightNoticeShown.current = true
+          addLog('[NetworkGuard] Reusing client proxy/helper route for this batch')
+        }
+      } else if (!liveProxyPoolConfig.enabled) {
         if (!proxyPreflightNoticeShown.current) {
           proxyPreflightNoticeShown.current = true
           addLog('[Proxy] Proxy pool is disabled; registration will use direct/system network, so the exit IP can remain unchanged.')
@@ -2083,7 +2596,7 @@ export function RegisterPage(): React.JSX.Element {
       }
     }
     return { success: false }
-  }, [addLog, t, proxyPool, proxyPoolConfig.enabled, pickNextProxy, reportProxyResult, buildAutoConfig, requestBatchStopForTerminalError, requestBatchStopForProxyConfigError])
+  }, [addLog, t, proxyPool, proxyPoolConfig.enabled, pickNextProxy, reportProxyResult, buildAutoConfig, requestBatchStopForTerminalError, requestBatchStopForProxyConfigError, networkSource])
 
   // 处理单个批量注册任务完成
   const handleBatchOutcome = async (
@@ -2207,10 +2720,29 @@ export function RegisterPage(): React.JSX.Element {
       }
     }
     batchPinnedProxy.current = null
+    batchClientProxyRoute.current = null
     _batchExpectedExitIp = null
     batchAbort.current = false
     batchPause.current = false
-    if (liveProxyPoolConfig.enabled) {
+    if (networkSource === 'client-proxy') {
+      const route = resolveRegistrationNetworkRoute()
+      if (!route.success || !route.patch?.proxy) {
+        setPhase('idle')
+        setBatchRunning(false)
+        setIsPaused(false)
+        setBatchDone(0)
+        setBatchSuccess(0)
+        setBatchFail(0)
+        setBatchItems([])
+        addLog(`[Network] ${route.error || 'Client proxy/helper URL is missing'}`)
+        return
+      }
+      batchClientProxyRoute.current = {
+        url: route.patch.proxy,
+        upstreamProxy: route.patch.upstreamProxy || ''
+      }
+      route.logLines.forEach(addLog)
+    } else if (liveProxyPoolConfig.enabled) {
       const usableProxyCount = Array.from(liveProxyPool.values()).filter((p) => p.enabled && p.status !== 'dead').length
       if (liveProxyPool.size === 0) {
         setPhase('idle')
@@ -2276,6 +2808,7 @@ export function RegisterPage(): React.JSX.Element {
       setBatchFail(0)
       setBatchItems([])
       batchPinnedProxy.current = null
+      batchClientProxyRoute.current = null
       addLog(`[NetworkGuard] Batch not started because the exit IP could not be verified: ${networkCheck.error || 'missing exit IP'}`)
       return
     }
@@ -2511,6 +3044,7 @@ export function RegisterPage(): React.JSX.Element {
       }
     })
     batchPinnedProxy.current = null
+    batchClientProxyRoute.current = null
     _batchExpectedExitIp = null
   }
 
@@ -2670,15 +3204,25 @@ export function RegisterPage(): React.JSX.Element {
             ))}
           </div>
 
+          <RegistrationNetworkSourcePanel
+            isEn={isEn}
+            isDisabled={isRunning || batchRunning}
+            networkSource={networkSource}
+            setNetworkSource={setNetworkSource}
+            clientProxyUrl={clientProxyUrl}
+            setClientProxyUrl={setClientProxyUrl}
+            clientProxyUpstream={clientProxyUpstream}
+            setClientProxyUpstream={setClientProxyUpstream}
+          />
 
           {/* 自动导入开关 */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-start gap-3">
             <Switch
               checked={batchAutoImport}
               onCheckedChange={setBatchAutoImport}
               disabled={isRunning || batchRunning}
             />
-            <div className="flex items-center gap-2">
+            <div className="register-option-row min-w-0">
               <Download className="h-4 w-4 text-muted-foreground" />
               <span className="text-sm">{t('register.batchAutoImport')}</span>
               <span className="text-xs text-muted-foreground">— {t('register.batchAutoImportDesc')}</span>
@@ -2687,13 +3231,13 @@ export function RegisterPage(): React.JSX.Element {
 
           {/* 自动获取 Pro 订阅链接开关 + 计划选择 */}
           <div className="flex flex-col gap-2">
-            <div className="flex items-center gap-3">
+            <div className="flex items-start gap-3">
               <Switch
                 checked={autoFetchProLink}
                 onCheckedChange={setAutoFetchProLink}
                 disabled={isRunning || batchRunning}
               />
-              <div className="flex items-center gap-2">
+              <div className="register-option-row min-w-0">
                 <Link2 className="h-4 w-4 text-muted-foreground" />
                 <span className="text-sm">{t('register.autoFetchProLink')}</span>
                 <span className="text-xs text-muted-foreground">— {t('register.autoFetchProLinkDesc')}</span>
@@ -3180,6 +3724,7 @@ export function RegisterPage(): React.JSX.Element {
               <Button
                 onClick={mode === 'manual' ? startManual : startAuto}
                 disabled={
+                  isClientRouteMissing ||
                   (mode === 'outlook' && !outlookData.trim()) ||
                   (mode === 'tempmail' && (!tempMailDomain.trim() || !tempMailEmail.trim() || !tempMailEpin.trim())) ||
                   (mode === 'tingamefi' && (!tingamefiMailApiUrl.trim() || !tingamefiMailAdminPassword.trim() || !tingamefiMailDomain.trim()))
@@ -3398,6 +3943,7 @@ export function RegisterPage(): React.JSX.Element {
                 onClick={batchRunning ? stopBatch : () => void startBatch()}
                 disabled={
                   (!batchRunning && isRunning) ||
+                  (!batchRunning && isClientRouteMissing) ||
                   (mode === 'outlook' && !outlookData.trim()) ||
                   (mode === 'tempmail' && (!tempMailDomain.trim() || !tempMailEmail.trim() || !tempMailEpin.trim())) ||
                   (mode === 'tingamefi' && (!tingamefiMailApiUrl.trim() || !tingamefiMailAdminPassword.trim() || !tingamefiMailDomain.trim())) ||
@@ -3747,7 +4293,9 @@ export function RegisterPage(): React.JSX.Element {
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-xs text-muted-foreground">
                     <span>
-                      {isEn ? 'Route' : 'Route'}: {proxyPoolConfig.enabled
+                      {isEn ? 'Route' : 'Route'}: {networkSource === 'client-proxy'
+                        ? (isEn ? 'Client proxy/helper from personal machine' : 'Proxy/helper tren may ca nhan')
+                        : proxyPoolConfig.enabled
                         ? (isEn ? 'One pinned proxy session for the entire batch' : 'Một proxy/session cố định cho toàn bộ batch')
                         : (isEn ? 'Direct/system VPN connection' : 'Kết nối trực tiếp/VPN hệ thống')}
                     </span>
@@ -3781,6 +4329,18 @@ export function RegisterPage(): React.JSX.Element {
       )}
 
       {/* 结果 */}
+      <RemoteKrouterSyncPanel
+        isEn={isEn}
+        accountCount={accounts.size}
+        targetUrl={remoteSyncUrl}
+        setTargetUrl={setRemoteSyncUrl}
+        syncPassword={remoteSyncPassword}
+        setSyncPassword={setRemoteSyncPassword}
+        isSyncing={remoteSyncRunning}
+        result={remoteSyncResult}
+        onSync={() => void handleRemoteSync()}
+      />
+
       {result && (
         <Card className={cn('border shadow-sm',
           result.status === 'success' ? 'bg-green-50 dark:bg-green-950/20 border-green-200 dark:border-green-800' : 'bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800'
@@ -3824,7 +4384,7 @@ export function RegisterPage(): React.JSX.Element {
             )}
 
             {result.status === 'failed' && (
-              <p className="text-sm text-red-600 dark:text-red-400">{result.error}</p>
+              <RegistrationErrorDiagnosisPanel error={result.error} />
             )}
           </CardContent>
         </Card>
@@ -3855,9 +4415,11 @@ export function RegisterPage(): React.JSX.Element {
             <div className="max-h-48 overflow-y-auto">
               {history.map((item) => {
                 const fp = item.result?.fingerprint
+                const failedError = item.status === 'failed' ? (item.error || item.result?.error) : undefined
                 return (
-                  <div key={item.id} className="flex items-center justify-between px-4 py-2.5 border-b last:border-b-0 hover:bg-muted/50 transition-colors">
-                    <div className="flex items-center gap-3 flex-1 min-w-0">
+                  <div key={item.id} className="border-b last:border-b-0 hover:bg-muted/50 transition-colors">
+                    <div className="flex items-center justify-between px-4 py-2.5">
+                      <div className="flex items-center gap-3 flex-1 min-w-0">
                       {item.status === 'success' ? <CheckCircle2 className="h-4 w-4 text-green-500 flex-shrink-0" /> : <XCircle className="h-4 w-4 text-red-500 flex-shrink-0" />}
                       <span className="font-mono text-xs truncate">{item.email}</span>
                       <span className="text-xs text-muted-foreground flex-shrink-0">{new Date(item.time).toLocaleTimeString()}</span>
@@ -3870,7 +4432,7 @@ export function RegisterPage(): React.JSX.Element {
                           🔒 {fp.chromeVer.split('.')[0]}・{fp.screen.width}×{fp.screen.height}{fp.exitIP ? `・${fp.exitIP}` : ''}
                         </span>
                       )}
-                    </div>
+                      </div>
                     {item.status === 'success' && item.result?.refreshToken && (
                       <Badge
                         variant="outline"
@@ -3879,6 +4441,12 @@ export function RegisterPage(): React.JSX.Element {
                       >
                         {item.imported ? t('register.imported') : t('register.historyImport')}
                       </Badge>
+                    )}
+                    </div>
+                    {failedError && (
+                      <div className="px-4 pb-3 pl-11">
+                        <RegistrationErrorDiagnosisPanel error={failedError} compact />
+                      </div>
                     )}
                   </div>
                 )

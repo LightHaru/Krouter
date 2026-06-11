@@ -7,7 +7,7 @@ import { writeFile, readFile } from 'fs/promises'
 import { encode, decode } from 'cbor-x'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import icon from '../../resources/icon.png?asset'
-import { ProxyServer, configureProxyClients, type ProxyAccount, type ProxyConfig, type ProxyClientTarget, type ProxyClientModel } from './proxy'
+import { ProxyServer, configureProxyClients, type ProxyAccount, type ProxyConfig, type ProxyClientTarget, type ProxyClientModel, type ProxyUsageStatsUpdate } from './proxy'
 import { 
   initKProxyService, 
   getKProxyService, 
@@ -342,8 +342,9 @@ function initProxyServer(): ProxyServer {
   }
   // 从 store 加载保存的累计 credits 和 tokens
   const savedTotalCredits = (store?.get('proxyTotalCredits') as number) || 0
-  const savedInputTokens = (store?.get('proxyInputTokens') as number) || 0
-  const savedOutputTokens = (store?.get('proxyOutputTokens') as number) || 0
+  const savedUsageStats = (store?.get('proxyUsageStats') as Partial<ProxyUsageStatsUpdate> | undefined) || {}
+  const savedInputTokens = savedUsageStats.inputTokens ?? ((store?.get('proxyInputTokens') as number) || 0)
+  const savedOutputTokens = savedUsageStats.outputTokens ?? ((store?.get('proxyOutputTokens') as number) || 0)
   // 从 store 加载保存的请求统计
   const savedTotalRequests = (store?.get('proxyTotalRequests') as number) || 0
   const savedSuccessRequests = (store?.get('proxySuccessRequests') as number) || 0
@@ -475,6 +476,11 @@ function initProxyServer(): ProxyServer {
         debouncedStoreSet('proxyInputTokens', inputTokens)
         debouncedStoreSet('proxyOutputTokens', outputTokens)
       },
+      onUsageStatsUpdate: (usage) => {
+        debouncedStoreSet('proxyUsageStats', usage)
+        debouncedStoreSet('proxyInputTokens', usage.inputTokens)
+        debouncedStoreSet('proxyOutputTokens', usage.outputTokens)
+      },
       // 请求统计更新回调 - 使用防抖持久化
       onRequestStatsUpdate: (totalRequests, successRequests, failedRequests) => {
         debouncedStoreSet('proxyTotalRequests', totalRequests)
@@ -544,8 +550,20 @@ function initProxyServer(): ProxyServer {
   }
 
   // 恢复保存的累计 tokens
-  if (savedInputTokens > 0 || savedOutputTokens > 0) {
-    proxyServer.setTotalTokens(savedInputTokens, savedOutputTokens)
+  if (
+    savedInputTokens > 0 ||
+    savedOutputTokens > 0 ||
+    (savedUsageStats.cacheReadTokens || 0) > 0 ||
+    (savedUsageStats.cacheWriteTokens || 0) > 0 ||
+    (savedUsageStats.reasoningTokens || 0) > 0
+  ) {
+    proxyServer.setTotalTokens(
+      savedInputTokens,
+      savedOutputTokens,
+      savedUsageStats.cacheReadTokens || 0,
+      savedUsageStats.cacheWriteTokens || 0,
+      savedUsageStats.reasoningTokens || 0
+    )
   }
 
   // 恢复保存的请求统计
@@ -5939,6 +5957,14 @@ app.whenReady().then(async () => {
     if (store) {
       store.set('proxyInputTokens', 0)
       store.set('proxyOutputTokens', 0)
+      store.set('proxyUsageStats', {
+        totalTokens: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0
+      })
     }
     return { success: true }
   })

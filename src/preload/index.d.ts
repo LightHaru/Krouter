@@ -136,6 +136,23 @@ interface StatusResult {
   error?: { message: string }
 }
 
+interface RemoteAccountSyncResult {
+  success: boolean
+  targetUrl?: string
+  totalIncoming?: number
+  added?: number
+  skipped?: number
+  remoteTotal?: number
+  skippedAccounts?: Array<{
+    id: string
+    email?: string
+    existingId?: string
+    reason: string
+  }>
+  syncedAccountIds?: string[]
+  error?: string
+}
+
 interface KiroApi {
   openExternal: (url: string, usePrivateMode?: boolean) => void
   getAppVersion: () => Promise<string>
@@ -144,6 +161,13 @@ interface KiroApi {
   // 账号管理
   loadAccounts: () => Promise<AccountData | null>
   saveAccounts: (data: AccountData) => Promise<void>
+  syncAccountsToRemote: (input: {
+    targetUrl: string
+    syncPassword?: string
+    adminEmail?: string
+    adminPassword?: string
+    timeoutMs?: number
+  }) => Promise<RemoteAccountSyncResult>
   refreshAccountToken: (account: unknown) => Promise<RefreshResult>
   checkAccountStatus: (account: unknown) => Promise<StatusResult>
   

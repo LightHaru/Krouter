@@ -1103,3 +1103,28 @@ img, video, canvas, svg, table, pre, code {
   mix-blend-mode: overlay;
   border-radius: inherit;
 }
+
+.register-option-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 0.5rem;
+  row-gap: 0.125rem;
+  align-items: center;
+}
+
+.register-option-row > svg {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.register-option-row > .text-sm {
+  grid-column: 2;
+  grid-row: 1;
+  font-weight: 500;
+}
+
+.register-option-row > .text-xs {
+  grid-column: 2;
+  grid-row: 2;
+  line-height: 1.45;
+}
