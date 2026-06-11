@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Input, Label, Select } from '../ui'
-import { useAccountsStore } from '@/store/accounts'
+import { isPlaceholderProfileArn, useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { IdpType, SubscriptionType } from '@/types/account'
 import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff } from 'lucide-react'
@@ -88,7 +88,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     return Array.from(accounts.values()).some(acc => {
       // userId 相同则重复（主要判断依据）
       if (userId && acc.userId === userId) return true
-      if (normalizedProfileArn && acc.profileArn?.trim().toLowerCase() === normalizedProfileArn) return true
+      if (normalizedProfileArn && !isPlaceholderProfileArn(normalizedProfileArn) && acc.profileArn?.trim().toLowerCase() === normalizedProfileArn) return true
       if (normalizedToken && acc.credentials.refreshToken === normalizedToken) return true
       if (normalizedApiKey && acc.credentials.kiroApiKey === normalizedApiKey) return true
       // email 非空且相同，且 provider 相同则重复（允许同邮箱不同登录方式）

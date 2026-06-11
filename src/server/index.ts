@@ -90,7 +90,7 @@ import {
   typeProtonText
 } from './services/protonBrowserRuntime'
 import { getDashboardTunnelRuntime } from './services/dashboardTunnel'
-import { mergePeerAccountData, pushAccountDataToRemote } from './services/accountSync'
+import { mergePeerAccountData, pushAccountDataToRemote, summarizeAccounts } from './services/accountSync'
 
 type JsonValue = unknown
 type SseClient = ServerResponse
@@ -1095,8 +1095,11 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
           totalIncoming: merged.totalIncoming,
           added: merged.added,
           skipped: merged.skipped,
+          addedAccountIds: merged.addedAccountIds,
+          skippedAccountIds: merged.skippedAccountIds,
           skippedAccounts: merged.skippedAccounts,
           syncedAccountIds: merged.syncedAccountIds,
+          remoteAccounts: summarizeAccounts(hydratedAccounts),
           remoteTotal: Object.keys(hydratedAccounts).length
         }
       }
@@ -1521,8 +1524,11 @@ async function handleAccountSyncMerge(request: IncomingMessage, response: Server
     totalIncoming: merged.totalIncoming,
     added: merged.added,
     skipped: merged.skipped,
+    addedAccountIds: merged.addedAccountIds,
+    skippedAccountIds: merged.skippedAccountIds,
     skippedAccounts: merged.skippedAccounts,
     syncedAccountIds: merged.syncedAccountIds,
+    remoteAccounts: summarizeAccounts(hydratedAccounts),
     remoteTotal: Object.keys(hydratedAccounts).length
   })
 }

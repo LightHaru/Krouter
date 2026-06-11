@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { UserPlus, Mail, Key, Loader2, CheckCircle2, XCircle, Trash2, Play, Square, Clock, RotateCcw, RefreshCw, Download, Upload, Settings2, Link2, AtSign, Shuffle, Info, Pause, AlertTriangle, ShieldAlert, Gauge, Activity, CalendarClock, Timer, Network, Lock } from 'lucide-react'
 import { useTranslation } from '@/hooks/useTranslation'
-import { useAccountsStore } from '@/store/accounts'
+import { isPlaceholderProfileArn, useAccountsStore } from '@/store/accounts'
 import { useTaskStore } from '@/store/tasks'
 import { createRateLimiter, type RateLimiter, type RateLimiterSnapshot } from '@/store/rateLimiter'
 import { useWebhookStore } from '@/store/webhooks'
@@ -811,11 +811,15 @@ interface RemoteSyncConfig {
 
 interface RemoteSyncUiResult {
   success: boolean
+  tone?: 'success' | 'warning' | 'error'
   message: string
   added?: number
   skipped?: number
   totalIncoming?: number
   remoteTotal?: number
+  verified?: number
+  missing?: number
+  missingEmails?: string[]
   tagged?: number
 }
 
@@ -1016,14 +1020,22 @@ function RemoteKrouterSyncPanel({
         {result && (
           <div className={cn(
             'rounded-md border px-3 py-2 text-xs',
-            result.success
+            (result.tone || (result.success ? 'success' : 'error')) === 'success'
               ? 'border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/20 dark:text-emerald-300'
-              : 'border-red-300 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/20 dark:text-red-300'
+              : (result.tone || (result.success ? 'success' : 'error')) === 'warning'
+                ? 'border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/20 dark:text-amber-300'
+                : 'border-red-300 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/20 dark:text-red-300'
           )}>
             <div className="font-medium">{result.message}</div>
-            {result.success && (
+            {(result.added !== undefined || result.verified !== undefined || result.missing !== undefined) && (
               <div className="mt-1 text-muted-foreground">
-                {isEn ? 'Added' : 'Da them'}: {result.added ?? 0} - {isEn ? 'Skipped existing' : 'Bo qua trung'}: {result.skipped ?? 0} - {isEn ? 'Tagged locally' : 'Da gan tag local'}: {result.tagged ?? 0} - {isEn ? 'Remote total' : 'Tong tren VPS'}: {result.remoteTotal ?? '-'}
+                {isEn ? 'Added' : 'Da them'}: {result.added ?? 0} - {isEn ? 'Skipped existing' : 'Bo qua trung'}: {result.skipped ?? 0} - {isEn ? 'Verified on VPS' : 'Xac minh tren VPS'}: {result.verified ?? '-'} - {isEn ? 'Missing' : 'Thieu'}: {result.missing ?? 0} - {isEn ? 'Tagged locally' : 'Da gan tag local'}: {result.tagged ?? 0} - {isEn ? 'Remote total' : 'Tong tren VPS'}: {result.remoteTotal ?? '-'}
+              </div>
+            )}
+            {result.missingEmails && result.missingEmails.length > 0 && (
+              <div className="mt-1 break-all text-muted-foreground">
+                {isEn ? 'Missing on VPS' : 'VPS chua thay'}: {result.missingEmails.slice(0, 5).join(', ')}
+                {result.missingEmails.length > 5 ? ` +${result.missingEmails.length - 5}` : ''}
               </div>
             )}
           </div>
@@ -1153,18 +1165,49 @@ export function RegisterPage(): React.JSX.Element {
       const message = isEn
         ? `Synced to ${response.targetUrl || remoteSyncUrl.trim()}`
         : `Da dong bo len ${response.targetUrl || remoteSyncUrl.trim()}`
-      const tagged = tagSyncedLocalAccounts(response.syncedAccountIds)
+      const canVerifyRemoteAccounts = Array.isArray(response.remoteAccounts)
+      const verifiedAccountIds = canVerifyRemoteAccounts ? (response.verifiedAccountIds || []) : []
+      const missingAccountIds = canVerifyRemoteAccounts ? (response.missingAccountIds || []) : []
+      const idsToTag = canVerifyRemoteAccounts
+        ? verifiedAccountIds
+        : (response.addedAccountIds && response.addedAccountIds.length > 0 ? response.addedAccountIds : response.syncedAccountIds)
+      const tagged = tagSyncedLocalAccounts(idsToTag)
       if (tagged > 0) await useAccountsStore.getState().flushSaveImmediately()
+      const state = useAccountsStore.getState()
+      const missingEmails = missingAccountIds
+        .map((id) => state.accounts.get(id)?.email)
+        .filter((email): email is string => Boolean(email))
+      const noNewAccounts = (response.totalIncoming || 0) > 0 && (response.added || 0) === 0
+      const hasMissingAccounts = missingAccountIds.length > 0
+      const tone: RemoteSyncUiResult['tone'] = hasMissingAccounts
+        ? 'error'
+        : noNewAccounts
+          ? 'warning'
+          : 'success'
+      const resultMessage = hasMissingAccounts
+        ? (isEn
+          ? `Remote sync finished but VPS is still missing ${missingAccountIds.length} local account(s).`
+          : `Dong bo xong nhung VPS van thieu ${missingAccountIds.length} tai khoan local.`)
+        : noNewAccounts
+          ? (isEn
+            ? `No new accounts were added; VPS reported the incoming accounts as already existing.`
+            : `Khong them tai khoan moi; VPS bao cac tai khoan gui len da ton tai.`)
+          : message
       setRemoteSyncResult({
-        success: true,
-        message,
+        success: !hasMissingAccounts,
+        tone,
+        message: resultMessage,
         added: response.added,
         skipped: response.skipped,
         totalIncoming: response.totalIncoming,
         remoteTotal: response.remoteTotal,
+        verified: canVerifyRemoteAccounts ? verifiedAccountIds.length : undefined,
+        missing: canVerifyRemoteAccounts ? missingAccountIds.length : undefined,
+        missingEmails,
         tagged
       })
-      addLog(`[RemoteSync] added=${response.added ?? 0}, skipped=${response.skipped ?? 0}, tagged=${tagged}, remoteTotal=${response.remoteTotal ?? '-'}`)
+      addLog(`[RemoteSync] added=${response.added ?? 0}, skipped=${response.skipped ?? 0}, verified=${canVerifyRemoteAccounts ? verifiedAccountIds.length : 'n/a'}, missing=${canVerifyRemoteAccounts ? missingAccountIds.length : 'n/a'}, tagged=${tagged}, remoteTotal=${response.remoteTotal ?? '-'}`)
+      if (missingEmails.length > 0) addLog(`[RemoteSync] missing=${missingEmails.join(', ')}`)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       setRemoteSyncResult({ success: false, message })
@@ -1182,7 +1225,7 @@ export function RegisterPage(): React.JSX.Element {
     const incomingProfileArn = String(accountData.profileArn || '').trim().toLowerCase()
     const duplicate = Array.from(accounts.values()).find((account) => {
       if (incomingRefreshToken && account.credentials.refreshToken === incomingRefreshToken) return true
-      if (incomingProfileArn && account.profileArn?.trim().toLowerCase() === incomingProfileArn) return true
+      if (incomingProfileArn && !isPlaceholderProfileArn(incomingProfileArn) && account.profileArn?.trim().toLowerCase() === incomingProfileArn) return true
       return Boolean(
         incomingEmail &&
         account.email.trim().toLowerCase() === incomingEmail &&
