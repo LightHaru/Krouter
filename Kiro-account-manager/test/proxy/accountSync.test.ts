@@ -73,4 +73,28 @@ describe('mergePeerAccountData', () => {
     expect(result.syncedAccountIds).toEqual(['l1', 'l2'])
     expect(Object.keys(result.data.accounts as Record<string, unknown>).sort()).toEqual(['r1', 'r2'])
   })
+
+  it('does not treat the fixed placeholder profileArn as a duplicate identity', () => {
+    const placeholderArn = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
+    const remote = {
+      accounts: {
+        r1: account('r1', 'existing@example.com', 'BuilderId', 'remote-rt', { profileArn: placeholderArn })
+      },
+      groups: {},
+      tags: {}
+    }
+    const local = {
+      accounts: {
+        l1: account('l1', 'new@example.com', 'BuilderId', 'local-rt', { profileArn: placeholderArn })
+      },
+      groups: {},
+      tags: {}
+    }
+    const result = mergePeerAccountData(remote, local)
+
+    expect(result.added).toBe(1)
+    expect(result.skipped).toBe(0)
+    expect(result.syncedAccountIds).toEqual(['l1'])
+    expect(Object.keys(result.data.accounts as Record<string, unknown>).sort()).toEqual(['l1', 'r1'])
+  })
 })
