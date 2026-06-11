@@ -2,6 +2,13 @@
 
 All notable Krouter changes are tracked here.
 
+## 1.8.11 - 2026-06-11
+
+### Fixed
+
+- Fixed remote account sync verification so the local dashboard only marks accounts as synced after the remote backend confirms the accounts are present.
+- Added remote sync response fields for accepted, skipped, and summarized remote accounts, preventing false success when the VPS skips or deduplicates accounts.
+
 ## 1.8.10 - 2026-06-11
 
 ### Fixed
