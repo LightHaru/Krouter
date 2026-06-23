@@ -50,6 +50,7 @@ const api = {
     email: string
     idp?: string
     needsTokenRefresh?: boolean
+    proxyUrl?: string
     machineId?: string  // 账户绑定的设备 ID
     credentials: {
       refreshToken: string
@@ -100,6 +101,7 @@ const api = {
       provider?: string
     }
     idp?: string
+    proxyUrl?: string
   }>, concurrency?: number): Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }> => {
     return ipcRenderer.invoke('background-batch-check', accounts, concurrency)
   },
@@ -207,6 +209,7 @@ const api = {
     profileArn?: string
     machineId?: string
     startUrl?: string
+    proxyUrl?: string
   }): Promise<{
     success: boolean
     data?: {

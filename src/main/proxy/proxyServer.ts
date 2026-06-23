@@ -410,13 +410,13 @@ export class ProxyServer {
       tokenRefreshBeforeExpiry: 300, // 5分钟提前刷新
       autoStart: false, // 是否自动启动
       clientDrivenToolExecution: true,
-      accountSelectionStrategy: 'smart',
+      accountSelectionStrategy: 'round-robin',
       sessionAffinityEnabled: false,
       ...config
     }
     this.normalizeAccountBalancingConfig()
     this.accountPool = new AccountPool()
-    this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'smart')
+    this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
     this.stats = {
       totalRequests: 0,
       successRequests: 0,
@@ -711,11 +711,11 @@ export class ProxyServer {
     this.config = { ...this.config, ...config }
     this.normalizeAccountBalancingConfig()
     // 同步账号选择策略到 accountPool
-    this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'smart')
+    this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
   }
 
   private normalizeAccountBalancingConfig(): void {
-    const strategy = this.config.accountSelectionStrategy || 'smart'
+    const strategy = this.config.accountSelectionStrategy || 'round-robin'
     this.config.accountSelectionStrategy = strategy
 
     if (this.config.enableMultiAccount && strategy !== 'sticky') {
@@ -731,7 +731,7 @@ export class ProxyServer {
   private isSessionAffinityActive(): boolean {
     return Boolean(
       this.config.sessionAffinityEnabled &&
-      (this.config.accountSelectionStrategy || 'smart') === 'sticky'
+      (this.config.accountSelectionStrategy || 'round-robin') === 'sticky'
     )
   }
 
@@ -1865,6 +1865,9 @@ export class ProxyServer {
 
   private recordAccountFailure(account: ProxyAccount, error: Error): void {
     const message = error.message || ''
+    if (this.isContentLengthError(message)) {
+      return
+    }
     const statusMatch = message.match(/\b(\d{3})\b/)
     const statusCode = statusMatch ? Number(statusMatch[1]) : undefined
     if (isThrottleError(message)) {
@@ -1969,6 +1972,10 @@ export class ProxyServer {
 
   private isInvalidModelForAccountError(message: string): boolean {
     return /invalid_model_id|invalid model id|please select a different model/i.test(message)
+  }
+
+  private isContentLengthError(message: string): boolean {
+    return /CONTENT_LENGTH_EXCEEDS_THRESHOLD|input content length exceeds threshold/i.test(message)
   }
 
   /**

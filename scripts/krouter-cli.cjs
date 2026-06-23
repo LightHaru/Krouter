@@ -28,7 +28,7 @@ const DASHBOARD_URL = (
   API_BASE
 ).replace(/\/$/, '')
 const invokedName = path.basename(process.argv[1] || 'krouter')
-const COMMAND_NAME = /^(krouter-cli|kiro-manager-cli)\.cjs$/i.test(invokedName) ? 'krouter' : invokedName
+const COMMAND_NAME = /^krouter-cli\.cjs$/i.test(invokedName) ? 'krouter' : invokedName
 const USE_COLOR = process.stdout.isTTY && !process.env.NO_COLOR
 const COLORS = {
   reset: USE_COLOR ? '\x1b[0m' : '',

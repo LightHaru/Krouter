@@ -26,6 +26,26 @@ interface ChainDiag {
   endToEndOk?: boolean; endToEndError?: string; endToEndRtMs?: number
 }
 
+interface ProxyMaintenanceStatusView {
+  enabled: boolean
+  running: boolean
+  intervalMin: number
+  sourceUrl: string
+  lastReason?: string
+  lastStartedAt?: number
+  lastCompletedAt?: number
+  nextRunAt?: number
+  sourceCandidates: number
+  proxiesChecked: number
+  proxiesAlive: number
+  proxiesAdded: number
+  proxiesRemoved: number
+  accountsChecked: number
+  accountsRemoved: number
+  lastError?: string
+  recentErrors: string[]
+}
+
 function ChainDiagnosisCard({
   diag,
   isEn
@@ -340,6 +360,8 @@ export function ProxyPoolPage(): React.ReactNode {
       endToEndOk?: boolean; endToEndError?: string; endToEndRtMs?: number
     }
   } | null>(null)
+  const [maintenanceStatus, setMaintenanceStatus] = useState<ProxyMaintenanceStatusView | null>(null)
+  const [maintenanceRequesting, setMaintenanceRequesting] = useState(false)
 
   // 用池里第一条 enabled 代理作为诊断目标；如果没有则用任意第一条
   const runChainDiagnose = useCallback(async () => {
@@ -399,27 +421,39 @@ export function ProxyPoolPage(): React.ReactNode {
   }, [accounts, accountProxyBindings, proxies, proxyPool])
 
   // 后台定时验活
-  const lastAutoValidateRef = useRef(0)
   useEffect(() => {
-    const intervalMin = proxyPoolConfig.autoValidateIntervalMin
-    if (!intervalMin || intervalMin <= 0) return
+    let cancelled = false
 
-    const tick = (): void => {
-      const now = Date.now()
-      if (now - lastAutoValidateRef.current < intervalMin * 60_000) return
-      const enabledIds = Array.from(proxyPool.values())
-        .filter((p) => p.enabled)
-        .map((p) => p.id)
-      if (enabledIds.length === 0) return
-      lastAutoValidateRef.current = now
-      console.log(`[ProxyPool] Auto-validate ${enabledIds.length} proxies`)
-      void validateProxiesBatch(enabledIds, proxyPoolConfig.autoValidateConcurrency || 5)
+    const refresh = async (): Promise<void> => {
+      if (typeof window.api.proxyMaintenanceGetStatus !== 'function') return
+      try {
+        const status = await window.api.proxyMaintenanceGetStatus()
+        if (!cancelled) setMaintenanceStatus(status)
+      } catch {
+        // The desktop renderer may run without the web backend maintenance API.
+      }
     }
 
     // 每分钟检查一次
-    const timer = setInterval(tick, 60_000)
-    return () => clearInterval(timer)
-  }, [proxyPoolConfig.autoValidateIntervalMin, proxyPoolConfig.autoValidateConcurrency, proxyPool, validateProxiesBatch])
+    void refresh()
+    const timer = setInterval(() => void refresh(), 10_000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [])
+
+  const runBackendMaintenanceNow = useCallback(async (): Promise<void> => {
+    if (typeof window.api.proxyMaintenanceRunNow !== 'function') return
+    setMaintenanceRequesting(true)
+    try {
+      const status = await window.api.proxyMaintenanceRunNow()
+      setMaintenanceStatus(status)
+      await useAccountsStore.getState().loadFromStorage()
+    } finally {
+      setMaintenanceRequesting(false)
+    }
+  }, [])
 
   const handleAutoDistribute = useCallback((onlyUnbound: boolean) => {
     if (bindingStats.aliveProxyCount === 0) {
@@ -606,6 +640,10 @@ export function ProxyPoolPage(): React.ReactNode {
     }
   }
 
+  const formatMaintenanceTime = (value?: number): string => {
+    return value ? new Date(value).toLocaleString() : '-'
+  }
+
   return (
     <div className="flex-1 p-6 space-y-6 overflow-auto">
       {/* Header */}
@@ -733,36 +771,158 @@ export function ProxyPoolPage(): React.ReactNode {
             </div>
           </div>
 
-          {/* 定时自动验活 (B2) */}
+          {/* Backend maintenance settings */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div className="space-y-1">
               <Label className="text-xs flex items-center gap-1">
                 <Clock className="h-3 w-3" />
-                {isEn ? 'Auto-validate interval (min, 0=off)' : '定时自动验活（分钟，0=关闭）'}
+                {isEn ? 'Backend maintenance interval (minutes)' : 'Chu kỳ bảo trì backend (phút)'}
               </Label>
               <Input
-                type="number" min={0} max={1440}
-                value={proxyPoolConfig.autoValidateIntervalMin}
+                type="number" min={5} max={1440}
+                value={proxyPoolConfig.backendMaintenanceIntervalMin}
                 onChange={(e) => {
                   const v = parseInt(e.target.value, 10)
-                  if (!isNaN(v) && v >= 0) setProxyPoolConfig({ autoValidateIntervalMin: v })
+                  if (!isNaN(v) && v >= 5) setProxyPoolConfig({ backendMaintenanceIntervalMin: v })
                 }}
                 className="h-8 text-xs"
               />
             </div>
             <div className="space-y-1">
-              <Label className="text-xs">{isEn ? 'Auto-validate concurrency' : '验活并发'}</Label>
+              <Label className="text-xs">{isEn ? 'Source validation concurrency' : 'Số proxy kiểm tra đồng thời'}</Label>
               <Input
-                type="number" min={1} max={50}
-                value={proxyPoolConfig.autoValidateConcurrency}
+                type="number" min={1} max={100}
+                value={proxyPoolConfig.sourceValidateConcurrency}
                 onChange={(e) => {
                   const v = parseInt(e.target.value, 10)
-                  if (!isNaN(v) && v >= 1) setProxyPoolConfig({ autoValidateConcurrency: v })
+                  if (!isNaN(v) && v >= 1) setProxyPoolConfig({ sourceValidateConcurrency: v })
                 }}
-                disabled={proxyPoolConfig.autoValidateIntervalMin === 0}
+                disabled={!proxyPoolConfig.backendMaintenanceEnabled || !proxyPoolConfig.sourceSyncEnabled}
                 className="h-8 text-xs"
               />
             </div>
+          </div>
+
+          <div className="rounded-lg border border-border/70 bg-background/35 p-3 space-y-3">
+            <div className="flex flex-col lg:flex-row lg:items-center gap-3">
+              <div className="flex items-center gap-2 flex-1">
+                <Switch
+                  checked={proxyPoolConfig.backendMaintenanceEnabled}
+                  onCheckedChange={(v) => setProxyPoolConfig({ backendMaintenanceEnabled: v })}
+                />
+                <div>
+                  <Label className="text-xs cursor-pointer">
+                    {isEn ? 'Backend maintenance' : 'Bảo trì nền'}
+                  </Label>
+                  <div className="text-[11px] text-muted-foreground">
+                    {maintenanceStatus?.running
+                      ? (isEn ? 'Running now' : 'Đang chạy')
+                      : `${isEn ? 'Next' : 'Lần tới'}: ${formatMaintenanceTime(maintenanceStatus?.nextRunAt)}`}
+                  </div>
+                </div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 px-3 text-xs whitespace-nowrap"
+                disabled={maintenanceRequesting || maintenanceStatus?.running}
+                onClick={() => void runBackendMaintenanceNow()}
+              >
+                {maintenanceRequesting || maintenanceStatus?.running
+                  ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+                  : <RefreshCw className="h-3.5 w-3.5 mr-1" />}
+                {isEn ? 'Run now' : 'Chạy ngay'}
+              </Button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+              <label className="flex items-center gap-2 text-xs">
+                <Switch
+                  checked={proxyPoolConfig.sourceSyncEnabled}
+                  onCheckedChange={(v) => setProxyPoolConfig({ sourceSyncEnabled: v })}
+                />
+                <span>{isEn ? 'Sync IPLocate source' : 'Đồng bộ IPLocate'}</span>
+              </label>
+              <label className="flex items-center gap-2 text-xs">
+                <Switch
+                  checked={proxyPoolConfig.sourceRemoveDead}
+                  onCheckedChange={(v) => setProxyPoolConfig({ sourceRemoveDead: v })}
+                />
+                <span>{isEn ? 'Remove dead source proxies' : 'Xóa proxy source die'}</span>
+              </label>
+              <label className="flex items-center gap-2 text-xs">
+                <Switch
+                  checked={proxyPoolConfig.accountHealthCheckEnabled}
+                  onCheckedChange={(v) => setProxyPoolConfig({ accountHealthCheckEnabled: v })}
+                />
+                <span>{isEn ? 'Check accounts' : 'Kiểm tra tài khoản'}</span>
+              </label>
+              <label className="flex items-center gap-2 text-xs">
+                <Switch
+                  checked={proxyPoolConfig.accountDeleteDead}
+                  onCheckedChange={(v) => setProxyPoolConfig({ accountDeleteDead: v })}
+                />
+                <span>{isEn ? 'Delete dead accounts' : 'Xóa tài khoản die'}</span>
+              </label>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-[1fr_150px_150px] gap-3">
+              <div className="space-y-1">
+                <Label className="text-xs">{isEn ? 'IPLocate source URL' : 'Nguồn IPLocate'}</Label>
+                <Input
+                  value={proxyPoolConfig.sourceUrl}
+                  onChange={(e) => setProxyPoolConfig({ sourceUrl: e.target.value })}
+                  className="h-8 text-xs font-mono"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs">{isEn ? 'Account threshold' : 'Ngưỡng lỗi tài khoản'}</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={proxyPoolConfig.accountFailureThreshold}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10)
+                    if (!isNaN(v) && v >= 1) setProxyPoolConfig({ accountFailureThreshold: v })
+                  }}
+                  disabled={!proxyPoolConfig.accountHealthCheckEnabled || !proxyPoolConfig.accountDeleteDead}
+                  className="h-8 text-xs"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs">{isEn ? 'Account concurrency' : 'Tài khoản đồng thời'}</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={proxyPoolConfig.accountCheckConcurrency}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10)
+                    if (!isNaN(v) && v >= 1) setProxyPoolConfig({ accountCheckConcurrency: v })
+                  }}
+                  disabled={!proxyPoolConfig.accountHealthCheckEnabled}
+                  className="h-8 text-xs"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-2 text-[11px]">
+              <div><span className="text-muted-foreground">{isEn ? 'Source' : 'Nguồn'}</span><div className="font-mono">{maintenanceStatus?.sourceCandidates ?? 0}</div></div>
+              <div><span className="text-muted-foreground">{isEn ? 'Checked' : 'Đã check'}</span><div className="font-mono">{maintenanceStatus?.proxiesChecked ?? 0}</div></div>
+              <div><span className="text-muted-foreground">{isEn ? 'Live' : 'Live'}</span><div className="font-mono text-green-600 dark:text-green-400">{maintenanceStatus?.proxiesAlive ?? 0}</div></div>
+              <div><span className="text-muted-foreground">{isEn ? 'Added' : 'Đã thêm'}</span><div className="font-mono">{maintenanceStatus?.proxiesAdded ?? 0}</div></div>
+              <div><span className="text-muted-foreground">{isEn ? 'Removed' : 'Đã xóa'}</span><div className="font-mono">{maintenanceStatus?.proxiesRemoved ?? 0}</div></div>
+              <div><span className="text-muted-foreground">{isEn ? 'Accounts' : 'Tài khoản'}</span><div className="font-mono">{maintenanceStatus?.accountsChecked ?? 0}</div></div>
+              <div><span className="text-muted-foreground">{isEn ? 'Dead accounts' : 'TK die'}</span><div className="font-mono text-red-600 dark:text-red-400">{maintenanceStatus?.accountsRemoved ?? 0}</div></div>
+              <div><span className="text-muted-foreground">{isEn ? 'Last' : 'Lần cuối'}</span><div className="font-mono truncate">{formatMaintenanceTime(maintenanceStatus?.lastCompletedAt)}</div></div>
+            </div>
+
+            {maintenanceStatus?.lastError && (
+              <div className="text-[11px] text-red-600 dark:text-red-400 break-all">
+                {maintenanceStatus.lastError}
+              </div>
+            )}
           </div>
 
           {/* 上游中转代理（代理链）：用于目标代理要求非大陆来源 IP 的场景 */}

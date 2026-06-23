@@ -1,9 +1,42 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { claudeToKiro, openaiToKiro, responsesToOpenAIChat } from '../../src/main/proxy/translator'
 import { kiroProxyModelSupportsThinking } from '../../src/main/proxy/modelCatalog'
 
 describe('translator thinking / reasoning mapping', () => {
+  const originalKrouterThinking = process.env.KROUTER_ENABLE_KIRO_THINKING_FIELDS
+  const originalKiroThinking = process.env.KIRO_ENABLE_THINKING_FIELDS
+
+  beforeEach(() => {
+    delete process.env.KROUTER_ENABLE_KIRO_THINKING_FIELDS
+    delete process.env.KIRO_ENABLE_THINKING_FIELDS
+  })
+
+  afterEach(() => {
+    if (originalKrouterThinking === undefined) {
+      delete process.env.KROUTER_ENABLE_KIRO_THINKING_FIELDS
+    } else {
+      process.env.KROUTER_ENABLE_KIRO_THINKING_FIELDS = originalKrouterThinking
+    }
+    if (originalKiroThinking === undefined) {
+      delete process.env.KIRO_ENABLE_THINKING_FIELDS
+    } else {
+      process.env.KIRO_ENABLE_THINKING_FIELDS = originalKiroThinking
+    }
+  })
+
+  it('does not send Kiro thinking fields by default', () => {
+    const payload = openaiToKiro({
+      model: 'claude-sonnet-4.5',
+      messages: [{ role: 'user', content: 'ping' }],
+      thinking: { type: 'enabled', budget_tokens: 4096 }
+    })
+
+    expect(payload.additionalModelRequestFields).toBeUndefined()
+  })
+
   it('maps OpenAI reasoning_effort to Kiro adaptive thinking effort for Opus 4+', () => {
+    process.env.KROUTER_ENABLE_KIRO_THINKING_FIELDS = '1'
+
     const payload = openaiToKiro({
       model: 'claude-opus-4.8',
       messages: [{ role: 'user', content: 'ping' }],
@@ -17,6 +50,8 @@ describe('translator thinking / reasoning mapping', () => {
   })
 
   it('maps OpenAI thinking budget to Kiro adaptive task budget for Claude 4+', () => {
+    process.env.KROUTER_ENABLE_KIRO_THINKING_FIELDS = '1'
+
     const payload = openaiToKiro({
       model: 'claude-sonnet-4.5',
       messages: [{ role: 'user', content: 'ping' }],
@@ -30,6 +65,8 @@ describe('translator thinking / reasoning mapping', () => {
   })
 
   it('maps Claude thinking effort and task budget to Kiro fields', () => {
+    process.env.KROUTER_ENABLE_KIRO_THINKING_FIELDS = '1'
+
     const payload = claudeToKiro({
       model: 'claude-opus-4.8',
       max_tokens: 1024,

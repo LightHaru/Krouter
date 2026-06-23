@@ -690,12 +690,21 @@ export class Registrar {
     try { return JSON.parse(body) } catch { return {} }
   }
 
+  private parseRequiredJsonBody(body: string | undefined, context: string): Record<string, unknown> {
+    const decoded = this.decodeBody(body || '')
+    try {
+      return decoded ? JSON.parse(decoded) as Record<string, unknown> : {}
+    } catch {
+      const compact = decoded.replace(/\s+/g, ' ').trim().slice(0, 220)
+      throw new Error(`${context} trả về non-JSON: ${compact || '(empty body)'}`)
+    }
+  }
+
   /**
    * 识别 AWS 风控触发的错误响应，返回人类可读的标签
    * @returns 风控类型标签（如 'AWS-RISK-CONTROL'），不是风控返回 null
    */
   private detectRiskControl(body: string, status: number): string | null {
-    if (status !== 400) return null
     const lower = body.toLowerCase()
     // 中文消息（已正确解码）
     if (body.includes('请稍后再试') && body.includes('管理员')) return 'AWS-RISK-CONTROL'
@@ -706,6 +715,7 @@ export class Registrar {
     if (lower.includes('blocked') && lower.includes('tes')) return 'AWS-RISK-CONTROL'
     if (lower.includes('try again later') && lower.includes('administrator')) return 'AWS-RISK-CONTROL'
     if (lower.includes('unexpected error') && lower.includes('contact')) return 'AWS-RISK-CONTROL'
+    if (status !== 400) return null
     return null
   }
 
@@ -715,7 +725,18 @@ export class Registrar {
     if (risk) {
       return `${risk} (AWS đã chặn yêu cầu; đề xuất: 1) dừng tác vụ hàng loạt hiện tại; 2) bật giới hạn tốc độ và tự động tạm dừng; 3) tránh đăng ký hàng loạt cùng một tên miền email; 4) nếu tài khoản bị hạn chế, liên hệ Support theo hướng dẫn của AWS/Kiro)`
     }
-    return `status=${status} body=${body.substring(0, 200)}`
+    const compactBody = body.replace(/\s+/g, ' ').trim()
+    if (
+      status === 403
+      && /<html[\s>]/i.test(compactBody)
+      && /403 forbidden/i.test(compactBody)
+    ) {
+      return `status=403 proxy gateway returned an HTML Forbidden page before Kiro produced an API response; route/proxy is not usable for AWS sign-in`
+    }
+    if ((status === 401 || status === 403) && /forbidden|unauthorized|access denied/i.test(compactBody)) {
+      return `status=${status} route đăng ký bị Kiro/AWS từ chối; nguồn mail có thể vẫn bình thường; body=${compactBody.substring(0, 160)}`
+    }
+    return `status=${status} body=${compactBody.substring(0, 200)}`
   }
 
   private async fetchD2CToken(origin: string, referer: string): Promise<void> {
@@ -954,6 +975,9 @@ export class Registrar {
       inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
       requestId: rid
     }, h)
+    if (resp.status !== 200) {
+      throw new Error(`WorkflowInit Kiro failed: ${this.formatErrorBody(resp.body, resp.status)}`)
+    }
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     let data = this.parseBody(resp.body)
     if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
@@ -969,6 +993,9 @@ export class Registrar {
         inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
         requestId: rid
       }, h)
+      if (resp.status !== 200) {
+        throw new Error(`WorkflowStart Kiro failed: ${this.formatErrorBody(resp.body, resp.status)}`)
+      }
       saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
       data = this.parseBody(resp.body)
       if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
@@ -1006,7 +1033,7 @@ export class Registrar {
 
     if (resp.status === 400) return 'signup'
     if (resp.status === 200) return 'login'
-    throw new Error(`Gửi email thất bại: ${resp.status} - ${resp.body.slice(0, 200)}`)
+    throw new Error(`SubmitEmail Kiro failed: ${this.formatErrorBody(resp.body, resp.status)}`)
   }
 
   private async step7Signup(): Promise<void> {
@@ -1266,7 +1293,7 @@ export class Registrar {
 
     const redir = data.redirect as Record<string, unknown> | undefined
     const rurl = redir?.url as string
-    if (!rurl) throw new Error(`Bước đặt mật khẩu không trả về redirect: ${resp.body.slice(0, 200)}`)
+    if (!rurl) throw new Error(`SetPassword Kiro failed: ${this.formatErrorBody(resp.body, resp.status)}`)
 
     const wh = extractParam(rurl, 'workflowStateHandle')
     const st = extractParam(rurl, 'state')
@@ -1423,9 +1450,9 @@ export class Registrar {
     try {
       for (let retry = 0; retry < 5; retry++) {
         const resp = await ssoSession.post(this.cfg.portalBase + '/auth/sso-token', formData, { headers: h })
-        const data = JSON.parse(resp.body || '{}')
+        const data = this.parseRequiredJsonBody(resp.body, `SSO Token status=${resp.status}`)
 
-        if (data.token) {
+        if (typeof data.token === 'string' && data.token) {
           this.ssoToken = data.token
           break
         }
@@ -1567,9 +1594,9 @@ export class Registrar {
       const initSteps: Array<{ name: string; fn: StepFn; retry?: number; timeoutMs?: number; refreshSession?: boolean }> = [
         { name: 'OIDC', fn: () => this.step1OIDC() },
         { name: 'Device', fn: () => this.step2Device(), retry: 2, timeoutMs: 30000, refreshSession: true },
-        { name: 'Email', fn: () => this.step3Email() },
         { name: 'Portal', fn: () => this.step4Portal(), retry: 3, timeoutMs: 35000, refreshSession: true },
-        { name: 'WorkflowInit', fn: () => this.step5WorkflowInit(), retry: 2, timeoutMs: 35000, refreshSession: true }
+        { name: 'WorkflowInit', fn: () => this.step5WorkflowInit(), retry: 2, timeoutMs: 35000, refreshSession: true },
+        { name: 'Email', fn: () => this.step3Email() }
       ]
       for (const s of initSteps) {
         this.checkAborted()

@@ -161,7 +161,7 @@ export function ProxyPanel() {
     enableMultiAccount: true,
     logRequests: true,
     clientDrivenToolExecution: true,
-    accountSelectionStrategy: 'smart',
+    accountSelectionStrategy: 'round-robin',
     sessionAffinityEnabled: false
   })
   const [stats, setStats] = useState<ProxyStats | null>(null)
@@ -395,8 +395,8 @@ export function ProxyPanel() {
         enableMultiAccount: config.enableMultiAccount,
         enabled: true,
         autoStart: config.autoStart,
-        accountSelectionStrategy: config.enableMultiAccount ? (config.accountSelectionStrategy || 'smart') : config.accountSelectionStrategy,
-        sessionAffinityEnabled: config.enableMultiAccount && (config.accountSelectionStrategy || 'smart') !== 'sticky'
+        accountSelectionStrategy: config.enableMultiAccount ? (config.accountSelectionStrategy || 'round-robin') : config.accountSelectionStrategy,
+        sessionAffinityEnabled: config.enableMultiAccount && (config.accountSelectionStrategy || 'round-robin') !== 'sticky'
           ? false
           : config.sessionAffinityEnabled,
         logRequests: config.logRequests,
@@ -895,7 +895,7 @@ export function ProxyPanel() {
                 checked={config.enableMultiAccount}
                 onCheckedChange={(checked) => {
                   const patch: Partial<ProxyConfig> = checked
-                    ? { enableMultiAccount: true, accountSelectionStrategy: 'smart', sessionAffinityEnabled: false }
+                    ? { enableMultiAccount: true, accountSelectionStrategy: 'round-robin', sessionAffinityEnabled: false }
                     : { enableMultiAccount: false }
                   setConfig(prev => ({ ...prev, ...patch }))
                   window.api.proxyUpdateConfig(patch)
@@ -912,7 +912,7 @@ export function ProxyPanel() {
                 </Label>
                 <div className="flex max-w-full flex-wrap gap-1 rounded-lg bg-muted/30 p-0.5">
                   {(['smart', 'round-robin', 'least-used', 'sticky'] as const).map(strategy => {
-                    const active = (config.accountSelectionStrategy || 'smart') === strategy
+                    const active = (config.accountSelectionStrategy || 'round-robin') === strategy
                     const labelEn = strategy === 'smart' ? 'Smart' : strategy === 'round-robin' ? 'Round-Robin' : strategy === 'least-used' ? 'Least-Used' : 'Sticky'
                     const labelZh = strategy === 'smart' ? 'Thông minh' : strategy === 'round-robin' ? 'Xoay vòng' : strategy === 'least-used' ? 'Ít dùng nhất' : 'Bám phiên'
                     return (
@@ -940,7 +940,7 @@ export function ProxyPanel() {
                 </div>
                 <span className="min-w-0 text-xs text-muted-foreground">
                   {(() => {
-                    const strategy = config.accountSelectionStrategy || 'smart'
+                    const strategy = config.accountSelectionStrategy || 'round-robin'
                     if (strategy === 'smart') return isEn ? 'Score quota, errors, latency and token freshness before each request' : 'Chấm điểm quota, lỗi, độ trễ và token trước mỗi request'
                     if (strategy === 'least-used') return isEn ? 'Pick the account with the fewest successful requests' : 'Chọn tài khoản có số request thành công thấp nhất'
                     if (strategy === 'sticky') return isEn ? 'Stay on success account until failure (preserves prompt cache)' : 'Giữ tài khoản đang thành công cho tới khi lỗi'

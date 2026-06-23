@@ -2,6 +2,58 @@
 
 All notable Krouter changes are tracked here.
 
+## 1.9.0 - 2026-06-23
+
+### Added
+
+- Added backend-owned proxy maintenance that continues while the dashboard is closed. It can periodically download the IPLocate free proxy list, validate candidates, add live routes, remove dead managed routes, check saved accounts, and remove terminally dead accounts after a configurable threshold.
+- Added proxy-maintenance controls and live status to the Proxy Pool page, including interval, source URL, validation concurrency, account-health settings, run-now action, counters, next-run time, and recent error reporting.
+- Added direct proxy URL account bindings so accounts imported from registration or history keep the exact route used during registration even when the route is not a permanent proxy-pool entry.
+- Added account-bound proxy support to token refresh, quota reads, profile discovery, liveness checks, background refresh, backend maintenance, and API proxy requests.
+- Added registration proxy rotation per task, proxy cooldown/exclusion tracking, route verification, exit-IP reporting, and strict client-proxy routing.
+- Added a registration safety circuit breaker. It stops after repeated network preflight failures, repeated AWS/Kiro service rejections, repeated proxy-gateway HTML `403` responses, TES/risk-control blocks, or newly suspended accounts.
+- Added Kiro payload compaction for oversized messages, history, and tool results while preserving the beginning and latest context.
+- Added a second compact-and-retry pass for `CONTENT_LENGTH_EXCEEDS_THRESHOLD` responses.
+- Added environment controls for Kiro content limits through `KROUTER_KIRO_CONTENT_CHAR_LIMIT` and `KIRO_CONTENT_CHAR_LIMIT`.
+- Added periodic frontend-to-backend account synchronization while the dashboard is visible, plus refreshes after background token and account checks.
+- Added Windows `start-krouter.cmd` and `stop-krouter.cmd` helpers.
+- Added unit and E2E coverage for round-robin distribution, payload compaction, Builder ID liveness, proxy maintenance, persisted proxy startup, direct proxy bindings, registration route failures, and safety-circuit behavior.
+
+### Changed
+
+- Changed the default API proxy account strategy from Smart to strict per-request Round-Robin with session affinity disabled, distributing sequential requests across available accounts.
+- Changed registration batches using the proxy pool to one concurrent registration at a time to reduce repeated security and gateway failures.
+- Changed registration ordering so AWS portal and workflow initialization must succeed before Krouter creates a temporary mailbox.
+- Changed `Continue on task error` to skip ordinary task failures only. Security blocks, suspended accounts, repeated `403` responses, and safety-circuit failures still stop the batch.
+- Changed account import liveness to require a real model `pong` response. Credential/quota-only fallbacks no longer appear as successful model checks.
+- Changed Builder ID placeholder `profileArn` handling to try model liveness, preserve the original authorization failure when fallback fails, and report rate limits or missing streaming capability as failures instead of green success.
+- Changed account health-state merging so transient network errors, `429` responses, and profileArn-only limitations do not overwrite a previously live account as dead.
+- Changed prompt thinking/reasoning fields to opt-in through `KROUTER_ENABLE_KIRO_THINKING_FIELDS=1` or `KIRO_ENABLE_THINKING_FIELDS=1`, preventing unsupported request fields from breaking otherwise compatible models.
+- Changed account-bound proxy failures to fail closed instead of silently falling back to the system IP.
+- Changed proxy-pool persistence to preserve backend-managed IPLocate entries and deletion tombstones across frontend synchronization.
+- Changed proxy maintenance and account synchronization to refresh the active API proxy pool after stored data changes.
+
+### Fixed
+
+- Fixed long Claude/OpenAI-compatible conversations failing with `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD` during compaction or large tool-result workflows.
+- Fixed content-length request errors incorrectly penalizing account health or rotating away from otherwise healthy accounts.
+- Fixed large histories repeatedly using one account instead of distributing requests across the live account pool.
+- Fixed account proxy bindings being lost when stored as direct URLs instead of proxy-pool IDs.
+- Fixed newly registered accounts reverting to the system IP during quota verification, liveness checks, token refresh, or later API proxy usage.
+- Fixed proxy pool preflight accepting routes that could reach an IP-check service but returned an HTML `403 Forbidden` page for AWS sign-in.
+- Fixed `WorkflowInit` and `WorkflowStart` ignoring non-`200` HTTP responses and continuing until `SubmitEmail`, which unnecessarily created mailboxes before reporting a route failure.
+- Fixed `SubmitEmail`, `SetPassword`, and SSO token failures returning ambiguous or non-JSON errors.
+- Fixed repeated proxy-gateway `403` failures being reset by a successful IP preflight, allowing a batch to continue through every task.
+- Fixed batch progress and error classification for proxy timeouts, route failures, TES blocks, service rejections, and suspended accounts.
+- Fixed dead or rate-limited proxy routes being immediately selected again during the same batch.
+- Fixed backend account refreshes and liveness checks omitting the account's bound proxy.
+- Fixed dashboard account state lagging behind backend maintenance, refresh, and deletion changes.
+- Fixed API proxy defaults and saved runtime settings disagreeing after backend restart.
+
+### Removed
+
+- Removed the deprecated `scripts/kiro-manager-cli.cjs` compatibility entry from the npm package. The supported command remains `krouter`.
+
 ## 1.8.11 - 2026-06-11
 
 ### Fixed

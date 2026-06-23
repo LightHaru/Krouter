@@ -210,7 +210,8 @@ export async function diagnoseAccountLiveness(params: {
         region: account.region || 'us-east-1',
         authMethod: account.authMethod,
         provider: account.provider,
-        machineId: account.machineId
+        machineId: account.machineId,
+        proxyUrl: account.proxyUrl
       }).catch(() => null)
       return refreshed?.success && refreshed.accessToken ? refreshed.accessToken : null
     }
@@ -244,7 +245,8 @@ export async function diagnoseAccountLiveness(params: {
       machineId: account.machineId,
       region: account.region || 'us-east-1',
       authMethod: account.authMethod,
-      provider: account.provider
+      provider: account.provider,
+      proxyUrl: account.proxyUrl
     }).catch(() => undefined)
     resolvedProfileArn = resolvedProfileArn || resolveProfileArn(proxyAccount)
 
@@ -267,7 +269,8 @@ export async function diagnoseAccountLiveness(params: {
           authMethod: account.authMethod,
           provider: account.provider,
           profileArn: account.profileArn,
-          machineId: account.machineId
+          machineId: account.machineId,
+          proxyUrl: account.proxyUrl
         }) as {
           success?: boolean
           data?: { email?: string; subscriptionTitle?: string; profileArn?: string; usage?: { current?: number; limit?: number } }

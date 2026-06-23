@@ -5,6 +5,7 @@ dist-web
 out-server
 .web-data
 .web-data-*
+.data-backups
 .DS_Store
 .eslintcache
 *.log*

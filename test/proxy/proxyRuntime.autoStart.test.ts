@@ -137,4 +137,36 @@ describe('ProxyRuntime persisted running state', () => {
     expect(store.getUserSetting(userId, 'proxyRunning', false)).toBe(true)
     expect(store.getUserSetting<Record<string, unknown>>(userId, 'proxyConfig', {}).autoStart).toBe(true)
   })
+
+  it('keeps direct proxy URL bindings when syncing accounts from the web store', async () => {
+    const { store, userId } = await createStore()
+    const proxyUrl = 'socks5://127.0.0.1:1080'
+
+    await store.setAccountData(userId, {
+      accounts: {
+        acc_api_key: {
+          id: 'acc_api_key',
+          email: 'api-key@example.test',
+          status: 'active',
+          credentials: {
+            accessToken: 'ksk_test_account_key',
+            authMethod: 'api_key',
+            provider: 'KiroApiKey',
+            region: 'us-east-1'
+          }
+        }
+      },
+      accountProxyBindings: {
+        acc_api_key: proxyUrl
+      },
+      proxyPool: {}
+    })
+
+    const runtime = createRuntime(store, userId)
+    const syncResult = runtime.syncAccountsFromStore()
+    const synced = runtime.getAccounts().accounts.find((account) => account.id === 'acc_api_key')
+
+    expect(syncResult.accountCount).toBe(1)
+    expect(synced?.proxyUrl).toBe(proxyUrl)
+  })
 })

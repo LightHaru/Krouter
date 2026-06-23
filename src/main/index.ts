@@ -361,6 +361,8 @@ function initProxyServer(): ProxyServer {
     retryDelayMs: 1000,
     tokenRefreshBeforeExpiry: 300, // 5分钟提前刷新
     clientDrivenToolExecution: true,
+    accountSelectionStrategy: 'round-robin',
+    sessionAffinityEnabled: false,
     enableTokenBufferReserve: false,
     tokenBufferReserve: 20000
   }
@@ -506,6 +508,7 @@ function initProxyServer(): ProxyServer {
         const buildProxyUrl = (accountId: string): string | undefined => {
           const proxyId = bindings[accountId]
           if (!proxyId) return undefined
+          if (/^(https?|socks4a?|socks5h?):\/\//i.test(proxyId)) return proxyId
           const p = proxyPool[proxyId]
           if (!p || !p.enabled || p.status === 'dead') return undefined
           return p.url
@@ -2106,6 +2109,7 @@ function createWindow(): void {
           const buildProxyUrl = (accountId: string): string | undefined => {
             const proxyId = bindings[accountId]
             if (!proxyId) return undefined
+            if (/^(https?|socks4a?|socks5h?):\/\//i.test(proxyId)) return proxyId
             const p = proxyPool[proxyId]
             if (!p || !p.enabled || p.status === 'dead') return undefined
             return p.url
@@ -2804,11 +2808,12 @@ app.whenReady().then(async () => {
           || message.includes('locked it as a security precaution')
           || message.includes('restricted your ability to use kiro')
       }
-      const runCredentialCheck = async (fallbackReason?: string): Promise<{
+      const runCredentialCheck = async (fallbackReason?: string, options?: { success?: boolean }): Promise<{
         success: boolean
         latencyMs: number
         model: string
-        content: string
+        content?: string
+        error?: string
       }> => {
         const usageResult = await getUsageAndLimits(
           accessToken,
@@ -2823,11 +2828,12 @@ app.whenReady().then(async () => {
         )
         const current = creditUsage?.currentUsageWithPrecision ?? creditUsage?.currentUsage ?? 0
         const limit = creditUsage?.usageLimitWithPrecision ?? creditUsage?.usageLimit ?? 0
+        const content = `${fallbackReason ? `${fallbackReason} ` : ''}Credential and quota check passed for ${acc.email || 'unknown'}, usage ${current}/${limit}.`
         return {
-          success: true,
+          success: options?.success ?? true,
           latencyMs: Date.now() - start,
           model: 'credential-check',
-          content: `${fallbackReason ? `${fallbackReason} ` : ''}Credential and quota check passed for ${acc.email || 'unknown'}, usage ${current}/${limit}.`
+          ...(options?.success === false ? { error: content } : { content })
         }
       }
 
@@ -2857,7 +2863,7 @@ app.whenReady().then(async () => {
               error: `Builder ID model liveness failed: ${detail}`
             }
           }
-          return await runCredentialCheck(`Builder ID model liveness fallback: Kiro did not accept the fixed placeholder profileArn (${detail}).`)
+          return await runCredentialCheck(`Builder ID model liveness fallback: Kiro did not accept the fixed placeholder profileArn (${detail}).`, { success: false })
         }
         throw error
       }

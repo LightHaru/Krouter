@@ -13,6 +13,8 @@ import { pageFromPath } from './lib/docsRoute'
 const TRAY_UPDATE_DEBOUNCE_MS = 400
 // 后台刷新结果批量化间隔：N 条结果合并到一次 set，避免 N 次 Map 全量复制 + 渲染抖动
 const BACKGROUND_RESULT_FLUSH_MS = 120
+const BACKEND_ACCOUNT_SYNC_INTERVAL_MS = 10000
+const BACKEND_ACCOUNT_SYNC_DEBOUNCE_MS = 800
 
 function App(): React.JSX.Element {
   const [currentPage, setCurrentPage] = useState<PageType>('home')
@@ -45,6 +47,8 @@ function App(): React.JSX.Element {
 
   // 托盘信息防抖：账号 Map 频繁变更（后台刷新风暴）时合并 N 次 IPC 为 1 次
   const trayDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const backendAccountSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const backendAccountSyncInFlightRef = useRef(false)
   const updateTrayInfo = useCallback(() => {
     if (trayDebounceRef.current) clearTimeout(trayDebounceRef.current)
     trayDebounceRef.current = setTimeout(() => {
@@ -87,6 +91,21 @@ function App(): React.JSX.Element {
     }, TRAY_UPDATE_DEBOUNCE_MS)
   }, [])
 
+  const syncAccountsFromBackend = useCallback((delayMs = 0): void => {
+    if (backendAccountSyncTimerRef.current) clearTimeout(backendAccountSyncTimerRef.current)
+    backendAccountSyncTimerRef.current = setTimeout(() => {
+      backendAccountSyncTimerRef.current = null
+      if (backendAccountSyncInFlightRef.current) return
+      if (typeof document !== 'undefined' && document.hidden) return
+      backendAccountSyncInFlightRef.current = true
+      loadFromStorage({ silent: true })
+        .catch((error) => console.warn('[App] silent backend account sync failed:', error))
+        .finally(() => {
+          backendAccountSyncInFlightRef.current = false
+        })
+    }, delayMs)
+  }, [loadFromStorage])
+
   // 应用启动时加载数据并启动自动刷新
   useEffect(() => {
     loadFromStorage().then(() => {
@@ -101,6 +120,27 @@ function App(): React.JSX.Element {
       stopAutoTokenRefresh()
     }
   }, [loadFromStorage, startAutoTokenRefresh, stopAutoTokenRefresh])
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      syncAccountsFromBackend()
+    }, BACKEND_ACCOUNT_SYNC_INTERVAL_MS)
+    const onFocus = (): void => syncAccountsFromBackend()
+    const onVisibilityChange = (): void => {
+      if (!document.hidden) syncAccountsFromBackend()
+    }
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      clearInterval(interval)
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      if (backendAccountSyncTimerRef.current) {
+        clearTimeout(backendAccountSyncTimerRef.current)
+        backendAccountSyncTimerRef.current = null
+      }
+    }
+  }, [syncAccountsFromBackend])
 
   // 订阅 Kiro IDE 自己 refresh token 后反代检测到的事件
   // 触发时间点：Kiro IDE 在后台 refresh loop 把磁盘 token 写新了，反代 watcher 反向同步到 store
@@ -230,6 +270,7 @@ function App(): React.JSX.Element {
       if (refreshBuffer.length === 0) return
       const batch = refreshBuffer.splice(0)
       applyBackgroundRefreshResults(batch)
+      syncAccountsFromBackend(BACKEND_ACCOUNT_SYNC_DEBOUNCE_MS)
     }
 
     const unsubscribe = window.api.onBackgroundRefreshResult((data) => {
@@ -246,7 +287,7 @@ function App(): React.JSX.Element {
         flush()
       }
     }
-  }, [applyBackgroundRefreshResults])
+  }, [applyBackgroundRefreshResults, syncAccountsFromBackend])
 
   // 监听后台检查结果：同样的批量化策略
   useEffect(() => {
@@ -258,6 +299,7 @@ function App(): React.JSX.Element {
       if (checkBuffer.length === 0) return
       const batch = checkBuffer.splice(0)
       applyBackgroundCheckResults(batch)
+      syncAccountsFromBackend(BACKEND_ACCOUNT_SYNC_DEBOUNCE_MS)
     }
 
     const unsubscribe = window.api.onBackgroundCheckResult((data) => {
@@ -273,7 +315,7 @@ function App(): React.JSX.Element {
         flush()
       }
     }
-  }, [applyBackgroundCheckResults])
+  }, [applyBackgroundCheckResults, syncAccountsFromBackend])
 
   useEffect(() => {
     if (typeof window.api.onProxyAccountUpdate !== 'function') return

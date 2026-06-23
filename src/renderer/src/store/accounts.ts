@@ -306,6 +306,84 @@ function isBannedAccountError(error?: string): boolean {
 }
 
 // 自动换号定时器
+function isProfileArnOnlyAccountError(error?: string): boolean {
+  if (!error) return false
+  const lowerError = error.toLowerCase()
+  return lowerError.includes('profilearn is required') ||
+    lowerError.includes('no profilearn') ||
+    lowerError.includes('without profilearn') ||
+    lowerError.includes('no usable streaming profilearn') ||
+    lowerError.includes('placeholder profilearn') ||
+    lowerError.includes('model liveness skipped') ||
+    lowerError.includes('credential and quota check passed')
+}
+
+function isTransientAccountError(error?: string): boolean {
+  if (!error) return false
+  const lowerError = error.toLowerCase()
+  return lowerError.includes('fetch failed') ||
+    lowerError.includes('network') ||
+    lowerError.includes('timeout') ||
+    lowerError.includes('timed out') ||
+    lowerError.includes('econnreset') ||
+    lowerError.includes('etimedout') ||
+    lowerError.includes('socket hang up') ||
+    lowerError.includes('too many requests') ||
+    lowerError.includes('rate limited') ||
+    /\b429\b/.test(lowerError)
+}
+
+function isHardAccountError(error?: string): boolean {
+  if (!error) return false
+  if (isBannedAccountError(error)) return true
+  if (isTransientAccountError(error) || isProfileArnOnlyAccountError(error)) return false
+  const lowerError = error.toLowerCase()
+  return /\b401\b/.test(lowerError) ||
+    /\b403\b/.test(lowerError) ||
+    lowerError.includes('bad credentials') ||
+    lowerError.includes('unauthorized') ||
+    lowerError.includes('invalid bearer') ||
+    lowerError.includes('invalid token')
+}
+
+function shouldKeepPreviousLiveState(account: Account, error?: string): boolean {
+  if (account.status !== 'active') return false
+  if (isHardAccountError(error)) return false
+  return isTransientAccountError(error) || isProfileArnOnlyAccountError(error)
+}
+
+function applyAccountCheckFailure(account: Account, error: string | undefined, now: number): Account {
+  if (shouldKeepPreviousLiveState(account, error)) {
+    return {
+      ...account,
+      status: 'active',
+      lastError: account.lastError,
+      lastCheckedAt: account.lastCheckedAt
+    }
+  }
+  return preserveBannedState(account, {
+    ...account,
+    status: 'error',
+    lastError: error,
+    lastCheckedAt: now
+  })
+}
+
+function resolveIncomingAccountStatus(account: Account, status: string | undefined, error: string | undefined, now: number): Pick<Account, 'status' | 'lastError' | 'lastCheckedAt'> {
+  if (status === 'error') {
+    const failed = applyAccountCheckFailure(account, error, now)
+    return {
+      status: failed.status,
+      lastError: failed.lastError,
+      lastCheckedAt: failed.lastCheckedAt
+    }
+  }
+  if (status === 'expired') {
+    return { status: 'expired', lastError: error, lastCheckedAt: now }
+  }
+  return { status: 'active', lastError: error, lastCheckedAt: now }
+}
+
 function preserveBannedState<T extends Account>(current: Account, next: T, forceClearBanned = false): T {
   const currentBanned = isBannedAccountError(current.lastError)
   const incomingBanned = isBannedAccountError(next.lastError)
@@ -528,7 +606,7 @@ interface AccountsActions {
   getStats: () => AccountStats
 
   // 持久化
-  loadFromStorage: () => Promise<void>
+  loadFromStorage: (options?: { silent?: boolean }) => Promise<void>
   /** 防抖触发持久化（推荐：高频 mutation 自动合并写盘） */
   saveToStorage: () => Promise<void>
   /** 立即持久化（用于 beforeunload 或关键操作场景） */
@@ -633,13 +711,15 @@ interface AccountsActions {
   /** 更新代理池配置 */
   setProxyPoolConfig: (config: Partial<ProxyPoolConfig>) => void
   /** 按当前策略挑选下一个可用代理（注册流程内部调用） */
-  pickNextProxy: () => ProxyEntry | null
+  pickNextProxy: (options?: { excludeIds?: Set<string> | string[]; excludeHosts?: Set<string> | string[] }) => ProxyEntry | null
   /** 标记代理使用结果（供注册流程上报，用于失败计数与自动停用） */
   reportProxyResult: (id: string, success: boolean, boundEmail?: string, errorMsg?: string) => void
 
   // ============ 账号-代理绑定（反代分桶）============
   /** 把账号绑定到指定代理 */
   bindAccountToProxy: (accountId: string, proxyId: string) => void
+  /** Bind an account to the exact proxy route URL used for registration/import. */
+  bindAccountToProxyRoute: (accountId: string, proxyUrl: string) => void
   /** 批量绑定（用于批量分配） */
   bindAccountsToProxy: (accountIds: string[], proxyId: string) => void
   /** 解除账号绑定 */
@@ -1536,7 +1616,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     try {
       // 通过主进程调用 Kiro API 刷新 Token（避免 CORS）
-      const result = await window.api.refreshAccountToken(account)
+      const result = await window.api.refreshAccountToken({
+        ...account,
+        proxyUrl: get().getAccountProxyUrl(id)
+      })
 
       if (result.success && result.data) {
         // 当 refresh 后 main 进程检测到该账号是 IDE 当前激活账号，会自动同步到磁盘 token 文件；
@@ -1574,7 +1657,17 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         get().saveToStorage()
         return true
       } else {
-        updateAccountStatus(id, 'error', result.error?.message)
+        const message = result.error?.message
+        if (shouldKeepPreviousLiveState(account, message)) {
+          set((state) => {
+            const accounts = new Map(state.accounts)
+            if (accounts.has(id)) accounts.set(id, applyAccountCheckFailure(account, message, Date.now()))
+            return { accounts }
+          })
+          get().saveToStorage()
+        } else {
+          updateAccountStatus(id, 'error', message)
+        }
         // 触发 webhook：Token 刷新失败
         triggerWebhook('token-expired', {
           title: 'Token 刷新失败',
@@ -1585,7 +1678,17 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         return false
       }
     } catch (error) {
-      updateAccountStatus(id, 'error', error instanceof Error ? error.message : 'Unknown error')
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      if (shouldKeepPreviousLiveState(account, message)) {
+        set((state) => {
+          const accounts = new Map(state.accounts)
+          if (accounts.has(id)) accounts.set(id, applyAccountCheckFailure(account, message, Date.now()))
+          return { accounts }
+        })
+        get().saveToStorage()
+      } else {
+        updateAccountStatus(id, 'error', message)
+      }
       return false
     }
   },
@@ -1605,6 +1708,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         authMethod?: string
         accessToken?: string
       }
+      proxyUrl?: string
     }> = []
 
     for (const id of ids) {
@@ -1621,7 +1725,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           region: account.credentials.region,
           authMethod: account.credentials.authMethod,
           accessToken: account.credentials.accessToken
-        }
+        },
+        proxyUrl: get().getAccountProxyUrl(id)
       })
     }
 
@@ -1652,7 +1757,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     try {
       // 通过主进程调用 Kiro API 获取状态（避免 CORS）
-      const result = await window.api.checkAccountStatus(account)
+      const result = await window.api.checkAccountStatus({
+        ...account,
+        proxyUrl: get().getAccountProxyUrl(id)
+      })
 
       if (result.success && result.data) {
         set((state) => {
@@ -1711,12 +1819,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               userId: result.data!.userId ?? acc.userId,
               idp: idpType,
               profileArn: result.data!.profileArn ?? acc.profileArn,
-              status: result.data!.status as AccountStatus,
+              status: resolveIncomingAccountStatus(acc, result.data!.status as string | undefined, result.data!.errorMessage, Date.now()).status,
               usage: mergedUsage,
               subscription: mergedSubscription as AccountSubscription,
               credentials: updatedCredentials,
-              lastCheckedAt: Date.now(),
-              lastError: undefined
+              lastCheckedAt: resolveIncomingAccountStatus(acc, result.data!.status as string | undefined, result.data!.errorMessage, Date.now()).lastCheckedAt,
+              lastError: resolveIncomingAccountStatus(acc, result.data!.status as string | undefined, result.data!.errorMessage, Date.now()).lastError
             }))
           }
           return { accounts }
@@ -1734,11 +1842,31 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           // 封禁账户：设置错误状态并标记为封禁
           updateAccountStatus(id, 'error', `账户已封禁: ${result.error?.message}`)
         } else {
-          updateAccountStatus(id, 'error', result.error?.message)
+          const message = result.error?.message
+          if (shouldKeepPreviousLiveState(account, message)) {
+            set((state) => {
+              const accounts = new Map(state.accounts)
+              if (accounts.has(id)) accounts.set(id, applyAccountCheckFailure(account, message, Date.now()))
+              return { accounts }
+            })
+            get().saveToStorage()
+          } else {
+            updateAccountStatus(id, 'error', message)
+          }
         }
       }
     } catch (error) {
-      updateAccountStatus(id, 'error', error instanceof Error ? error.message : 'Unknown error')
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      if (shouldKeepPreviousLiveState(account, message)) {
+        set((state) => {
+          const accounts = new Map(state.accounts)
+          if (accounts.has(id)) accounts.set(id, applyAccountCheckFailure(account, message, Date.now()))
+          return { accounts }
+        })
+        get().saveToStorage()
+      } else {
+        updateAccountStatus(id, 'error', message)
+      }
     }
   },
 
@@ -1759,6 +1887,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         provider?: string
       }
       idp?: string
+      proxyUrl?: string
     }> = []
 
     for (const id of ids) {
@@ -1777,7 +1906,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           authMethod: account.credentials.authMethod,
           provider: account.credentials.provider
         },
-        idp: account.idp
+        idp: account.idp,
+        proxyUrl: get().getAccountProxyUrl(id)
       })
     }
 
@@ -1862,8 +1992,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   // ==================== 持久化 ====================
 
-  loadFromStorage: async () => {
-    set({ isLoading: true })
+  loadFromStorage: async (options) => {
+    const silent = Boolean(options?.silent)
+    if (!silent) set({ isLoading: true })
 
     try {
       // 获取应用版本号
@@ -1964,12 +2095,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
         // SSO 同步（含潜在网络请求）异步执行，不阻塞首屏加载
         // 完成后通过 set 应用结果，UI 会自然更新
-        queueMicrotask(() => { void syncLocalSsoAccountAsync(get, set) })
+        if (!silent) queueMicrotask(() => { void syncLocalSsoAccountAsync(get, set) })
       }
     } catch (error) {
       console.error('Failed to load accounts:', error)
     } finally {
-      set({ isLoading: false, hasLoadedStorage: true })
+      set(silent ? { hasLoadedStorage: true } : { isLoading: false, hasLoadedStorage: true })
     }
   },
 
@@ -2588,6 +2719,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       email: string
       idp?: string
       needsTokenRefresh: boolean
+      proxyUrl?: string
       machineId?: string  // 账户绑定的设备 ID
       credentials: {
         refreshToken: string
@@ -2617,6 +2749,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           email: account.email,
           idp: account.idp,
           needsTokenRefresh: !!needsTokenRefresh,
+          proxyUrl: get().getAccountProxyUrl(id),
           machineId: account.machineId,  // 传递账户绑定的设备 ID
           credentials: {
             refreshToken: account.credentials.refreshToken || '',
@@ -2662,12 +2795,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         if (!account) continue
 
         if (!success) {
-          accounts.set(id, preserveBannedState(account, {
-            ...account,
-            status: 'error',
-            lastError: error,
-            lastCheckedAt: now
-          }))
+          accounts.set(id, applyAccountCheckFailure(account, error, now))
           continue
         }
 
@@ -2703,8 +2831,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       } | undefined
 
       // 检测封禁状态
-      const newStatus = refreshData?.status === 'error' ? 'error' as AccountStatus : 'active' as AccountStatus
       const newError = refreshData?.errorMessage
+      const incomingStatus = resolveIncomingAccountStatus(account, refreshData?.status, newError, now)
 
       accounts.set(id, preserveBannedState(account, {
         ...account,
@@ -2741,9 +2869,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         } : account.subscription,
         email: refreshData?.userInfo?.email || account.email,
         userId: refreshData?.userInfo?.userId || account.userId,
-        status: newStatus,
-        lastError: newError,
-        lastCheckedAt: now
+        status: incomingStatus.status,
+        lastError: incomingStatus.lastError,
+        lastCheckedAt: incomingStatus.lastCheckedAt
       }))
       } // end for-loop
 
@@ -2771,12 +2899,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         if (!account) continue
 
         if (!success) {
-          accounts.set(id, preserveBannedState(account, {
-            ...account,
-            status: 'error',
-            lastError: error,
-            lastCheckedAt: now
-          }))
+          accounts.set(id, applyAccountCheckFailure(account, error, now))
           continue
         }
 
@@ -2810,13 +2933,13 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       } | undefined
 
       // 检测状态
-      let newStatus: AccountStatus = 'active'
-      if (checkData?.status === 'error') {
-        newStatus = 'error'
-      } else if (checkData?.status === 'expired' || checkData?.needsRefresh) {
-        newStatus = 'expired'
-      }
       const newError = checkData?.errorMessage
+      const incomingStatus = resolveIncomingAccountStatus(
+        account,
+        checkData?.needsRefresh ? 'expired' : checkData?.status,
+        newError,
+        now
+      )
 
       accounts.set(id, preserveBannedState(account, {
         ...account,
@@ -2847,9 +2970,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         } : account.subscription,
         email: checkData?.userInfo?.email || account.email,
         userId: checkData?.userInfo?.userId || account.userId,
-        status: newStatus,
-        lastError: newError,
-        lastCheckedAt: now
+        status: incomingStatus.status,
+        lastError: incomingStatus.lastError,
+        lastCheckedAt: incomingStatus.lastCheckedAt
       }))
       } // end for-loop
 
@@ -3317,13 +3440,19 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     get().saveToStorage()
   },
 
-  pickNextProxy: () => {
+  pickNextProxy: (options) => {
     const { proxyPool, proxyPoolConfig, proxyPoolCursor } = get()
     if (!proxyPoolConfig.enabled) return null
+    const excludeIds = options?.excludeIds
+      ? options.excludeIds instanceof Set ? options.excludeIds : new Set(options.excludeIds)
+      : new Set<string>()
+    const excludeHosts = options?.excludeHosts
+      ? options.excludeHosts instanceof Set ? options.excludeHosts : new Set(options.excludeHosts)
+      : new Set<string>()
 
     // 仅在启用且非 dead 的代理中挑选
     const candidates = Array.from(proxyPool.values())
-      .filter(p => p.enabled && p.status !== 'dead')
+      .filter(p => p.enabled && p.status !== 'dead' && !excludeIds.has(p.id) && !excludeHosts.has(p.host))
     if (candidates.length === 0) return null
 
     let picked: ProxyEntry
@@ -3406,6 +3535,17 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     }))
     get().saveToStorage()
     // 同步到主进程的账号池
+    syncAccountProxyToMain(accountId)
+  },
+
+  bindAccountToProxyRoute: (accountId, proxyUrl) => {
+    const parsed = parseProxyUrl(proxyUrl)
+    const route = parsed?.normalized || proxyUrl.trim()
+    if (!route) return
+    set((state) => ({
+      accountProxyBindings: { ...state.accountProxyBindings, [accountId]: route }
+    }))
+    get().saveToStorage()
     syncAccountProxyToMain(accountId)
   },
 
@@ -3509,11 +3649,15 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   getAccountProxyUrl: (accountId) => {
     const state = get()
-    const proxyId = state.accountProxyBindings[accountId]
-    if (!proxyId) return undefined
-    const proxy = state.proxyPool.get(proxyId)
-    if (!proxy || !proxy.enabled || proxy.status === 'dead') return undefined
-    return proxy.url
+    const binding = state.accountProxyBindings[accountId]
+    if (!binding) return undefined
+    const proxy = state.proxyPool.get(binding)
+    if (proxy) {
+      if (!proxy.enabled || proxy.status === 'dead') return undefined
+      return proxy.url
+    }
+    const direct = parseProxyUrl(binding)
+    return direct?.normalized || undefined
   }
 }))
 
@@ -3583,6 +3727,14 @@ function isProxyConnectionError(msg: string | undefined): boolean {
   const m = (msg || '').toLowerCase()
   if (!m) return false
   return m.includes('proxy')
+    || m.includes('fetch failed')
+    || m.includes('timeout')
+    || m.includes('timed out')
+    || m.includes('aborted due to timeout')
+    || m.includes('network route check failed')
+    || m.includes('missing exit ip')
+    || m.includes('status=0')
+    || m.includes('failed to do request')
     || m.includes('econnrefused')
     || m.includes('econnreset')
     || m.includes('etimedout')

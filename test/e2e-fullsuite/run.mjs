@@ -732,8 +732,8 @@ await test('batch', 'controlled batch retry, concurrency, pause, resume, stop an
         contentType: 'application/json',
         body: JSON.stringify({
           success: true,
-          model: 'credential-check',
-          content: 'Builder ID model liveness fallback: Kiro did not accept the fixed placeholder profileArn (API error 400: {"message":"profileArn is required for this request.","reason":null}). Credential and quota check passed for autoimport@example.invalid, usage 0/50.'
+          model: 'claude-sonnet-4.5',
+          content: 'pong'
         })
       })
       return
@@ -806,6 +806,7 @@ await test('batch', 'controlled batch retry, concurrency, pause, resume, stop an
     await setBatchField('Concurrency', 2)
     await clickBatchStart(page)
     await page.getByText(viBatch.progress(4, 4), { exact: true }).waitFor({ timeout: 25000 })
+    await waitForBatchStartButton(page, 20000)
     assert.equal(state.calls, 5)
     assert.equal(state.attempts.get(state.retryTaskId), 2)
     assert.equal(state.maxActive, 2)
@@ -822,14 +823,14 @@ await test('batch', 'controlled batch retry, concurrency, pause, resume, stop an
     await setBatchField('Retries', 0)
     await setBatchField('Concurrency', 1)
     await clickBatchStart(page)
-    await waitFor(() => state.calls >= 1)
+    await waitFor(() => state.calls >= 1, 20000)
     const callsAtPause = state.calls
     await page.getByRole('button', { name: viBatch.pause }).click()
     await page.waitForTimeout(1000)
     assert.ok(state.calls <= callsAtPause + 1, `Pause allowed too many tasks to launch: before=${callsAtPause}, after=${state.calls}`)
     assert.ok(state.calls < 5, `Pause did not stop the batch before all tasks launched: ${state.calls}`)
     await page.getByRole('button', { name: viBatch.resume }).click()
-    await waitFor(() => state.calls >= Math.min(2, callsAtPause + 1))
+    await waitFor(() => state.calls >= Math.min(2, callsAtPause + 1), 20000)
     await page.getByRole('button', { name: viBatch.stop }).click()
     await waitForBatchStartButton(page)
     assert.ok(state.calls < 5, `Stop launched all ${state.calls} tasks`)
@@ -975,6 +976,90 @@ await test('batch', 'terminal 403 stops batch without retrying or launching rema
   }
 })
 
+await test('batch', 'repeated SubmitEmail 403 trips the safety circuit even when continue-on-error is enabled', async () => {
+  const originalData = JSON.parse(JSON.stringify(await ipc('loadAccounts')))
+  const seededData = JSON.parse(JSON.stringify(originalData))
+  seededData.proxyPool = {}
+  seededData.proxyPoolConfig = { ...(seededData.proxyPoolConfig || {}), enabled: false }
+  seededData.proxyPoolCursor = 0
+  seededData.autoRefreshEnabled = false
+  seededData.autoRefreshSyncInfo = false
+  await ipc('saveAccounts', [seededData])
+  const browser = await chromium.launch({ headless: true })
+  const context = await browser.newContext({ viewport: { width: 1440, height: 1100 } })
+  await context.addInitScript(() => {
+    localStorage.setItem('kiro-register-config', JSON.stringify({
+      mode: 'tingamefi',
+      batchCount: 5,
+      batchInterval: 0,
+      batchAutoImport: false,
+      batchRetries: 2,
+      batchConcurrency: 1,
+      batchContinueOnError: true,
+      autoFetchProLink: false,
+      tingamefiMailApiUrl: 'https://mail.invalid',
+      tingamefiMailAdminPassword: 'controlled-test',
+      tingamefiMailDomain: 'example.invalid'
+    }))
+    localStorage.setItem('kiro-register-ratelimit-enabled', '0')
+    localStorage.setItem('kiro-register-dailyquota-limit', '0')
+  })
+  const page = await context.newPage()
+  const state = { calls: 0, cancelCalls: 0 }
+  await page.route('**/api/ipc', async (route) => {
+    const body = route.request().postDataJSON?.()
+    if (body?.method === 'networkRouteValidate') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, latencyMs: 10, externalIp: '198.51.100.30', route: 'direct-or-vpn' })
+      })
+      return
+    }
+    if (body?.method === 'registrationCancel') {
+      state.cancelCalls++
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{"success":true}' })
+      return
+    }
+    if (body?.method !== 'registrationStartAuto') {
+      await route.continue()
+      return
+    }
+    state.calls++
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        success: true,
+        result: {
+          status: 'failed',
+          email: `route-rejected-${state.calls}@example.invalid`,
+          error: '[SubmitEmail] SubmitEmail Kiro failed: status=403 body=<html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1></body></html>'
+        }
+      })
+    })
+  })
+
+  try {
+    await loginUi(page)
+    await page.locator('nav button').nth(7).click()
+    await page.getByText(viBatch.title, { exact: true }).waitFor()
+    await clickBatchStart(page)
+    await waitFor(() => state.calls >= 1)
+    await waitForBatchStartButton(page)
+    assert.equal(state.calls, 3)
+    assert.ok(state.cancelCalls >= 1)
+    assert.ok(await page.getByText(viBatch.failed(3), { exact: true }).isVisible())
+    assert.ok(await page.getByText(viBatch.progress(3, 5), { exact: true }).isVisible())
+    return { registrationStartAutoCalls: state.calls, cancelCalls: state.cancelCalls }
+  } finally {
+    await context.close()
+    await browser.close()
+    await ipc('saveAccounts', [originalData]).catch(() => undefined)
+    accountData = undefined
+  }
+})
+
 await test('batch', 'TES/BLOCKED SendOTP error stops batch without retrying or launching remaining items', async () => {
   const originalData = JSON.parse(JSON.stringify(await ipc('loadAccounts')))
   const seededData = JSON.parse(JSON.stringify(originalData))
@@ -1052,6 +1137,7 @@ await test('batch', 'TES/BLOCKED SendOTP error stops batch without retrying or l
     await setBatchField('Retries', 2)
     await setBatchField('Concurrency', 1)
     await clickBatchStart(page)
+    await waitFor(() => state.calls >= 1)
     await waitForBatchStartButton(page)
     assert.equal(state.calls, 1)
     assert.ok(state.cancelCalls >= 1)

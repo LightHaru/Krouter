@@ -46,6 +46,41 @@ function makePoolWithAccount(overrides: Partial<ProxyAccount> = {}): { pool: Acc
   return { pool, id }
 }
 
+describe('AccountPool round-robin distribution', () => {
+  it('uses every live account once per cycle', () => {
+    const pool = new AccountPool()
+    for (const id of ['account-a', 'account-b', 'account-c']) {
+      pool.addAccount({ id, email: `${id}@test`, accessToken: 'tok' })
+    }
+
+    expect(Array.from({ length: 7 }, () => pool.getNextAccount()?.id)).toEqual([
+      'account-a',
+      'account-b',
+      'account-c',
+      'account-a',
+      'account-b',
+      'account-c',
+      'account-a'
+    ])
+  })
+
+  it('skips unavailable accounts without breaking the live-account cycle', () => {
+    const pool = new AccountPool()
+    pool.addAccount({ id: 'account-a', email: 'a@test', accessToken: 'tok' })
+    pool.addAccount({ id: 'account-dead', email: 'dead@test', accessToken: 'tok', isAvailable: false })
+    pool.addAccount({ id: 'account-c', email: 'c@test', accessToken: 'tok' })
+
+    expect(Array.from({ length: 6 }, () => pool.getNextAccount()?.id)).toEqual([
+      'account-a',
+      'account-c',
+      'account-a',
+      'account-c',
+      'account-a',
+      'account-c'
+    ])
+  })
+})
+
 describe('AccountPool — 429 throttle cooldown bounds & backoff cap (Property 6)', () => {
   // Feature: smart-proxy-account-rotation, Property 6: For any errorCount >= 1, the cooldown after a Throttle_Error (status 429) equals min(throttleCooldownMs * 2^(min(errorCount-1, log2(maxBackoffMultiplier))), maxThrottleCooldownMs), always within [throttleCooldownMs, maxThrottleCooldownMs], and does NOT set quotaExhaustedAt.
   // Validates: Requirements 3.3, 3.6

@@ -7,6 +7,7 @@ import { WebStore, hashPassword, verifyPassword, type UserRecord } from './store
 import {
   type AccountLike,
   checkAccountStatus,
+  classifyKiroAccountError,
   refreshAccountToken,
   verifyAccountCredentials
 } from './services/kiroAccounts'
@@ -91,6 +92,10 @@ import {
 } from './services/protonBrowserRuntime'
 import { getDashboardTunnelRuntime } from './services/dashboardTunnel'
 import { mergePeerAccountData, pushAccountDataToRemote, summarizeAccounts } from './services/accountSync'
+import {
+  getProxyMaintenanceRuntime,
+  IPLOCATE_PROXY_SOURCE
+} from './services/proxyMaintenance'
 
 type JsonValue = unknown
 type SseClient = ServerResponse
@@ -381,7 +386,17 @@ function defaultAccountData(): Record<string, unknown> {
       testTimeoutMs: 8000,
       autoValidateIntervalMin: 0,
       autoValidateConcurrency: 5,
-      upstreamProxy: ''
+      upstreamProxy: '',
+      backendMaintenanceEnabled: true,
+      backendMaintenanceIntervalMin: 30,
+      sourceSyncEnabled: true,
+      sourceUrl: 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/all-proxies.txt',
+      sourceValidateConcurrency: 40,
+      sourceRemoveDead: true,
+      accountHealthCheckEnabled: true,
+      accountDeleteDead: true,
+      accountFailureThreshold: 2,
+      accountCheckConcurrency: 8
     },
     proxyPoolCursor: 0,
     accountProxyBindings: {}
@@ -407,11 +422,34 @@ function mergeAccountData(currentRaw: unknown, incomingRaw: unknown): Record<str
   ])
   const accounts = { ...currentAccounts, ...incomingAccounts }
   for (const id of deletedIds) delete accounts[id]
+  const currentProxyPool = current.proxyPool && typeof current.proxyPool === 'object'
+    ? current.proxyPool as Record<string, unknown>
+    : {}
+  const incomingHasProxyPool = Boolean(incoming.proxyPool && typeof incoming.proxyPool === 'object')
+  const incomingProxyPool = incomingHasProxyPool
+    ? incoming.proxyPool as Record<string, unknown>
+    : currentProxyPool
+  const deletedProxyIds = new Set<string>([
+    ...(Array.isArray(current._deletedProxyIds) ? current._deletedProxyIds.filter((id): id is string => typeof id === 'string') : []),
+    ...(Array.isArray(incoming._deletedProxyIds) ? incoming._deletedProxyIds.filter((id): id is string => typeof id === 'string') : [])
+  ])
+  const proxyPool = { ...incomingProxyPool }
+  for (const [id, value] of Object.entries(currentProxyPool)) {
+    const source = value && typeof value === 'object'
+      ? String((value as Record<string, unknown>).source || '')
+      : ''
+    if (source === IPLOCATE_PROXY_SOURCE && !(id in proxyPool) && !deletedProxyIds.has(id)) {
+      proxyPool[id] = value
+    }
+  }
+  for (const id of deletedProxyIds) delete proxyPool[id]
   return {
     ...current,
     ...incoming,
     accounts,
-    _deletedAccountIds: Array.from(deletedIds)
+    proxyPool,
+    _deletedAccountIds: Array.from(deletedIds),
+    _deletedProxyIds: Array.from(deletedProxyIds)
   }
 }
 
@@ -659,6 +697,8 @@ type StoredAccountData = Record<string, unknown> & {
   autoRefreshConcurrency?: number
   autoRefreshSyncInfo?: boolean
   autoSwitchEnabled?: boolean
+  accountProxyBindings?: Record<string, string>
+  proxyPool?: Record<string, { id?: string; url?: string; enabled?: boolean; status?: string }>
 }
 
 function errorMessageFromResult(result: any): string {
@@ -690,6 +730,70 @@ function isBannedAccountError(error?: string): boolean {
     lowerError.includes('已封禁') ||
     /\b423\b/.test(lowerError)
   )
+}
+
+function isDirectProxyUrl(value: unknown): value is string {
+  return typeof value === 'string' && /^(https?|socks4a?|socks5h?):\/\//i.test(value.trim())
+}
+
+function resolveStoredAccountProxyUrl(accountData: StoredAccountData, accountId: string): string | undefined {
+  const binding = accountData.accountProxyBindings?.[accountId]
+  if (!binding) return undefined
+  const proxyPool = accountData.proxyPool || {}
+  const poolEntry = proxyPool[binding] || Object.values(proxyPool).find((proxy) => proxy.id === binding || proxy.url === binding)
+  if (poolEntry?.url && poolEntry.enabled !== false && poolEntry.status !== 'dead') return poolEntry.url
+  return isDirectProxyUrl(binding) ? binding.trim() : undefined
+}
+
+function withStoredAccountProxy(accountData: StoredAccountData, accountId: string, account: StoredAccount): StoredAccount {
+  const proxyUrl = resolveStoredAccountProxyUrl(accountData, accountId)
+  return proxyUrl ? { ...account, proxyUrl } : account
+}
+
+function isProfileArnOnlyAccountError(error?: string): boolean {
+  if (!error) return false
+  const lowerError = error.toLowerCase()
+  return lowerError.includes('profilearn is required') ||
+    lowerError.includes('no profilearn') ||
+    lowerError.includes('without profilearn') ||
+    lowerError.includes('no usable streaming profilearn') ||
+    lowerError.includes('placeholder profilearn') ||
+    lowerError.includes('model liveness skipped') ||
+    lowerError.includes('credential and quota check passed')
+}
+
+function isTransientAccountError(error?: string): boolean {
+  if (!error) return false
+  const lowerError = error.toLowerCase()
+  return lowerError.includes('fetch failed') ||
+    lowerError.includes('network') ||
+    lowerError.includes('timeout') ||
+    lowerError.includes('timed out') ||
+    lowerError.includes('econnreset') ||
+    lowerError.includes('etimedout') ||
+    lowerError.includes('socket hang up') ||
+    lowerError.includes('too many requests') ||
+    lowerError.includes('rate limited') ||
+    /\b429\b/.test(lowerError)
+}
+
+function isHardAccountError(error?: string): boolean {
+  if (!error) return false
+  if (isBannedAccountError(error)) return true
+  if (isTransientAccountError(error) || isProfileArnOnlyAccountError(error)) return false
+  const info = classifyKiroAccountError(error)
+  if (info.isAuthError) return true
+  const lowerError = error.toLowerCase()
+  return /\b403\b/.test(lowerError) ||
+    lowerError.includes('bad credentials') ||
+    lowerError.includes('invalid bearer') ||
+    lowerError.includes('invalid token')
+}
+
+function shouldKeepStoredAccountLiveState(account: StoredAccount, error?: string): boolean {
+  if (account.status !== 'active') return false
+  if (isHardAccountError(error)) return false
+  return isTransientAccountError(error) || isProfileArnOnlyAccountError(error)
 }
 
 function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
@@ -816,8 +920,10 @@ function applyRefreshDataToStoredAccount(
   const errorMessage = typeof data?.errorMessage === 'string' && data.errorMessage ? data.errorMessage : undefined
   const currentBanned = isBannedAccountError(account.lastError)
   const incomingBanned = isBannedAccountError(errorMessage)
-  const status = currentBanned || incomingBanned || data?.status === 'error' ? 'error' : 'active'
-  const lastError = incomingBanned ? errorMessage : currentBanned ? account.lastError : errorMessage
+  const keepLive = data?.status === 'error' && shouldKeepStoredAccountLiveState(account, errorMessage)
+  const status = keepLive ? 'active' : currentBanned || incomingBanned || data?.status === 'error' ? 'error' : 'active'
+  const lastError = keepLive ? account.lastError : incomingBanned ? errorMessage : currentBanned ? account.lastError : errorMessage
+  const lastCheckedAt = keepLive ? account.lastCheckedAt : now
 
   return {
     ...account,
@@ -830,13 +936,22 @@ function applyRefreshDataToStoredAccount(
     subscription,
     status,
     lastError,
-    lastCheckedAt: now
+    lastCheckedAt
   }
 }
 
 function applyBackendRefreshFailure(id: string, account: StoredAccount, error: string, now: number): StoredAccount {
   const currentBanned = isBannedAccountError(account.lastError)
   const incomingBanned = isBannedAccountError(error)
+  if (shouldKeepStoredAccountLiveState(account, error)) {
+    return {
+      ...account,
+      id: account.id || id,
+      status: 'active',
+      lastError: account.lastError,
+      lastCheckedAt: account.lastCheckedAt
+    }
+  }
   return {
     ...account,
     id: account.id || id,
@@ -887,8 +1002,9 @@ async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): P
     for (let index = 0; index < pending.length; index += concurrency) {
       const batch = pending.slice(index, index + concurrency)
       await Promise.all(batch.map(async ({ id, account, needsTokenRefresh }) => {
+        const accountForApi = withStoredAccountProxy(accountData, id, account)
         const backgroundAccount: BackgroundAccount = {
-          ...account,
+          ...accountForApi,
           id,
           needsTokenRefresh
         }
@@ -981,6 +1097,22 @@ async function startBackendAutoRefreshRuntimes(): Promise<void> {
   }
   for (const user of store.getUsers()) {
     scheduleBackendAutoRefreshForUser(user, true)
+  }
+}
+
+function proxyMaintenanceRuntimeForUser(user: UserRecord) {
+  return getProxyMaintenanceRuntime(store, user.id, emit, async () => {
+    await getProxyRuntime(store, user.id, emit).syncAccountsFromStoreAsync()
+  })
+}
+
+function scheduleProxyMaintenanceForUser(user: UserRecord, runOnBoot: boolean): void {
+  proxyMaintenanceRuntimeForUser(user).configure(runOnBoot)
+}
+
+async function startProxyMaintenanceRuntimes(): Promise<void> {
+  for (const user of store.getUsers()) {
+    scheduleProxyMaintenanceForUser(user, true)
   }
 }
 
@@ -1079,6 +1211,7 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
         const hydrated = await hydrateAccountDataProfileArns(merged)
         await store.setAccountData(user.id, hydrated.data)
         scheduleBackendAutoRefreshForUser(user, false)
+        scheduleProxyMaintenanceForUser(user, false)
       }
       return null
     case 'mergePeerAccounts':
@@ -1087,6 +1220,7 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
         const hydrated = await hydrateAccountDataProfileArns(merged.data)
         await store.setAccountData(user.id, hydrated.data)
         scheduleBackendAutoRefreshForUser(user, false)
+        scheduleProxyMaintenanceForUser(user, false)
         const hydratedAccounts = hydrated.data.accounts && typeof hydrated.data.accounts === 'object'
           ? hydrated.data.accounts as Record<string, unknown>
           : {}
@@ -1293,6 +1427,10 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
       return proxyRuntime.resetApiKeyUsage(String(args[0] || ''))
     case 'proxyConfigureClients':
       return proxyRuntime.configureClients(args[0] as Parameters<typeof proxyRuntime.configureClients>[0])
+    case 'proxyMaintenanceGetStatus':
+      return proxyMaintenanceRuntimeForUser(user).getStatus()
+    case 'proxyMaintenanceRunNow':
+      return proxyMaintenanceRuntimeForUser(user).runNow('manual')
     case 'proxyPoolValidate':
       return proxyPoolValidate(args[0] as Parameters<typeof proxyPoolValidate>[0])
     case 'networkRouteValidate':
@@ -1379,8 +1517,17 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
     case 'accountSetProxyBinding': {
       const [accountId, proxyUrl] = args as [string, string | undefined]
       const accountData = (store.getAccountData(user.id) || defaultAccountData()) as Record<string, any>
-      accountData.accountProxyBindings = { ...(accountData.accountProxyBindings || {}), [accountId]: proxyUrl }
-      if (!proxyUrl) delete accountData.accountProxyBindings[accountId]
+      accountData.accountProxyBindings = { ...(accountData.accountProxyBindings || {}) }
+      if (!proxyUrl) {
+        delete accountData.accountProxyBindings[accountId]
+      } else {
+        const proxyPool = accountData.proxyPool || {}
+        const matchingProxyId = Object.entries(proxyPool).find(([, proxy]) => {
+          const entry = proxy as { id?: string; url?: string }
+          return entry.id === proxyUrl || entry.url === proxyUrl
+        })?.[0]
+        accountData.accountProxyBindings[accountId] = matchingProxyId || proxyUrl
+      }
       await store.setAccountData(user.id, accountData)
       return { success: true }
     }
@@ -1440,6 +1587,7 @@ async function handleAuth(request: IncomingMessage, response: ServerResponse, pa
       })
       const session = await store.createSession(user.id)
       scheduleBackendAutoRefreshForUser(user, false)
+      scheduleProxyMaintenanceForUser(user, false)
       response.setHeader('Set-Cookie', sessionCookie(session.id, session.expiresAt))
       sendJson(response, 200, {
         authenticated: true,
@@ -1844,6 +1992,7 @@ async function main(): Promise<void> {
   void startAutoProxyRuntimes()
   void startAutoKProxyRuntimes()
   void startBackendAutoRefreshRuntimes()
+  void startProxyMaintenanceRuntimes()
   const port = Number(process.env.PORT || 4010)
   const host = process.env.HOST || '127.0.0.1'
   const server = http.createServer((request, response) => {

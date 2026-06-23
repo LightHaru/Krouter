@@ -883,7 +883,7 @@ const phraseReplacements: Array<[RegExp, string]> = [
   [/Imported\s+(\d+)\s+link\(s\)/g, 'Đã nhập $1 link'],
   [/(\d+)d left/g, 'Còn $1 ngày'],
   [/(\d+)d/g, '$1 ngày'],
-  [/(\d+)m/g, '$1 phút'],
+  [/(\d+)m(?!s)\b/g, '$1 phút'],
   [/Base:/g, 'Cơ bản:'],
   [/Trial:/g, 'Dùng thử:'],
   [/Checked:/g, 'Đã kiểm tra:'],

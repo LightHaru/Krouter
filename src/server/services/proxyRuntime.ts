@@ -53,6 +53,10 @@ interface AccountDataShape {
   proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
 }
 
+function isDirectProxyUrl(value: unknown): value is string {
+  return typeof value === 'string' && /^(https?|socks4a?|socks5h?):\/\//i.test(value.trim())
+}
+
 function defaultProxyConfig(saved?: Partial<ProxyConfig>): ProxyConfig {
   return normalizeProxyConfig({
     enabled: false,
@@ -66,14 +70,14 @@ function defaultProxyConfig(saved?: Partial<ProxyConfig>): ProxyConfig {
     retryDelayMs: 5000,
     tokenRefreshBeforeExpiry: 300,
     clientDrivenToolExecution: true,
-    accountSelectionStrategy: 'smart',
+    accountSelectionStrategy: 'round-robin',
     sessionAffinityEnabled: false,
     ...saved
   })
 }
 
 function normalizeProxyConfig(config: ProxyConfig): ProxyConfig {
-  const strategy = config.accountSelectionStrategy || 'smart'
+  const strategy = config.accountSelectionStrategy || 'round-robin'
   const normalized: ProxyConfig = {
     ...config,
     accountSelectionStrategy: strategy
@@ -275,7 +279,8 @@ export class ProxyRuntime {
           clientSecret: account.clientSecret,
           region: account.region || 'us-east-1',
           authMethod: account.authMethod,
-          machineId: account.machineId
+          machineId: account.machineId,
+          proxyUrl: account.proxyUrl
         })
         return {
           success: result.success,
@@ -363,8 +368,11 @@ export class ProxyRuntime {
         skippedNoProfileArn++
         continue
       }
-      const proxyId = bindings[account.id]
-      const boundProxy = proxyId ? proxyPool[proxyId] : undefined
+      const proxyBinding = bindings[account.id]
+      const boundProxy = proxyBinding
+        ? (proxyPool[proxyBinding] || Object.values(proxyPool).find((proxy) => proxy.url === proxyBinding))
+        : undefined
+      const directProxyUrl = isDirectProxyUrl(proxyBinding) ? proxyBinding.trim() : undefined
       proxyAccounts.push(normalizeProxyAccount({
           id: account.id,
           email: account.email,
@@ -383,7 +391,7 @@ export class ProxyRuntime {
         quotaUsed: typeof account.usage?.current === 'number' ? account.usage.current : undefined,
         quotaLimit: typeof account.usage?.limit === 'number' ? account.usage.limit : undefined,
         quotaResetAt: parseQuotaResetAt(account.usage?.nextResetDate),
-        proxyUrl: boundProxy?.enabled && boundProxy.status !== 'dead' ? boundProxy.url : undefined
+        proxyUrl: boundProxy?.enabled && boundProxy.status !== 'dead' ? boundProxy.url : directProxyUrl
       }))
     }
     pool.replaceAccounts(proxyAccounts)

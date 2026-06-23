@@ -45,6 +45,10 @@ export function setPayloadSizeLimitKB(limitKB: number): void {
   payloadSizeLimitKB = Math.max(256, Math.min(10240, limitKB))
 }
 
+const DEFAULT_KIRO_CONTENT_CHAR_LIMIT = 180000
+const MIN_KIRO_CONTENT_CHAR_LIMIT = 16000
+const MAX_KIRO_CONTENT_CHAR_LIMIT = 1000000
+
 // Token buffer reserve 开关（默认 false = 完全跳过 trimHistoryByTokens）
 // 关闭时后端不再裁剪任何旧消息，超出 context window 由 Kiro 后端原样返回错误
 let enableTokenBufferReserve = false
@@ -85,6 +89,132 @@ function estimatePayloadTokens(payload: KiroPayload): number {
   return estimateTokensFromString(JSON.stringify(payload))
 }
 
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value))
+}
+
+function getPayloadSizeLimitBytes(): number {
+  return (payloadSizeLimitKB || 1536) * 1024
+}
+
+function getKiroContentCharLimit(mode: 'normal' | 'retry' = 'normal'): number {
+  const configured = Number(process.env.KROUTER_KIRO_CONTENT_CHAR_LIMIT || process.env.KIRO_CONTENT_CHAR_LIMIT)
+  const base = Number.isFinite(configured) && configured > 0
+    ? clampNumber(Math.floor(configured), MIN_KIRO_CONTENT_CHAR_LIMIT, MAX_KIRO_CONTENT_CHAR_LIMIT)
+    : DEFAULT_KIRO_CONTENT_CHAR_LIMIT
+  if (mode === 'retry') {
+    return clampNumber(Math.min(80000, Math.floor(base * 0.45)), MIN_KIRO_CONTENT_CHAR_LIMIT, base)
+  }
+  return base
+}
+
+function truncateMiddle(text: string, maxChars: number, reason: string): string {
+  if (text.length <= maxChars) return text
+  const marker = `\n\n[Krouter trimmed ${text.length - maxChars} chars from the middle to fit Kiro ${reason}. The beginning and latest context were preserved.]\n\n`
+  const available = maxChars - marker.length
+  if (available <= 200) return text.slice(0, maxChars)
+  const headLength = Math.max(1000, Math.floor(available * 0.35))
+  const tailLength = Math.max(0, available - headLength)
+  return `${text.slice(0, headLength)}${marker}${tailLength > 0 ? text.slice(-tailLength) : ''}`
+}
+
+function compactToolResults(toolResults: KiroToolResult[] | undefined, maxChars: number): number {
+  let changed = 0
+  for (const toolResult of toolResults ?? []) {
+    for (const item of toolResult.content ?? []) {
+      if (typeof item.text === 'string' && item.text.length > maxChars) {
+        item.text = truncateMiddle(item.text, maxChars, 'tool result limit')
+        changed++
+      }
+    }
+  }
+  return changed
+}
+
+function compactMessageText(message: KiroHistoryMessage, maxChars: number): number {
+  let changed = 0
+  const userContent = message.userInputMessage?.content
+  if (typeof userContent === 'string' && userContent.length > maxChars) {
+    message.userInputMessage!.content = truncateMiddle(userContent, maxChars, 'message content limit')
+    changed++
+  }
+  const assistantContent = message.assistantResponseMessage?.content
+  if (typeof assistantContent === 'string' && assistantContent.length > maxChars) {
+    message.assistantResponseMessage!.content = truncateMiddle(assistantContent, maxChars, 'message content limit')
+    changed++
+  }
+  return changed
+}
+
+function compactPayloadForKiroLimits(
+  payload: KiroPayload,
+  options: { mode?: 'normal' | 'retry'; payloadSizeLimitBytes?: number } = {}
+): { changed: boolean; finalSize: number; textTrimmed: number; toolResultsTrimmed: number; historyDropped: number } {
+  const mode = options.mode ?? 'normal'
+  const payloadLimit = options.payloadSizeLimitBytes ?? getPayloadSizeLimitBytes()
+  const currentLimit = getKiroContentCharLimit(mode)
+  const historyLimit = mode === 'retry'
+    ? Math.min(24000, Math.floor(currentLimit * 0.35))
+    : Math.min(60000, Math.floor(currentLimit * 0.5))
+  const toolResultLimit = mode === 'retry' ? 2000 : 4000
+  let textTrimmed = 0
+  let toolResultsTrimmed = 0
+  let historyDropped = 0
+
+  const currentMessage = payload.conversationState.currentMessage
+  textTrimmed += compactMessageText(currentMessage, currentLimit)
+  toolResultsTrimmed += compactToolResults(
+    currentMessage.userInputMessage.userInputMessageContext?.toolResults,
+    toolResultLimit
+  )
+
+  for (const message of payload.conversationState.history ?? []) {
+    textTrimmed += compactMessageText(message, historyLimit)
+    toolResultsTrimmed += compactToolResults(
+      message.userInputMessage?.userInputMessageContext?.toolResults,
+      toolResultLimit
+    )
+  }
+
+  let finalSize = JSON.stringify(payload).length
+  let history = payload.conversationState.history
+  while (finalSize > payloadLimit && history && history.length > 0) {
+    const dropCount = Math.min(history.length, 2)
+    history = history.slice(dropCount)
+    historyDropped += dropCount
+    history = ensureStartsWithUserMessage(history)
+    payload.conversationState.history = history.length > 0 ? history : undefined
+    finalSize = JSON.stringify(payload).length
+  }
+
+  let currentContent = payload.conversationState.currentMessage.userInputMessage.content
+  while (finalSize > payloadLimit && currentContent.length > MIN_KIRO_CONTENT_CHAR_LIMIT) {
+    const nextLimit = Math.max(MIN_KIRO_CONTENT_CHAR_LIMIT, Math.floor(currentContent.length * 0.65))
+    if (nextLimit >= currentContent.length) break
+    payload.conversationState.currentMessage.userInputMessage.content = truncateMiddle(currentContent, nextLimit, 'payload size limit')
+    textTrimmed++
+    currentContent = payload.conversationState.currentMessage.userInputMessage.content
+    finalSize = JSON.stringify(payload).length
+  }
+
+  return {
+    changed: textTrimmed > 0 || toolResultsTrimmed > 0 || historyDropped > 0,
+    finalSize,
+    textTrimmed,
+    toolResultsTrimmed,
+    historyDropped
+  }
+}
+
+function isContentLengthThresholdError(status: number, body: string): boolean {
+  const lower = body.toLowerCase()
+  return status === 400 && (
+    body.includes('CONTENT_LENGTH_EXCEEDS_THRESHOLD') ||
+    lower.includes('input content length exceeds threshold') ||
+    lower.includes('content length exceeds')
+  )
+}
+
 /**
  * 获取网络代理 agent
  * 优先级（从高到低）：
@@ -103,6 +233,7 @@ function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
       proxyLogger.debug('KiroAPI', `Using account-bound proxy for ${account.email || account.id}`)
       return agent
     }
+    throw new Error(`Account-bound proxy is configured but could not be used for ${account.email || account.id}`)
   }
   // 2. K-Proxy
   if (useKProxyForApi) {
@@ -1064,38 +1195,18 @@ export function buildKiroPayload(
   // ====== 第二阶段：按 byte 截断 tool result 内容 ======
   // 避免 HTTP body 过大被 Kiro 网关拒绝
   // 用户可在高级设置中调整限制值（默认 1536KB = 1.5MB）
-  const PAYLOAD_SIZE_LIMIT = (payloadSizeLimitKB || 1536) * 1024
-  const TOOL_RESULT_TRUNCATE_LENGTH = 4000
-  let initialPayloadSize = JSON.stringify(payload).length
-  if (initialPayloadSize > PAYLOAD_SIZE_LIMIT && payload.conversationState.history) {
-    const historyMessages = payload.conversationState.history
-    let truncatedCount = 0
-    for (const message of historyMessages) {
-      if (initialPayloadSize <= PAYLOAD_SIZE_LIMIT) break
-      const userToolResults = message.userInputMessage?.userInputMessageContext?.toolResults
-      if (!userToolResults) continue
-      for (const toolResult of userToolResults) {
-        if (initialPayloadSize <= PAYLOAD_SIZE_LIMIT) break
-        if (!toolResult.content) continue
-        for (const contentItem of toolResult.content) {
-          if (initialPayloadSize <= PAYLOAD_SIZE_LIMIT) break
-          if (contentItem.text && contentItem.text.length > TOOL_RESULT_TRUNCATE_LENGTH) {
-            const originalLen = contentItem.text.length
-            contentItem.text = `${contentItem.text.slice(0, TOOL_RESULT_TRUNCATE_LENGTH)}\n\n[Truncated by proxy: original ${originalLen} chars]`
-            truncatedCount++
-            initialPayloadSize = JSON.stringify(payload).length
-          }
-        }
-      }
-    }
-    if (truncatedCount > 0) {
-      console.log(`[KiroPayload] Truncated ${truncatedCount} large tool results to fit payload size limit (final size: ${initialPayloadSize} bytes)`)
-    }
+  const payloadCompactResult = compactPayloadForKiroLimits(payload, {
+    mode: 'normal',
+    payloadSizeLimitBytes: getPayloadSizeLimitBytes()
+  })
+  let initialPayloadSize = payloadCompactResult.finalSize
+  if (payloadCompactResult.changed) {
+    console.log(`[KiroPayload] Compacted oversized request for Kiro limits (text=${payloadCompactResult.textTrimmed}, toolResults=${payloadCompactResult.toolResultsTrimmed}, droppedHistory=${payloadCompactResult.historyDropped}, finalSize=${initialPayloadSize} bytes)`)
   }
 
   // 调试日志
   console.log(`[KiroPayload] Built payload (native history mode):`, {
-    contentLength: finalContent.length,
+    contentLength: payload.conversationState.currentMessage.userInputMessage.content.length,
     originalHistoryLength: history.length,
     sanitizedHistoryLength: sanitizedHistory.length,
     toolsCount: tools.length,
@@ -1265,6 +1376,15 @@ function parseRetryAfterMs(headers: Headers): number | undefined {
 }
 
 // 调用 Kiro API（流式）
+function shouldRetryWithoutPlaceholderProfileArn(status: number, body: string, profileArn: unknown): boolean {
+  if (!isPlaceholderProfileArn(typeof profileArn === 'string' ? profileArn : undefined)) return false
+  const lower = body.toLowerCase()
+  return status === 403
+    || lower.includes('profilearn')
+    || lower.includes('profile arn')
+    || lower.includes('placeholder')
+}
+
 export async function callKiroApiStream(
   account: ProxyAccount,
   payload: KiroPayload,
@@ -1326,20 +1446,45 @@ export async function callKiroApiStream(
         ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
         : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
 
+      const retryWithCompactedPayload = async (status: number, body: string): Promise<Response> => {
+        const compactResult = compactPayloadForKiroLimits(requestPayload, {
+          mode: 'retry',
+          payloadSizeLimitBytes: Math.min(getPayloadSizeLimitBytes(), 768 * 1024)
+        })
+        if (!compactResult.changed) {
+          throw new Error(`API error ${status}: ${body}`)
+        }
+        payloadStr = JSON.stringify(requestPayload)
+        console.log(`[KiroAPI] Endpoint ${endpoint.name} rejected oversized content, retrying with compacted payload (text=${compactResult.textTrimmed}, toolResults=${compactResult.toolResultsTrimmed}, droppedHistory=${compactResult.historyDropped}, finalSize=${payloadStr.length} bytes)...`)
+        throwIfAborted(signal)
+        return await sendRequest()
+      }
+
       let response = await sendRequest()
-      if (response.status === 403 && isPlaceholderProfileArn(requestPayload.profileArn)) {
+      if (!response.ok && isPlaceholderProfileArn(requestPayload.profileArn)) {
         const originalStatus = response.status
         const originalBody = await response.text().catch(() => '')
-        throwIfAborted(signal)
-        console.log(`[KiroAPI] Endpoint ${endpoint.name} rejected Builder ID placeholder profileArn, retrying without it...`)
-        delete requestPayload.profileArn
-        payloadStr = JSON.stringify(requestPayload)
-        response = await sendRequest()
-        if (!response.ok) {
-          // Current Kiro endpoints require profileArn. Preserve the original
-          // authorization failure instead of masking it as "profileArn is required".
-          await response.text().catch(() => '')
-          throw new Error(`Auth error ${originalStatus}: ${originalBody}`)
+        if (isContentLengthThresholdError(originalStatus, originalBody)) {
+          response = await retryWithCompactedPayload(originalStatus, originalBody)
+        } else {
+          if (!shouldRetryWithoutPlaceholderProfileArn(originalStatus, originalBody, requestPayload.profileArn)) {
+            throwIfAborted(signal)
+            if (originalStatus === 401 || originalStatus === 403) {
+              throw new Error(`Auth error ${originalStatus}: ${originalBody}`)
+            }
+            throw new Error(`API error ${originalStatus}: ${originalBody}`)
+          }
+          throwIfAborted(signal)
+          console.log(`[KiroAPI] Endpoint ${endpoint.name} rejected Builder ID placeholder profileArn, retrying without it...`)
+          delete requestPayload.profileArn
+          payloadStr = JSON.stringify(requestPayload)
+          response = await sendRequest()
+          if (!response.ok) {
+            // Current Kiro endpoints require profileArn. Preserve the original
+            // authorization failure instead of masking it as "profileArn is required".
+            await response.text().catch(() => '')
+            throw new Error(`Auth error ${originalStatus}: ${originalBody}`)
+          }
         }
       }
 
@@ -1368,6 +1513,16 @@ export async function callKiroApiStream(
         throwIfAborted(signal)
         const body = await response.text()
         throwIfAborted(signal)
+        if (isContentLengthThresholdError(response.status, body)) {
+          response = await retryWithCompactedPayload(response.status, body)
+          if (response.ok) {
+            const inputChars = payloadStr.length
+            await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr)
+            return
+          }
+          const retryBody = await response.text().catch(() => body)
+          throw new Error(`API error ${response.status}: ${retryBody}`)
+        }
         throw new Error(`API error ${response.status}: ${body}`)
       }
 

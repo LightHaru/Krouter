@@ -1,3 +1,6 @@
+import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
+import { safeCreateProxyAgent } from '../../main/proxy/systemProxy'
+
 const KIRO_AUTH_ENDPOINT = 'https://prod.us-east-1.auth.desktop.kiro.dev'
 const KIRO_VERSION = '0.6.18'
 export const BUILDER_ID_STREAMING_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
@@ -14,6 +17,7 @@ export interface AccountLike {
   idp?: string
   profileArn?: string
   machineId?: string
+  proxyUrl?: string
   credentials?: {
     accessToken?: string
     refreshToken?: string
@@ -39,6 +43,7 @@ export interface CredentialInput {
   profileArn?: string
   machineId?: string
   startUrl?: string
+  proxyUrl?: string
 }
 
 interface RefreshResult {
@@ -265,8 +270,19 @@ function subscriptionTypeFromTitle(title: string): string {
   return 'Free'
 }
 
-async function refreshOidcToken(input: Required<Pick<CredentialInput, 'refreshToken' | 'clientId' | 'clientSecret'>> & { region: string }): Promise<RefreshResult> {
-  const response = await fetch(`https://oidc.${input.region}.amazonaws.com/token`, {
+async function fetchWithOptionalProxy(url: string, init: RequestInit, proxyUrl?: string): Promise<Response> {
+  const agent = safeCreateProxyAgent(proxyUrl)
+  if (agent) {
+    return await undiciFetch(url, { ...init, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+  }
+  if (proxyUrl) {
+    throw new Error('Account-bound proxy is configured but could not be used for credential request')
+  }
+  return fetch(url, init)
+}
+
+async function refreshOidcToken(input: Required<Pick<CredentialInput, 'refreshToken' | 'clientId' | 'clientSecret'>> & { region: string; proxyUrl?: string }): Promise<RefreshResult> {
+  const response = await fetchWithOptionalProxy(`https://oidc.${input.region}.amazonaws.com/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -275,7 +291,7 @@ async function refreshOidcToken(input: Required<Pick<CredentialInput, 'refreshTo
       refreshToken: input.refreshToken,
       grantType: 'refresh_token'
     })
-  })
+  }, input.proxyUrl)
   if (!response.ok) return { success: false, error: `HTTP ${response.status}: ${await response.text()}` }
   const data = await response.json() as { accessToken?: string; refreshToken?: string; expiresIn?: number }
   return {
@@ -286,15 +302,15 @@ async function refreshOidcToken(input: Required<Pick<CredentialInput, 'refreshTo
   }
 }
 
-async function refreshSocialToken(refreshToken: string, machineId?: string): Promise<RefreshResult> {
-  const response = await fetch(`${KIRO_AUTH_ENDPOINT}/refreshToken`, {
+async function refreshSocialToken(refreshToken: string, machineId?: string, proxyUrl?: string): Promise<RefreshResult> {
+  const response = await fetchWithOptionalProxy(`${KIRO_AUTH_ENDPOINT}/refreshToken`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'User-Agent': getKiroUserAgent(machineId)
     },
     body: JSON.stringify({ refreshToken })
-  })
+  }, proxyUrl)
   if (!response.ok) return { success: false, error: `HTTP ${response.status}: ${await response.text()}` }
   const data = await response.json() as { accessToken?: string; refreshToken?: string; expiresIn?: number }
   return {
@@ -318,13 +334,14 @@ export async function refreshTokenByMethod(input: CredentialInput & { machineId?
     }
   }
   if (!input.refreshToken) return { success: false, error: 'Missing refresh token' }
-  if (input.authMethod === 'social') return refreshSocialToken(input.refreshToken, input.machineId)
+  if (input.authMethod === 'social') return refreshSocialToken(input.refreshToken, input.machineId, input.proxyUrl)
   if (!input.clientId || !input.clientSecret) return { success: false, error: 'Missing OIDC clientId/clientSecret' }
   return refreshOidcToken({
     refreshToken: input.refreshToken,
     clientId: input.clientId,
     clientSecret: input.clientSecret,
-    region
+    region,
+    proxyUrl: input.proxyUrl
   })
 }
 
@@ -336,6 +353,7 @@ async function getUsageLimitsRest(input: {
   region?: string
   authMethod?: string
   provider?: string
+  proxyUrl?: string
 }): Promise<UsageLimitsResponse> {
   const params = new URLSearchParams({
     origin: 'AI_EDITOR',
@@ -347,9 +365,9 @@ async function getUsageLimitsRest(input: {
   const path = `/getUsageLimits?${params.toString()}`
   const headers = buildKiroRestHeaders(input)
 
-  let response = await fetch(`${getRestApiBase(input.region)}${path}`, { method: 'GET', headers })
+  let response = await fetchWithOptionalProxy(`${getRestApiBase(input.region)}${path}`, { method: 'GET', headers }, input.proxyUrl)
   if (response.status === 403) {
-    response = await fetch(`${getFallbackRestApiBase(input.region)}${path}`, { method: 'GET', headers })
+    response = await fetchWithOptionalProxy(`${getFallbackRestApiBase(input.region)}${path}`, { method: 'GET', headers }, input.proxyUrl)
   }
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`)
   return response.json() as Promise<UsageLimitsResponse>
@@ -371,11 +389,12 @@ async function postListAvailableProfiles(input: {
   provider?: string
   nextToken?: string
   timeoutMs?: number
+  proxyUrl?: string
 }): Promise<ListAvailableProfilesResponse> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), input.timeoutMs || 10000)
   try {
-    const response = await fetch(`${input.endpoint}/ListAvailableProfiles`, {
+    const response = await fetchWithOptionalProxy(`${input.endpoint}/ListAvailableProfiles`, {
       method: 'POST',
       signal: controller.signal,
       headers: {
@@ -383,7 +402,7 @@ async function postListAvailableProfiles(input: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(input.nextToken ? { maxResults: 10, nextToken: input.nextToken } : { maxResults: 10 })
-    })
+    }, input.proxyUrl)
     const text = await response.text()
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${text}`)
     return text ? JSON.parse(text) as ListAvailableProfilesResponse : {}
@@ -400,6 +419,7 @@ export async function listAvailableProfilesRest(input: {
   authMethod?: string
   provider?: string
   timeoutMs?: number
+  proxyUrl?: string
 }): Promise<KiroAvailableProfile[]> {
   let lastError: Error | undefined
 
@@ -417,7 +437,8 @@ export async function listAvailableProfilesRest(input: {
           authMethod: input.authMethod,
           provider: input.provider,
           nextToken,
-          timeoutMs: input.timeoutMs
+          timeoutMs: input.timeoutMs,
+          proxyUrl: input.proxyUrl
         })
         profiles.push(...(Array.isArray(data.profiles) ? data.profiles : []))
         nextToken = data.nextToken
@@ -466,6 +487,7 @@ export async function resolveStreamingProfileArn(input: {
   region?: string
   authMethod?: string
   provider?: string
+  proxyUrl?: string
 }): Promise<string | undefined> {
   const explicit = normalizeProfileArn(input.profileArn)
   if (explicit) return explicit
@@ -483,7 +505,8 @@ export async function resolveStreamingProfileArn(input: {
     machineId: input.machineId,
     region: input.region || 'us-east-1',
     authMethod: input.authMethod,
-    provider: input.provider
+    provider: input.provider,
+    proxyUrl: input.proxyUrl
   })
   return chooseStreamingProfileArn(profiles)
 }
@@ -571,7 +594,8 @@ export async function refreshAccountToken(account: AccountLike): Promise<{
     clientSecret: credentials.clientSecret,
     region: credentials.region,
     authMethod: credentials.authMethod,
-    machineId: account.machineId
+    machineId: account.machineId,
+    proxyUrl: account.proxyUrl
   })
   if (!result.success || !result.accessToken) {
     return { success: false, error: classifyKiroAccountError(result.error || 'Token refresh failed') }
@@ -601,7 +625,8 @@ export async function verifyAccountCredentials(credentials: CredentialInput): Pr
       machineId: credentials.machineId,
       region: credentials.region || 'us-east-1',
       authMethod: credentials.authMethod,
-      provider: credentials.provider
+      provider: credentials.provider,
+      proxyUrl: credentials.proxyUrl
     })
   } catch (error) {
     return { success: false, error: classifyKiroAccountError(error).message }
@@ -612,7 +637,8 @@ export async function verifyAccountCredentials(credentials: CredentialInput): Pr
     machineId: credentials.machineId,
     region: credentials.region || 'us-east-1',
     authMethod: credentials.authMethod,
-    provider: credentials.provider
+    provider: credentials.provider,
+    proxyUrl: credentials.proxyUrl
   }).catch(() => undefined)
   return {
     success: true,
@@ -666,7 +692,8 @@ export async function checkAccountStatus(account: AccountLike): Promise<unknown>
       machineId: account.machineId,
       region: credentials.region || 'us-east-1',
       authMethod: credentials.authMethod,
-      provider: credentials.provider || account.idp
+      provider: credentials.provider || account.idp,
+      proxyUrl: account.proxyUrl
     })
   } catch (error) {
     return { success: false, error: classifyKiroAccountError(error) }
@@ -679,7 +706,8 @@ export async function checkAccountStatus(account: AccountLike): Promise<unknown>
     machineId: account.machineId,
     region: credentials.region || 'us-east-1',
     authMethod: credentials.authMethod,
-    provider: credentials.provider || account.idp
+    provider: credentials.provider || account.idp,
+    proxyUrl: account.proxyUrl
   }).catch(() => normalizeProfileArn(account.profileArn))
   return {
     success: true,

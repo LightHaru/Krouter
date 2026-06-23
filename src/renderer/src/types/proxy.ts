@@ -99,6 +99,19 @@ export interface ProxyPoolConfig {
   autoValidateConcurrency: number
   /** 上游中转代理（可选）：配合"目标代理要求非大陆来源 IP"的场景串联代理链；支持 http/socks5 */
   upstreamProxy?: string
+  /** Backend-owned maintenance loop. It continues while the dashboard is closed. */
+  backendMaintenanceEnabled: boolean
+  backendMaintenanceIntervalMin: number
+  /** Sync verified proxies from IPLocate's main branch. */
+  sourceSyncEnabled: boolean
+  sourceUrl: string
+  sourceValidateConcurrency: number
+  sourceRemoveDead: boolean
+  /** Check saved accounts during the same backend maintenance cycle. */
+  accountHealthCheckEnabled: boolean
+  accountDeleteDead: boolean
+  accountFailureThreshold: number
+  accountCheckConcurrency: number
 }
 
 export const DEFAULT_PROXY_POOL_CONFIG: ProxyPoolConfig = {
@@ -111,5 +124,15 @@ export const DEFAULT_PROXY_POOL_CONFIG: ProxyPoolConfig = {
   testTimeoutMs: 8000,
   autoValidateIntervalMin: 0,
   autoValidateConcurrency: 5,
-  upstreamProxy: ''
+  upstreamProxy: '',
+  backendMaintenanceEnabled: true,
+  backendMaintenanceIntervalMin: 30,
+  sourceSyncEnabled: true,
+  sourceUrl: 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/all-proxies.txt',
+  sourceValidateConcurrency: 40,
+  sourceRemoveDead: true,
+  accountHealthCheckEnabled: true,
+  accountDeleteDead: true,
+  accountFailureThreshold: 2,
+  accountCheckConcurrency: 8
 }

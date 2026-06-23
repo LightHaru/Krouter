@@ -60,7 +60,7 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
   const [regenerating, setRegenerating] = useState(false)
   const isRoundRobinBalancing = Boolean(
     config.enableMultiAccount &&
-    (config.accountSelectionStrategy || 'smart') !== 'sticky'
+    (config.accountSelectionStrategy || 'round-robin') !== 'sticky'
   )
   // 输入框本地状态（确保编辑时不被 config 同步打断）
   const [allowedIPsText, setAllowedIPsText] = useState((config.allowedIPs || []).join('\n'))

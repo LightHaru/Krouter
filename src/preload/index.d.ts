@@ -95,6 +95,7 @@ interface StatusResult {
   success: boolean
   data?: {
     status: string
+    errorMessage?: string
     email?: string
     userId?: string
     idp?: string // 身份提供商：BuilderId, Google, Github 等
@@ -186,6 +187,7 @@ interface KiroApi {
     email: string
     idp?: string
     needsTokenRefresh?: boolean
+    proxyUrl?: string
     machineId?: string  // 账户绑定的设备 ID
     credentials: {
       refreshToken: string
@@ -214,6 +216,7 @@ interface KiroApi {
       provider?: string
     }
     idp?: string
+    proxyUrl?: string
   }>, concurrency?: number) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
   onBackgroundCheckProgress: (callback: (data: { completed: number; total: number; success: number; failed: number }) => void) => () => void
   onBackgroundCheckResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void) => () => void
@@ -300,6 +303,7 @@ interface KiroApi {
     profileArn?: string
     machineId?: string
     startUrl?: string
+    proxyUrl?: string
   }) => Promise<{
     success: boolean
     data?: {
@@ -975,6 +979,47 @@ interface KiroApi {
   protonLoginStatus: (proxy?: string) => Promise<{ loggedIn: boolean }>
 
   protonClose: () => Promise<{ success: boolean }>
+
+  // 代理池后台维护
+  proxyMaintenanceGetStatus?: () => Promise<{
+    enabled: boolean
+    running: boolean
+    intervalMin: number
+    sourceUrl: string
+    lastReason?: string
+    lastStartedAt?: number
+    lastCompletedAt?: number
+    nextRunAt?: number
+    sourceCandidates: number
+    proxiesChecked: number
+    proxiesAlive: number
+    proxiesAdded: number
+    proxiesRemoved: number
+    accountsChecked: number
+    accountsRemoved: number
+    lastError?: string
+    recentErrors: string[]
+  }>
+
+  proxyMaintenanceRunNow?: () => Promise<{
+    enabled: boolean
+    running: boolean
+    intervalMin: number
+    sourceUrl: string
+    lastReason?: string
+    lastStartedAt?: number
+    lastCompletedAt?: number
+    nextRunAt?: number
+    sourceCandidates: number
+    proxiesChecked: number
+    proxiesAlive: number
+    proxiesAdded: number
+    proxiesRemoved: number
+    accountsChecked: number
+    accountsRemoved: number
+    lastError?: string
+    recentErrors: string[]
+  }>
 
   // 代理池验活
   proxyPoolValidate: (params: {

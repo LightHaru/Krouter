@@ -62,6 +62,11 @@ function normalizeThinkingBudget(value: unknown): number | undefined {
   return Math.floor(numeric)
 }
 
+function kiroThinkingFieldsEnabled(): boolean {
+  return process.env.KROUTER_ENABLE_KIRO_THINKING_FIELDS === '1'
+    || process.env.KIRO_ENABLE_THINKING_FIELDS === '1'
+}
+
 function buildKiroThinkingFields(
   modelId: string,
   thinking?: ClientThinkingConfig,
@@ -74,7 +79,7 @@ function buildKiroThinkingFields(
   const budgetTokens = normalizeThinkingBudget((thinking as { budget_tokens?: unknown } | undefined)?.budget_tokens)
     ?? normalizeThinkingBudget(taskBudget?.total)
   const hasThinkingRequest = !!thinking || !!normalizedEffort || !!budgetTokens
-  if (!hasThinkingRequest || !modelSupportsThinkingParam(modelId) || !kiroProxyModelSupportsThinking(modelId)) return undefined
+  if (!hasThinkingRequest || !kiroThinkingFieldsEnabled() || !modelSupportsThinkingParam(modelId)) return undefined
 
   const fields: Record<string, unknown> = { thinking: { type: 'adaptive' } }
   const outputConfig: Record<string, unknown> = {}

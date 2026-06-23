@@ -86,7 +86,7 @@ export class AccountPool {
   private config: AccountPoolConfig
   // 默认 round-robin: 选中账号时立即前进，避免并发请求集中到同一账号
   // sticky: 一个账号成功就粘住 (保留 prompt cache 命中)
-  private strategy: AccountSelectionStrategy = 'smart'
+  private strategy: AccountSelectionStrategy = 'round-robin'
 
   constructor(config: Partial<AccountPoolConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config }
