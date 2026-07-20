@@ -94,6 +94,8 @@ export interface ProxyPoolConfig {
   testUrl: string               // 验活测试 URL（默认 https://api.ipify.org）
   testTimeoutMs: number         // 单次验活超时
   /** 定时自动验活：分钟为单位，0 表示关闭 */
+  /** Only validated proxies at or below this latency may enter the usable pool. */
+  maxUsableLatencyMs: number
   autoValidateIntervalMin: number
   /** 定时验活的并发数 */
   autoValidateConcurrency: number
@@ -122,6 +124,7 @@ export const DEFAULT_PROXY_POOL_CONFIG: ProxyPoolConfig = {
   failureThreshold: 3,
   testUrl: 'https://api.ipify.org?format=json',
   testTimeoutMs: 8000,
+  maxUsableLatencyMs: 1000,
   autoValidateIntervalMin: 0,
   autoValidateConcurrency: 5,
   upstreamProxy: '',

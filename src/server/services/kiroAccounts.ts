@@ -230,6 +230,17 @@ interface UsageLimitsResponse {
   }
 }
 
+/**
+ * Region embedded in a codewhisperer profileArn (e.g. arn:aws:codewhisperer:us-east-1:...).
+ * The service endpoint MUST match the profile's region or Kiro returns
+ * 400 "Improperly formed request". The IdC/SSO region (credentials.region) can
+ * differ from the profile region, so the profileArn region takes precedence.
+ */
+function regionFromProfileArn(profileArn?: string): string | undefined {
+  const match = profileArn?.match(/^arn:aws:codewhisperer:([a-z0-9-]+):/i)
+  return match?.[1]?.toLowerCase() || undefined
+}
+
 function getRestApiBase(ssoRegion?: string): string {
   if (!ssoRegion) return KIRO_REST_API_ENDPOINTS['us-east-1']
   if (KIRO_REST_API_ENDPOINTS[ssoRegion]) return KIRO_REST_API_ENDPOINTS[ssoRegion]
@@ -263,10 +274,11 @@ function normalizeDate(value: number | string | undefined): string | undefined {
 function subscriptionTypeFromTitle(title: string): string {
   const upper = title.toUpperCase()
   if (upper.includes('PRO+') || upper.includes('PRO_PLUS') || upper.includes('PROPLUS')) return 'Pro_Plus'
-  if (upper.includes('POWER')) return 'Enterprise'
-  if (upper.includes('PRO')) return 'Pro'
+  // Power là tier riêng của Kiro ($200/10000 credits), KHÔNG phải Enterprise.
+  if (upper.includes('POWER')) return 'Power'
   if (upper.includes('ENTERPRISE')) return 'Enterprise'
   if (upper.includes('TEAMS')) return 'Teams'
+  if (upper.includes('PRO')) return 'Pro'
   return 'Free'
 }
 
@@ -365,9 +377,13 @@ async function getUsageLimitsRest(input: {
   const path = `/getUsageLimits?${params.toString()}`
   const headers = buildKiroRestHeaders(input)
 
-  let response = await fetchWithOptionalProxy(`${getRestApiBase(input.region)}${path}`, { method: 'GET', headers }, input.proxyUrl)
+  // Endpoint region must match the profile's region (embedded in profileArn), not
+  // the IdC/SSO region — they can differ, and a mismatch yields 400 "Improperly
+  // formed request". Fall back to the SSO region only when no profileArn region.
+  const serviceRegion = regionFromProfileArn(profileArn) || input.region
+  let response = await fetchWithOptionalProxy(`${getRestApiBase(serviceRegion)}${path}`, { method: 'GET', headers }, input.proxyUrl)
   if (response.status === 403) {
-    response = await fetchWithOptionalProxy(`${getFallbackRestApiBase(input.region)}${path}`, { method: 'GET', headers }, input.proxyUrl)
+    response = await fetchWithOptionalProxy(`${getFallbackRestApiBase(serviceRegion)}${path}`, { method: 'GET', headers }, input.proxyUrl)
   }
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`)
   return response.json() as Promise<UsageLimitsResponse>

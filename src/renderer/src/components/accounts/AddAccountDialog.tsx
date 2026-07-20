@@ -9,6 +9,7 @@ import { splitCredentialLine } from '@/lib/utils'
 interface AddAccountDialogProps {
   isOpen: boolean
   onClose: () => void
+  defaultMode?: ImportMode
 }
 
 interface BonusData {
@@ -72,10 +73,10 @@ interface OidcCredential {
   machineId?: string
 }
 
-type ImportMode = 'oidc' | 'sso' | 'login' | 'apiKey'
+type ImportMode = 'oidc' | 'sso' | 'login' | 'apiKey' | 'bedrock' | 'xpixi'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso'
 
-export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): React.ReactNode {
+export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDialogProps): React.ReactNode {
   const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab } = useAccountsStore()
 
   // 检查账户是否已存在（同userId 或 同邮箱+同provider 才算重复）
@@ -133,6 +134,24 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
   // 状态
   const [isVerifying, setIsVerifying] = useState(false)
+  // AWS Bedrock (upstream provider config, not a Kiro account)
+  const [bedrockAccessKeyId, setBedrockAccessKeyId] = useState('')
+  const [bedrockSecretAccessKey, setBedrockSecretAccessKey] = useState('')
+  const [bedrockSessionToken, setBedrockSessionToken] = useState('')
+  const [bedrockRegion, setBedrockRegion] = useState('us-east-1')
+  const [bedrockTesting, setBedrockTesting] = useState(false)
+  const [bedrockModels, setBedrockModels] = useState<Array<{ id: string; name?: string; provider?: string; kind: 'foundation' | 'profile' }>>([])
+  const [bedrockTested, setBedrockTested] = useState(false)
+  const [bedrockSelectedModels, setBedrockSelectedModels] = useState<string[]>([])
+
+  // Xpixi (third-party API provider)
+  const [xpixiApiKey, setXpixiApiKey] = useState('')
+  const [xpixiBaseUrl, setXpixiBaseUrl] = useState('https://api.xpiki.com')
+  const [xpixiTesting, setXpixiTesting] = useState(false)
+  const [xpixiModels, setXpixiModels] = useState<Array<{ id: string }>>([])
+  const [xpixiTested, setXpixiTested] = useState(false)
+  const [xpixiSelectedModels, setXpixiSelectedModels] = useState<string[]>([])
+
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const { t } = useTranslation()
@@ -1218,6 +1237,144 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     }
   }
 
+  // Verify Bedrock credentials (IAM) and list invokable models
+  const handleBedrockTest = async () => {
+    const accessKeyId = bedrockAccessKeyId.trim()
+    const secretAccessKey = bedrockSecretAccessKey.trim()
+    if (!accessKeyId || !secretAccessKey) {
+      setError(isEn ? 'Enter AWS Access Key ID and Secret Access Key' : 'Nh???p AWS Access Key ID v?  Secret Access Key')
+      return
+    }
+    setBedrockTesting(true)
+    setError(null)
+    try {
+      const result = await window.api.proxyTestBedrock({
+        accessKeyId,
+        secretAccessKey,
+        sessionToken: bedrockSessionToken.trim() || undefined,
+        region: bedrockRegion.trim() || 'us-east-1'
+      })
+      if (result.success) {
+        setBedrockModels(result.models || [])
+        setBedrockSelectedModels((result.models || []).map((m) => m.id))
+        setBedrockTested(true)
+        if (!result.models || result.models.length === 0) {
+          setError(isEn ? 'Credentials OK but no invokable text models were found for this identity.' : 'Key h???p l??? nh??ng kh??ng t??m th???y model text n? o t? i kho???n n? y d??ng ???????c.')
+        }
+      } else {
+        setBedrockTested(false)
+        setBedrockModels([])
+        setError(result.error || (isEn ? 'Bedrock credential test failed' : 'Ki???m tra key Bedrock th???t b???i'))
+      }
+    } catch (e) {
+      setBedrockTested(false)
+      setError(e instanceof Error ? e.message : (isEn ? 'Bedrock credential test failed' : 'Ki???m tra key Bedrock th???t b???i'))
+    } finally {
+      setBedrockTesting(false)
+    }
+  }
+
+  // Save Bedrock credentials into the proxy config (ProxyConfig.bedrock)
+  const handleBedrockSave = async () => {
+    const accessKeyId = bedrockAccessKeyId.trim()
+    const secretAccessKey = bedrockSecretAccessKey.trim()
+    if (!accessKeyId || !secretAccessKey) {
+      setError(isEn ? 'Enter AWS Access Key ID and Secret Access Key' : 'Nh???p AWS Access Key ID v?  Secret Access Key')
+      return
+    }
+    setIsSubmitting(true)
+    setError(null)
+    try {
+      const result = await window.api.proxyUpdateConfig({
+        bedrock: {
+          enabled: true,
+          accessKeyId,
+          secretAccessKey,
+          sessionToken: bedrockSessionToken.trim() || undefined,
+          region: bedrockRegion.trim() || 'us-east-1',
+          models: bedrockTested && bedrockModels.length > 0 && bedrockSelectedModels.length < bedrockModels.length
+            ? bedrockSelectedModels
+            : []
+        }
+      })
+      if (result.success) {
+        resetForm()
+        onClose()
+      } else {
+        setError(result.error || (isEn ? 'Failed to save Bedrock provider' : 'L??u Bedrock th???t b???i'))
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : (isEn ? 'Failed to save Bedrock provider' : 'L??u Bedrock th???t b???i'))
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  // Test Xpixi credentials
+  const handleXpixiTest = async () => {
+    const apiKey = xpixiApiKey.trim()
+    if (!apiKey) {
+      setError(isEn ? 'Enter Xpixi API key' : 'Nhập Xpixi API key')
+      return
+    }
+    setXpixiTesting(true)
+    setError(null)
+    try {
+      const result = await window.api.proxyTestXpixi({
+        apiKey,
+        baseUrl: xpixiBaseUrl.trim() || 'https://api.xpiki.com'
+      })
+      if (result.success) {
+        setXpixiTested(true)
+        setXpixiModels(result.models || [])
+        setXpixiSelectedModels([])
+        setError(null)
+      } else {
+        setXpixiTested(false)
+        setXpixiModels([])
+        setError(result.error || (isEn ? 'Xpixi API key test failed' : 'Kiểm tra key Xpixi thất bại'))
+      }
+    } catch (e) {
+      setXpixiTested(false)
+      setError(e instanceof Error ? e.message : (isEn ? 'Xpixi API key test failed' : 'Kiểm tra key Xpixi thất bại'))
+    } finally {
+      setXpixiTesting(false)
+    }
+  }
+
+  // Save Xpixi credentials into the proxy config
+  const handleXpixiSave = async () => {
+    const apiKey = xpixiApiKey.trim()
+    if (!apiKey) {
+      setError(isEn ? 'Enter Xpixi API key' : 'Nhập Xpixi API key')
+      return
+    }
+    setIsSubmitting(true)
+    setError(null)
+    try {
+      const result = await window.api.proxyUpdateConfig({
+        xpixi: {
+          enabled: true,
+          apiKey,
+          baseUrl: xpixiBaseUrl.trim() || 'https://api.xpiki.com',
+          models: xpixiTested && xpixiModels.length > 0 && xpixiSelectedModels.length < xpixiModels.length
+            ? xpixiSelectedModels
+            : []
+        }
+      })
+      if (result.success) {
+        resetForm()
+        onClose()
+      } else {
+        setError(result.error || (isEn ? 'Failed to save Xpixi provider' : 'Lưu Xpixi thất bại'))
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : (isEn ? 'Failed to save Xpixi provider' : 'Lưu Xpixi thất bại'))
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
   const resetForm = () => {
     setImportMode('login')
     setRefreshToken('')
@@ -1234,6 +1391,14 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setApiKeyAuthRegion('us-east-1')
     setApiKeyApiRegion('us-east-1')
     setSsoToken('')
+    setBedrockAccessKeyId('')
+    setBedrockSecretAccessKey('')
+    setBedrockSessionToken('')
+    setBedrockRegion('us-east-1')
+    setBedrockModels([])
+    setBedrockSelectedModels([])
+    setBedrockTested(false)
+    setBedrockTesting(false)
     setVerifiedData(null)
     setError(null)
     // 清理登录状态
@@ -1246,6 +1411,13 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       pollIntervalRef.current = null
     }
   }
+
+  useEffect(() => {
+    if (isOpen && defaultMode) {
+      setImportMode(defaultMode)
+      setError(null)
+    }
+  }, [isOpen, defaultMode])
 
   if (!isOpen) return null
 
@@ -1281,7 +1453,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             </div>
           )}
           {/* 导入模式切换 */}
-          <div className="grid grid-cols-4 gap-1 p-1 bg-muted/50 rounded-xl border">
+          <div className="grid grid-cols-5 gap-1 p-1 bg-muted/50 rounded-xl border">
             <button
               className={`py-2 px-3 text-sm rounded-lg transition-all duration-200 font-medium ${
                 importMode === 'login' 
@@ -1325,6 +1497,18 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               disabled={!!verifiedData || isLoggingIn}
             >
               SSO Token
+            </button>
+
+            <button
+              className={`py-2 px-3 text-sm rounded-lg transition-all duration-200 font-medium ${
+                importMode === 'bedrock'
+                  ? 'bg-background text-foreground shadow-sm ring-1 ring-black/5'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
+              }`}
+              onClick={() => { setImportMode('bedrock'); setError(null) }}
+              disabled={!!verifiedData || isLoggingIn}
+            >
+              Bedrock
             </button>
           </div>
 
@@ -1866,6 +2050,220 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             </div>
           )}
 
+          {/* AWS Bedrock provider config */}
+          {importMode === 'bedrock' && !verifiedData && (
+            <div className="space-y-5">
+              <div className="p-3 bg-muted/60 rounded-xl border text-xs text-muted-foreground">
+                {isEn
+                  ? 'Connect AWS Bedrock as an upstream provider. Credentials are stored in the proxy config and models available to this IAM identity (including cross-region Claude Opus) become routable.'
+                  : 'Ket noi AWS Bedrock lam nha cung cap upstream. Key duoc luu trong cau hinh proxy; cac model ma IAM nay dung duoc (ke ca Claude Opus cross-region) se dinh tuyen duoc.'}
+              </div>
+
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">
+                    AWS Access Key ID <span className="text-destructive">*</span>
+                  </Label>
+                  <Input
+                    value={bedrockAccessKeyId}
+                    onChange={(e) => { setBedrockAccessKeyId(e.target.value); setBedrockTested(false) }}
+                    placeholder="AKIA..."
+                    className="font-mono"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">
+                    AWS Secret Access Key <span className="text-destructive">*</span>
+                  </Label>
+                  <Input
+                    type="password"
+                    value={bedrockSecretAccessKey}
+                    onChange={(e) => { setBedrockSecretAccessKey(e.target.value); setBedrockTested(false) }}
+                    placeholder={isEn ? 'Secret access key' : 'Secret access key'}
+                    className="font-mono"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">{isEn ? 'Session Token (optional)' : 'Session Token (tuy chon)'}</Label>
+                  <Input
+                    type="password"
+                    value={bedrockSessionToken}
+                    onChange={(e) => { setBedrockSessionToken(e.target.value); setBedrockTested(false) }}
+                    placeholder={isEn ? 'For temporary STS credentials' : 'Cho credential STS tam thoi'}
+                    className="font-mono"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">{isEn ? 'Region' : 'Region'}</Label>
+                  <Input
+                    value={bedrockRegion}
+                    onChange={(e) => { setBedrockRegion(e.target.value); setBedrockTested(false) }}
+                    placeholder="us-east-1"
+                    className="font-mono"
+                  />
+                </div>
+
+                <div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={handleBedrockTest}
+                    disabled={bedrockTesting || !bedrockAccessKeyId.trim() || !bedrockSecretAccessKey.trim()}
+                    className="rounded-xl h-10 px-4"
+                  >
+                    {bedrockTesting && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                    {isEn ? 'Test credentials' : 'Kiem tra key'}
+                  </Button>
+                </div>
+
+                {bedrockTested && bedrockModels.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm font-medium text-success">
+                        {isEn ? `Verified. ${bedrockModels.length} invokable models.` : `Hop le. ${bedrockModels.length} model dung duoc.`}
+                      </p>
+                      <div className="flex items-center gap-2">
+                        <button type="button" className="text-xs text-primary hover:underline" onClick={() => setBedrockSelectedModels(bedrockModels.map((m) => m.id))}>
+                          {isEn ? 'All' : 'Tat ca'}
+                        </button>
+                        <button type="button" className="text-xs text-muted-foreground hover:underline" onClick={() => setBedrockSelectedModels([])}>
+                          {isEn ? 'None' : 'Bo chon'}
+                        </button>
+                      </div>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {isEn ? 'Choose which models to expose. Leave all selected to expose everything.' : 'Chon model muon expose. De nguyen tat ca = expose het.'}
+                    </p>
+                    <div className="grid grid-cols-1 gap-1.5 max-h-56 overflow-y-auto pr-1 rounded-lg border bg-muted/20 p-2">
+                      {bedrockModels.map((m) => {
+                        const checked = bedrockSelectedModels.includes(m.id)
+                        return (
+                          <button
+                            key={m.id}
+                            type="button"
+                            onClick={() => setBedrockSelectedModels((cur) => cur.includes(m.id) ? cur.filter((x) => x !== m.id) : [...cur, m.id])}
+                            className={`flex items-start gap-2 rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors ${checked ? 'border-primary/50 bg-primary/10' : 'border-border bg-background hover:border-primary/40'}`}
+                          >
+                            <span className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border ${checked ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/40'}`}>
+                              {checked && <Check className="h-3 w-3" />}
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate font-mono font-medium">{m.id}</span>
+                            </span>
+                            {m.kind === 'profile' && (
+                              <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">profile</span>
+                            )}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Xpixi provider config */}
+          {importMode === 'xpixi' && !verifiedData && (
+            <div className="space-y-5">
+              <div className="p-3 bg-muted/60 rounded-xl border text-xs text-muted-foreground">
+                {isEn
+                  ? 'Connect Xpixi as a third-party API provider. The API key is stored in proxy config and Claude models from xpiki.com become routable through Krouter.'
+                  : 'Kết nối Xpixi làm nhà cung cấp API bên thứ ba. Key được lưu trong config proxy; các model Claude từ xpiki.com sẽ định tuyến được qua Krouter.'}
+              </div>
+
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">
+                    Xpixi API Key <span className="text-destructive">*</span>
+                  </Label>
+                  <Input
+                    type="password"
+                    value={xpixiApiKey}
+                    onChange={(e) => { setXpixiApiKey(e.target.value); setXpixiTested(false) }}
+                    placeholder="sk-..."
+                    className="font-mono"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">{isEn ? 'Base URL (optional)' : 'Base URL (tùy chọn)'}</Label>
+                  <Input
+                    value={xpixiBaseUrl}
+                    onChange={(e) => { setXpixiBaseUrl(e.target.value); setXpixiTested(false) }}
+                    placeholder="https://api.xpiki.com"
+                    className="font-mono"
+                  />
+                </div>
+
+                <div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={handleXpixiTest}
+                    disabled={xpixiTesting || !xpixiApiKey.trim()}
+                    className="rounded-xl h-10 px-4"
+                  >
+                    {xpixiTesting && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                    {isEn ? 'Test API key' : 'Kiểm tra key'}
+                  </Button>
+                </div>
+
+                {xpixiTested && xpixiModels.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm font-medium text-success">
+                        {isEn ? `Verified. ${xpixiModels.length} available models.` : `Hợp lệ. ${xpixiModels.length} model khả dụng.`}
+                      </p>
+                      <div className="flex items-center gap-2">
+                        <button type="button" className="text-xs text-primary hover:underline" onClick={() => setXpixiSelectedModels(xpixiModels.map((m) => m.id))}>
+                          {isEn ? 'All' : 'Tất cả'}
+                        </button>
+                        <button type="button" className="text-xs text-muted-foreground hover:underline" onClick={() => setXpixiSelectedModels([])}>
+                          {isEn ? 'None' : 'Bỏ chọn'}
+                        </button>
+                      </div>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {isEn ? 'Choose which models to expose. Leave all selected to expose everything.' : 'Chọn model muốn expose. Để nguyên tất cả = expose hết.'}
+                    </p>
+                    <div className="grid grid-cols-1 gap-1.5 max-h-56 overflow-y-auto pr-1 rounded-lg border bg-muted/20 p-2">
+                      {xpixiModels.map((m) => {
+                        const checked = xpixiSelectedModels.includes(m.id)
+                        return (
+                          <button
+                            key={m.id}
+                            type="button"
+                            onClick={() => setXpixiSelectedModels((cur) => cur.includes(m.id) ? cur.filter((x) => x !== m.id) : [...cur, m.id])}
+                            className={`flex items-start gap-2 rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors ${checked ? 'border-primary/50 bg-primary/10' : 'border-border bg-background hover:border-primary/40'}`}
+                          >
+                            <span className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border ${checked ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/40'}`}>
+                              {checked && <Check className="h-3 w-3" />}
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate font-mono font-medium">{m.id}</span>
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* OIDC 凭证输入模式 */}
           {importMode === 'oidc' && !verifiedData && (
             <div className="space-y-5">
@@ -2227,6 +2625,38 @@ email----password----refreshToken----clientId----clientSecret`
           )}
 
           {/* 提交按钮 - 只在 OIDC 模式显示 */}
+          {importMode === 'bedrock' && (
+            <div className="flex justify-end gap-3 pt-4 border-t">
+              <Button type="button" variant="outline" onClick={() => setImportMode('login')} className="rounded-xl h-10 px-6">
+                {isEn ? 'Back' : 'Quay lai'}
+              </Button>
+              <Button
+                onClick={handleBedrockSave}
+                disabled={isSubmitting || !bedrockAccessKeyId.trim() || !bedrockSecretAccessKey.trim()}
+                className="rounded-xl h-10 px-6"
+              >
+                {isSubmitting && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                {isEn ? 'Save Provider' : 'Luu Bedrock'}
+              </Button>
+            </div>
+          )}
+
+          {importMode === 'xpixi' && (
+            <div className="flex justify-end gap-3 pt-4 border-t">
+              <Button type="button" variant="outline" onClick={() => setImportMode('login')} className="rounded-xl h-10 px-6">
+                {isEn ? 'Back' : 'Quay lại'}
+              </Button>
+              <Button
+                onClick={handleXpixiSave}
+                disabled={isSubmitting || !xpixiApiKey.trim()}
+                className="rounded-xl h-10 px-6"
+              >
+                {isSubmitting && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                {isEn ? 'Save Provider' : 'Lưu Xpixi'}
+              </Button>
+            </div>
+          )}
+
           {importMode === 'apiKey' && (
             <div className="flex justify-end gap-3 pt-4 border-t">
               <Button type="button" variant="outline" onClick={() => setImportMode('login')} className="rounded-xl h-10 px-6">

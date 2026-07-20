@@ -63,7 +63,7 @@ describe('proxy maintenance backend service', () => {
     ])
   })
 
-  it('adds live IPLocate proxies, prunes dead source proxies, and removes only terminal dead accounts', async () => {
+  it('adds live proxies, retains blocked accounts, and removes only terminal credential failures', async () => {
     const { store, userId } = await createStore()
     await store.setAccountData(userId, {
       accounts: {
@@ -77,6 +77,13 @@ describe('proxy maintenance backend service', () => {
           id: 'suspended',
           email: 'suspended@example.com',
           credentials: { accessToken: 'suspended-token', refreshToken: 'suspended-refresh', expiresAt: Date.now() + 3600000 }
+        },
+        blockedSuccess: {
+          id: 'blockedSuccess',
+          email: 'blocked-success@example.com',
+          status: 'blocked',
+          usage: { suspendedAt: Date.now(), suspendReason: 'TEMPORARILY_SUSPENDED' },
+          credentials: { accessToken: 'blocked-token', refreshToken: 'blocked-refresh', expiresAt: Date.now() + 3600000 }
         },
         invalid: {
           id: 'invalid',
@@ -126,6 +133,7 @@ describe('proxy maintenance backend service', () => {
           port: 8080,
           source: 'manual',
           status: 'alive',
+          latencyMs: 250,
           usedCount: 0,
           failCount: 0,
           enabled: true,
@@ -144,6 +152,7 @@ describe('proxy maintenance backend service', () => {
         sourceUrl: 'memory://iplocate',
         sourceValidateConcurrency: 2,
         sourceRemoveDead: true,
+        maxUsableLatencyMs: 1000,
         accountHealthCheckEnabled: true,
         accountDeleteDead: true,
         accountFailureThreshold: 2,
@@ -153,15 +162,25 @@ describe('proxy maintenance backend service', () => {
       }
     })
 
+    const validateCalls: Array<Record<string, unknown>> = []
     const runtime = new ProxyMaintenanceRuntime(store, userId, () => undefined, {
       fetchSourceText: async () => [
         'http://1.1.1.1:8080',
         'socks5://2.2.2.2:1080',
-        'http://3.3.3.3:8000'
+        'http://3.3.3.3:8000',
+        'http://4.4.4.4:8080'
       ].join('\n'),
-      validateProxy: async ({ url }) => url === 'http://3.3.3.3:8000'
-        ? { success: false, error: 'connect timeout' }
-        : { success: true, latencyMs: url.includes('2.2.2.2') ? 450 : 120, externalIp: '1.1.1.1' },
+      validateProxy: async (params) => {
+        validateCalls.push(params as unknown as Record<string, unknown>)
+        const { url } = params
+        return url === 'http://3.3.3.3:8000'
+          ? { success: false, error: 'connect timeout' }
+          : {
+              success: true,
+              latencyMs: url.includes('4.4.4.4') ? 1600 : url.includes('2.2.2.2') ? 450 : 120,
+              externalIp: '1.1.1.1'
+            }
+      },
       checkAccount: async (account) => {
         if (account.id === 'suspended') return { success: false, error: { message: 'User ID is temporarily suspended' } }
         if (account.id === 'invalid') return { success: false, error: { message: 'invalid_grant' } }
@@ -182,17 +201,25 @@ describe('proxy maintenance backend service', () => {
     const status = await runtime.runNow('test')
     const data = store.getAccountData(userId) as Record<string, any>
 
-    expect(status.proxiesChecked).toBe(3)
+    expect(status.proxiesChecked).toBe(4)
+    expect(validateCalls).toHaveLength(4)
+    expect(validateCalls.every((call) => call.requireAwsSigninRoute === true)).toBe(true)
     expect(status.proxiesAlive).toBe(2)
     expect(status.proxiesAdded).toBe(2)
     expect(status.proxiesRemoved).toBe(2)
-    expect(status.accountsChecked).toBe(4)
-    expect(status.accountsRemoved).toBe(2)
+    expect(status.accountsChecked).toBe(5)
+    expect(status.accountsRemoved).toBe(1)
     expect(Object.keys(data.proxyPool).sort()).toEqual(expect.arrayContaining(['manual']))
     expect(Object.values(data.proxyPool).filter((proxy: any) => proxy.source === IPLOCATE_PROXY_SOURCE)).toHaveLength(2)
     expect(data.proxyPool.staleSource).toBeUndefined()
     expect(data.proxyPool.deadSource).toBeUndefined()
-    expect(data.accounts.suspended).toBeUndefined()
+    expect(data.proxyPoolConfig.maxUsableLatencyMs).toBe(1000)
+    expect(data.proxyPoolConfig.sourceRemoveDead).toBe(true)
+    expect(data.accounts.suspended.status).toBe('blocked')
+    expect(data.accounts.suspended.usage.suspendedAt).toBeTypeOf('number')
+    expect(data.accounts.suspended.lastError).toContain('temporarily suspended')
+    expect(data.accounts.blockedSuccess.status).toBe('blocked')
+    expect(data.accounts.blockedSuccess.usage.suspendedAt).toBeTypeOf('number')
     expect(data.accounts.invalid).toBeUndefined()
     expect(data.accounts.rateLimited).toBeTruthy()
     expect(data.accounts.ok.credentials.accessToken).toBe('ok-token-new')
@@ -200,7 +227,8 @@ describe('proxy maintenance backend service', () => {
     expect(data.accountProxyBindings.suspended).toBeUndefined()
     expect(data.accountProxyBindings.rateLimited).toBe('manual')
     expect(data.activeAccountId).toBeNull()
-    expect(data._deletedAccountIds).toEqual(expect.arrayContaining(['suspended', 'invalid']))
+    expect(data._deletedAccountIds).toEqual(expect.arrayContaining(['invalid']))
+    expect(data._deletedAccountIds).not.toContain('suspended')
     expect(data._deletedProxyIds).toEqual(expect.arrayContaining(['staleSource', 'deadSource']))
   })
 })

@@ -55,7 +55,6 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
   const [showCert, setShowCert] = useState(false)
   const [certInfo, setCertInfo] = useState<SelfSignedCertInfo | null>(null)
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([])
-  const [needsRestart, setNeedsRestart] = useState(false)
   const [copiedCert, setCopiedCert] = useState(false)
   const [regenerating, setRegenerating] = useState(false)
   const isRoundRobinBalancing = Boolean(
@@ -70,17 +69,6 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
     setAllowedIPsText((config.allowedIPs || []).join('\n'))
     setDeniedIPsText((config.deniedIPs || []).join('\n'))
   }, [config.allowedIPs, config.deniedIPs])
-
-  // 加载 needsRestart 状态
-  useEffect(() => {
-    if (!isRunning) { setNeedsRestart(false); return }
-    let mounted = true
-    void window.api.proxyNeedsRestart().then(r => { if (mounted) setNeedsRestart(r.needsRestart) })
-    const timer = setInterval(() => {
-      void window.api.proxyNeedsRestart().then(r => { if (mounted) setNeedsRestart(r.needsRestart) })
-    }, 5000)
-    return () => { mounted = false; clearInterval(timer) }
-  }, [isRunning])
 
   const updateConfig = useCallback(<K extends keyof ProxyConfigSecurity>(key: K, value: ProxyConfigSecurity[K]) => {
     setConfig((prev: unknown) => ({ ...(prev as object), [key]: value }))
@@ -106,7 +94,7 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
       const info = await window.api.proxySelfSignedCertRegenerate()
       if (info.success) {
         setCertInfo(info)
-        alert(isEn ? 'Regenerated. Restart proxy to apply.' : 'Đã tạo lại. Khởi động lại proxy để áp dụng.')
+        alert(isEn ? 'Regenerated. Backend proxy will apply it automatically.' : 'Đã tạo lại. Backend proxy sẽ tự áp dụng.')
       } else {
         alert(isEn ? `Failed: ${info.error}` : `Thất bại: ${info.error}`)
       }
@@ -142,16 +130,6 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
     if (showAudit) void fetchAudit()
   }, [showAudit, fetchAudit])
 
-  const handleRestart = useCallback(async () => {
-    if (!confirm(isEn ? 'Restart proxy server now? Active streams will be interrupted.' : 'Khởi động lại proxy ngay? Các stream đang chạy sẽ bị ngắt.')) return
-    const r = await window.api.proxyRestart()
-    if (r.success) {
-      setNeedsRestart(false)
-    } else {
-      alert(isEn ? `Restart failed: ${r.error}` : `Khởi động lại thất bại: ${r.error}`)
-    }
-  }, [isEn])
-
   return (
     <Card className="hover-lift">
       <CardHeader className="pb-3 cursor-pointer" onClick={() => setExpanded(!expanded)}>
@@ -159,12 +137,6 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
           <div className="flex items-center gap-2">
             <Shield className="h-5 w-5 text-amber-500" />
             <CardTitle className="text-base">{isEn ? 'Security & Observability (v1.8)' : 'Bảo mật & quan sát (v1.8)'}</CardTitle>
-            {needsRestart && (
-              <Badge variant="destructive" className="ml-2">
-                <AlertTriangle className="h-3 w-3 mr-1" />
-                {isEn ? 'Restart required' : 'Cần khởi động lại'}
-              </Badge>
-            )}
           </div>
           <Button variant="ghost" size="sm" className="h-8 w-8 p-0">
             {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
@@ -174,19 +146,6 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
 
       {expanded && (
         <CardContent className="space-y-4 text-sm">
-          {needsRestart && (
-            <div className="flex items-center justify-between p-3 rounded-md bg-amber-500/10 border border-amber-500/20">
-              <div className="flex items-center gap-2 text-amber-600 dark:text-amber-400">
-                <AlertTriangle className="h-4 w-4" />
-                <span className="text-xs">{isEn ? 'Configuration change requires a restart to take effect.' : 'Cấu hình đã đổi, cần khởi động lại để áp dụng.'}</span>
-              </div>
-              <Button size="sm" onClick={handleRestart}>
-                <RefreshCw className="h-3 w-3 mr-1" />
-                {isEn ? 'Restart Now' : 'Khởi động lại'}
-              </Button>
-            </div>
-          )}
-
           {/* 请求安全 */}
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -261,7 +220,6 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
                   <Switch
                     checked={config.allowExternalWithoutApiKey || false}
                     onCheckedChange={(checked) => updateConfig('allowExternalWithoutApiKey', checked)}
-                    disabled={isRunning}
                   />
                   <span className="text-xs text-red-600 dark:text-red-400">{isEn ? 'I understand the risk, allow without API Key (DANGEROUS)' : 'Tôi hiểu rủi ro, cho phép chạy không cần API Key (nguy hiểm)'}</span>
                 </label>
@@ -352,7 +310,6 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
                 onChange={(e) => updateConfig('fallbackPort', parseInt(e.target.value) || 0)}
                 placeholder={isEn ? '0 = disabled' : '0 = tắt'}
                 className="h-9"
-                disabled={isRunning}
               />
             </div>
           </div>

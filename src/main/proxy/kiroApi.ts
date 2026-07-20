@@ -1,6 +1,6 @@
 // Kiro API 调用核心模块
 import { v4 as uuidv4 } from 'uuid'
-import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
+import { fetch as undiciFetch, Agent, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import type {
   KiroPayload,
   KiroUserInputMessage,
@@ -39,6 +39,19 @@ export function setLogStreamEvents(enabled: boolean): void {
   logStreamEvents = enabled
 }
 
+// 流式读取超时（毫秒，0 = 关闭）。防止 AWS 长时间不吐字节导致客户端无限等待。
+// 首字节超时较长以容忍 reasoning 模型的思考延迟；空闲超时在每收到一块后重置。
+let streamFirstByteTimeoutMs = 30_000
+let streamIdleTimeoutMs = 60_000
+export function setStreamTimeouts(opts: { firstByteMs?: number; idleMs?: number }): void {
+  if (typeof opts.firstByteMs === 'number' && opts.firstByteMs >= 0) {
+    streamFirstByteTimeoutMs = opts.firstByteMs
+  }
+  if (typeof opts.idleMs === 'number' && opts.idleMs >= 0) {
+    streamIdleTimeoutMs = opts.idleMs
+  }
+}
+
 // Payload 大小限制（KB），用户可在高级设置中调整
 let payloadSizeLimitKB = 1536 // 默认 1.5MB
 export function setPayloadSizeLimitKB(limitKB: number): void {
@@ -48,6 +61,8 @@ export function setPayloadSizeLimitKB(limitKB: number): void {
 const DEFAULT_KIRO_CONTENT_CHAR_LIMIT = 180000
 const MIN_KIRO_CONTENT_CHAR_LIMIT = 16000
 const MAX_KIRO_CONTENT_CHAR_LIMIT = 1000000
+const DEFAULT_TOOL_RESULT_HISTORY_KEEP = 24
+const DEFAULT_OLD_TOOL_RESULT_CHAR_LIMIT = 320
 
 // Token buffer reserve 开关（默认 false = 完全跳过 trimHistoryByTokens）
 // 关闭时后端不再裁剪任何旧消息，超出 context window 由 Kiro 后端原样返回错误
@@ -131,6 +146,38 @@ function compactToolResults(toolResults: KiroToolResult[] | undefined, maxChars:
   return changed
 }
 
+function getToolResultHistoryKeep(): number {
+  const configured = Number(process.env.KROUTER_KIRO_TOOL_RESULT_HISTORY_KEEP || process.env.KIRO_TOOL_RESULT_HISTORY_KEEP)
+  return Number.isFinite(configured) && configured >= 0
+    ? clampNumber(Math.floor(configured), 0, 100)
+    : DEFAULT_TOOL_RESULT_HISTORY_KEEP
+}
+
+function getOldToolResultCharLimit(): number {
+  const configured = Number(process.env.KROUTER_KIRO_OLD_TOOL_RESULT_CHAR_LIMIT || process.env.KIRO_OLD_TOOL_RESULT_CHAR_LIMIT)
+  return Number.isFinite(configured) && configured > 0
+    ? clampNumber(Math.floor(configured), 80, 2000)
+    : DEFAULT_OLD_TOOL_RESULT_CHAR_LIMIT
+}
+
+function compactOldToolResultHistory(history: KiroHistoryMessage[] | undefined): number {
+  if (!history?.length) return 0
+  const keepRecent = getToolResultHistoryKeep()
+  const oldToolResultLimit = getOldToolResultCharLimit()
+  let seenFromEnd = 0
+  let changed = 0
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    const toolResults = history[i]?.userInputMessage?.userInputMessageContext?.toolResults
+    if (!toolResults?.length) continue
+    seenFromEnd++
+    if (seenFromEnd <= keepRecent) continue
+    changed += compactToolResults(toolResults, oldToolResultLimit)
+  }
+
+  return changed
+}
+
 function compactMessageText(message: KiroHistoryMessage, maxChars: number): number {
   let changed = 0
   const userContent = message.userInputMessage?.content
@@ -148,7 +195,7 @@ function compactMessageText(message: KiroHistoryMessage, maxChars: number): numb
 
 function compactPayloadForKiroLimits(
   payload: KiroPayload,
-  options: { mode?: 'normal' | 'retry'; payloadSizeLimitBytes?: number } = {}
+  options: { mode?: 'normal' | 'retry'; payloadSizeLimitBytes?: number; tools?: KiroToolWrapper[] } = {}
 ): { changed: boolean; finalSize: number; textTrimmed: number; toolResultsTrimmed: number; historyDropped: number } {
   const mode = options.mode ?? 'normal'
   const payloadLimit = options.payloadSizeLimitBytes ?? getPayloadSizeLimitBytes()
@@ -167,6 +214,7 @@ function compactPayloadForKiroLimits(
     currentMessage.userInputMessage.userInputMessageContext?.toolResults,
     toolResultLimit
   )
+  toolResultsTrimmed += compactOldToolResultHistory(payload.conversationState.history)
 
   for (const message of payload.conversationState.history ?? []) {
     textTrimmed += compactMessageText(message, historyLimit)
@@ -184,8 +232,13 @@ function compactPayloadForKiroLimits(
     historyDropped += dropCount
     history = ensureStartsWithUserMessage(history)
     payload.conversationState.history = history.length > 0 ? history : undefined
+    repairPayloadConversation(payload, options.tools)
+    history = payload.conversationState.history
     finalSize = JSON.stringify(payload).length
   }
+
+  repairPayloadConversation(payload, options.tools)
+  finalSize = JSON.stringify(payload).length
 
   let currentContent = payload.conversationState.currentMessage.userInputMessage.content
   while (finalSize > payloadLimit && currentContent.length > MIN_KIRO_CONTENT_CHAR_LIMIT) {
@@ -213,6 +266,42 @@ function isContentLengthThresholdError(status: number, body: string): boolean {
     lower.includes('input content length exceeds threshold') ||
     lower.includes('content length exceeds')
   )
+}
+
+function isRequestBodyInvalidJsonError(status: number, body: string): boolean {
+  const lower = body.toLowerCase()
+  return status === 400 && (
+    body.includes('REQUEST_BODY_INVALID_JSON') ||
+    lower.includes('request body is not valid json') ||
+    lower.includes('body is not valid json')
+  )
+}
+
+// Shared undici dispatcher for DIRECT (non-proxied) Kiro calls. Node's global
+// fetch dispatcher caps connections-per-origin at 6 by default. Since every
+// account hits the same AWS origin, that cap serializes a concurrent burst:
+// wave 1 runs, the rest queue for a socket. OpenClaw fans out many parallel
+// calls, so that queue is exactly the "khựng"/stall the user sees. A pool with
+// a high per-origin connection ceiling lets the whole account pool run in
+// parallel (each request still uses its own account token — this only removes
+// the transport-level bottleneck, it does not change account selection).
+let directDispatcher: Agent | null = null
+function getDirectDispatcher(): Agent {
+  if (!directDispatcher) {
+    // Match how the official Kiro IDE (and Kiro-Go) reach AWS: HTTP/2 multiplexes
+    // many concurrent requests over a SMALL number of connections. An earlier fix
+    // opened connections:256 over HTTP/1.1, which from a single VPS IP looks like a
+    // connection flood and triggers AWS "suspicious activity" 429s. allowH2 lets
+    // undici negotiate h2 so a burst rides a few multiplexed sockets instead.
+    directDispatcher = new Agent({
+      allowH2: true,
+      connections: 20,
+      keepAliveTimeout: 60_000,
+      keepAliveMaxTimeout: 300_000,
+      connectTimeout: 15_000
+    })
+  }
+  return directDispatcher
 }
 
 /**
@@ -263,11 +352,25 @@ async function fetchWithProxy(url: string, options: RequestInit, account?: Proxy
     proxyLogger.debug('KiroAPI', `Using proxy agent: ${agent.constructor.name}`)
     return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
   }
-  return await fetch(url, options)
+  // Direct (no per-account proxy): use the shared high-connection dispatcher so a
+  // concurrent burst isn't serialized by the default per-origin connection cap.
+  return await undiciFetch(url, { ...options, dispatcher: getDirectDispatcher() } as UndiciRequestInit) as unknown as Response
 }
 
 // Kiro API 端点配置
+// NOTE ordering: "Kiro IDE" (q.us-east-1, no X-Amz-Target) is FIRST so a request
+// looks like the official Kiro IDE hitting Amazon Q. Leading with codewhisperer.
+// + trying multiple hosts made AWS flag the traffic as "suspicious activity"
+// (429 USER_REQUEST_RATE_EXCEEDED). Kiro-Go's running config uses exactly this
+// endpoint (preferredEndpoint=kiro) and never gets throttled on the same account.
 const KIRO_ENDPOINTS = [
+  {
+    url: 'https://q.us-east-1.amazonaws.com/generateAssistantResponse',
+    origin: 'AI_EDITOR',
+    amzTarget: '',
+    name: 'Kiro IDE',
+    protocol: 'generateAssistantResponse' as const
+  },
   {
     url: 'https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse',
     origin: 'AI_EDITOR',
@@ -290,6 +393,25 @@ const KIRO_ENDPOINTS = [
   }
 ]
 
+/**
+ * 账号区域 → Kiro 服务区域的唯一归一化来源。
+ * 仅 eu-* 区域映射到 eu-central-1，其余（含 undefined / 未知 / 非 eu）保持 us-east-1。
+ * getQServiceEndpoint 与 regionalizeKiroEndpointUrl 均基于此，保证只有一处区域映射规则。
+ */
+export function mapKiroServiceRegion(region?: string): string {
+  return region && region.toLowerCase().startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
+}
+
+/**
+ * 把硬编码的 us-east-1 端点 URL 按账号区域重写到目标区域。
+ * 仅替换 host 中的区域段（codewhisperer.us-east-1. / q.us-east-1.）；
+ * 对 us-east-1（默认 / 未知 / 非 eu）账号原样返回，保持既有行为不变。
+ */
+export function regionalizeKiroEndpointUrl(url: string, region?: string): string {
+  const target = mapKiroServiceRegion(region)
+  return target === 'us-east-1' ? url : url.replace('.us-east-1.', '.' + target + '.')
+}
+
 // Kiro 版本号（跟随官方 IDE 更新）
 const KIRO_VERSION = '0.12.155'
 const AWS_SDK_VERSION = '1.0.34'
@@ -305,7 +427,11 @@ function getKiroUserAgent(machineId?: string): string {
 }
 
 function getKiroAmzUserAgent(machineId?: string): string {
-  const suffix = machineId ? `KiroIDE ${KIRO_VERSION} ${machineId}` : `KiroIDE-${KIRO_VERSION}`
+  // Match the official Kiro IDE (and Kiro-Go) format EXACTLY: dash separators, not
+  // spaces. Krouter previously sent `KiroIDE 0.12.155 {id}` (spaces), which does not
+  // match any real Kiro IDE user-agent and helps AWS flag the traffic as non-IDE →
+  // 429 "suspicious activity". Kiro-Go sends `aws-sdk-js/1.0.34 KiroIDE-0.11.107-{id}`.
+  const suffix = machineId ? `KiroIDE-${KIRO_VERSION}-${machineId}` : `KiroIDE-${KIRO_VERSION}`
   return `aws-sdk-js/${AWS_SDK_VERSION} ${suffix}`
 }
 
@@ -368,6 +494,36 @@ export function resolveProfileArn(account: Pick<ProxyAccount, 'profileArn' | 'au
   return KIRO_BUILDER_ID_PLACEHOLDER_ARN
 }
 
+/**
+ * 从 profileArn 中提取区域段。
+ * ARN 形如 `arn:aws:codewhisperer:{region}:ACCOUNT:profile/XXXX`；
+ * 空区域（`arn:aws:codewhisperer::`）、非 ARN、undefined 均返回 undefined。
+ */
+export function regionFromProfileArn(profileArn?: string): string | undefined {
+  const match = profileArn?.match(/^arn:aws:codewhisperer:([a-z0-9-]+):/i)
+  return match?.[1]?.toLowerCase() || undefined
+}
+
+/**
+ * 解析账号应使用的 Kiro 服务区域（RAW，不做 eu-* → eu-central-1 归一化）。
+ * 优先使用 profileArn 内嵌的 profile 区域，因为 Amazon Q Developer profile 区域
+ * 可能与 IdC/SSO 区域不同——服务端点必须匹配 profile 区域，否则 400
+ * "Improperly formed request"。
+ * 顺序：resolveProfileArn 派生的区域 → account.profileArn 直接派生（防 resolveProfileArn 返回占位符）
+ *   → account.region（SSO 区域）→ 'us-east-1'。
+ * 调用方按需再传入 mapKiroServiceRegion 做端点归一化。
+ */
+export function resolveKiroServiceRegion(
+  account: Pick<ProxyAccount, 'profileArn' | 'authMethod' | 'provider' | 'kiroApiKey' | 'region'> & { accessToken?: string }
+): string {
+  return (
+    regionFromProfileArn(resolveProfileArn(account)) ??
+    regionFromProfileArn(account.profileArn) ??
+    account.region ??
+    'us-east-1'
+  )
+}
+
 // 兼容 SDK 部分调用仍想知道社交 ARN 的场景（极少；保留 export 不破坏外部 import）
 export { KIRO_SOCIAL_PROFILE_ARN }
 
@@ -399,7 +555,7 @@ REMEMBER: When in doubt, write LESS per operation. Multiple small operations > o
 const THINKING_MODE_PROMPT = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
-const CODEWHISPERER_DEFAULT_MODEL_ID = 'CLAUDE_SONNET_4_20250514_V1_0'
+const CODEWHISPERER_DEFAULT_MODEL_ID = 'claude-sonnet-4.5'
 const CODEWHISPERER_MODEL_CACHE_TTL = 5 * 60 * 1000
 
 const codeWhispererModelCache = new Map<string, { models: KiroModel[]; timestamp: number }>()
@@ -519,8 +675,14 @@ async function resolveCodeWhispererModelId(account: ProxyAccount, requestedModel
   const modelId = requestedModelId?.trim()
   if (!modelId) return CODEWHISPERER_DEFAULT_MODEL_ID
   if (isCodeWhispererModelId(modelId)) return modelId
-  const models = await getCachedCodeWhispererModels(account, signal)
-  return models.find(model => matchesRequestedModel(model, modelId))?.modelId || CODEWHISPERER_DEFAULT_MODEL_ID
+  const fallbackModelId = mapModelId(modelId)
+  try {
+    const models = await getCachedCodeWhispererModels(account, signal)
+    return models.find(model => matchesRequestedModel(model, modelId))?.modelId || fallbackModelId
+  } catch (error) {
+    console.warn(`[KiroAPI] ListAvailableModels unavailable; using requested model fallback "${fallbackModelId}":`, error)
+    return fallbackModelId
+  }
 }
 
 function getPayloadModelId(payload: KiroPayload): string | undefined {
@@ -598,7 +760,7 @@ const CONTINUE_MESSAGE: KiroHistoryMessage = {
 }
 
 const UNDERSTOOD_MESSAGE: KiroHistoryMessage = {
-  assistantResponseMessage: { content: 'understood' }
+  assistantResponseMessage: { content: ' ' }
 }
 
 // 创建失败的工具结果消息
@@ -752,6 +914,10 @@ function removeInvalidToolResultMessages(messages: KiroHistoryMessage[]): KiroHi
       result.push(message)
       continue
     }
+    if (i === messages.length - 1) {
+      result.push(message)
+      continue
+    }
     if (!previousMessage || !isAssistantResponseMessage(previousMessage) || !hasToolUses(previousMessage)) {
       const stripped = stripInvalidToolResults(message)
       if (stripped) result.push(stripped)
@@ -883,7 +1049,10 @@ function validateConversation(messages: KiroHistoryMessage[]): string[] {
       errors.push(`TOOL_USES_AND_RESULTS:index=${i + 1}`)
       break
     }
-    if (isAssistantResponseMessage(message) && !hasToolUses(message) && isUserInputMessage(nextMessage) && hasToolResults(nextMessage)) {
+    const nextIsFinalStatefulToolResult = i + 1 === messages.length - 1
+      && isUserInputMessage(nextMessage)
+      && hasToolResults(nextMessage)
+    if (isAssistantResponseMessage(message) && !hasToolUses(message) && isUserInputMessage(nextMessage) && hasToolResults(nextMessage) && !nextIsFinalStatefulToolResult) {
       errors.push(`TOOL_RESULTS_AND_NO_USES:index=${i}`)
       break
     }
@@ -951,8 +1120,58 @@ function formatToolResults(toolResults: KiroToolResult[]): string {
   ].filter(Boolean).join('\n')).join('\n\n')
 }
 
+function getCurrentPayloadTools(payload: KiroPayload): KiroToolWrapper[] {
+  return payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools ?? []
+}
+
+function repairPayloadConversation(payload: KiroPayload, tools: KiroToolWrapper[] = getCurrentPayloadTools(payload)): void {
+  const allMessages = [
+    ...(payload.conversationState.history ?? []),
+    payload.conversationState.currentMessage
+  ]
+  const repaired = sanitizeConversation(normalizeToolHistory(allMessages, tools))
+  const currentMessage = repaired.at(-1)
+  if (!currentMessage?.userInputMessage) {
+    throw new Error('Invalid Kiro conversation after repair: missing current user message')
+  }
+  payload.conversationState.history = repaired.length > 1 ? repaired.slice(0, -1) : undefined
+  payload.conversationState.currentMessage = {
+    userInputMessage: currentMessage.userInputMessage
+  }
+}
+
 function normalizeToolHistory(messages: KiroHistoryMessage[], tools: KiroToolWrapper[]): KiroHistoryMessage[] {
   const toolNames = getToolNames(tools)
+  const hasStructuredToolBlocks = messages.some(message => (
+    !!message.assistantResponseMessage?.toolUses?.length ||
+    !!message.userInputMessage?.userInputMessageContext?.toolResults?.length
+  ))
+  if (toolNames.size === 0 && hasStructuredToolBlocks) {
+    return messages.map(message => {
+      if (message.assistantResponseMessage?.toolUses?.length) {
+        return {
+          assistantResponseMessage: {
+            ...message.assistantResponseMessage,
+            content: flattenContent(message.assistantResponseMessage.content, formatToolUses(message.assistantResponseMessage.toolUses)),
+            toolUses: undefined
+          }
+        }
+      }
+      if (message.userInputMessage?.userInputMessageContext?.toolResults?.length) {
+        return {
+          userInputMessage: {
+            ...message.userInputMessage,
+            content: flattenContent(message.userInputMessage.content, formatToolResults(message.userInputMessage.userInputMessageContext.toolResults)),
+            userInputMessageContext: {
+              ...message.userInputMessage.userInputMessageContext,
+              toolResults: undefined
+            }
+          }
+        }
+      }
+      return message
+    })
+  }
   const hasUnknownToolUse = messages.some(message => (
     message.assistantResponseMessage?.toolUses?.some(toolUse => !toolNames.has(toolUse.name)) ?? false
   ))
@@ -985,6 +1204,40 @@ function normalizeToolHistory(messages: KiroHistoryMessage[], tools: KiroToolWra
 }
 
 // 清理会话消息（参考 Kiro 官方实现）
+function flattenHistoricalToolBlocksForBedrock(payload: KiroPayload): number {
+  const history = payload.conversationState.history
+  if (!history?.length) return 0
+  let flattened = 0
+  payload.conversationState.history = history.map(message => {
+    if (message.assistantResponseMessage?.toolUses?.length) {
+      flattened++
+      return {
+        assistantResponseMessage: {
+          ...message.assistantResponseMessage,
+          content: flattenContent(message.assistantResponseMessage.content, formatToolUses(message.assistantResponseMessage.toolUses)),
+          toolUses: undefined
+        }
+      }
+    }
+    if (message.userInputMessage?.userInputMessageContext?.toolResults?.length) {
+      flattened++
+      return {
+        userInputMessage: {
+          ...message.userInputMessage,
+          content: flattenContent(message.userInputMessage.content, formatToolResults(message.userInputMessage.userInputMessageContext.toolResults)),
+          userInputMessageContext: {
+            ...message.userInputMessage.userInputMessageContext,
+            toolResults: undefined
+          }
+        }
+      }
+    }
+    return message
+  })
+  repairPayloadConversation(payload)
+  return flattened
+}
+
 function sanitizeConversation(messages: KiroHistoryMessage[]): KiroHistoryMessage[] {
   let sanitized = [...messages]
   sanitized = ensureStartsWithUserMessage(sanitized)
@@ -1197,7 +1450,8 @@ export function buildKiroPayload(
   // 用户可在高级设置中调整限制值（默认 1536KB = 1.5MB）
   const payloadCompactResult = compactPayloadForKiroLimits(payload, {
     mode: 'normal',
-    payloadSizeLimitBytes: getPayloadSizeLimitBytes()
+    payloadSizeLimitBytes: getPayloadSizeLimitBytes(),
+    tools
   })
   let initialPayloadSize = payloadCompactResult.finalSize
   if (payloadCompactResult.changed) {
@@ -1272,24 +1526,47 @@ export function clearAllCaches(): { conversation: number; model: number } {
 // machineId 稳定生成缓存（用于无绑定 machineId 且 K-Proxy 不可用时的兆底）
 const fallbackMachineIds = new Map<string, string>()
 
-function generateStableMachineId(accountId: string): string {
-  const cached = fallbackMachineIds.get(accountId)
-  if (cached) return cached
+// The real Kiro IDE (and Kiro-Go) send a UUID v4 machineId. AWS fingerprints the
+// client from it: a value that is NOT UUID-shaped (e.g. a 64-char sha256, which
+// older Krouter builds generated as a fallback and persisted onto accounts) makes
+// the request look unlike Kiro IDE and triggers 429 "suspicious activity". Kiro-Go
+// proves AWS does not require a REAL device id — a randomly generated UUID works —
+// so we only need to guarantee the correct SHAPE. Coerce any non-UUID machineId to
+// a stable UUID v4 derived deterministically from the seed (so it never changes
+// across restarts and stays bound to the same account).
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+function deriveStableUuid(seed: string): string {
   const crypto = require('crypto')
-  const hash = crypto.createHash('sha256').update(`kiro-device-${accountId}`).digest('hex')
-  fallbackMachineIds.set(accountId, hash)
-  return hash
+  const bytes: Buffer = crypto.createHash('sha256').update(seed).digest()
+  bytes[6] = (bytes[6] & 0x0f) | 0x40 // version 4
+  bytes[8] = (bytes[8] & 0x3f) | 0x80 // variant
+  const hex = bytes.toString('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
 }
 
-// 获取账号绑定的 Machine ID（保证永远不为空）
+// Return the machineId Kiro IDE would send: keep it only if already a valid UUID v4,
+// otherwise derive a stable UUID from it (or the accountId). Never returns a sha256.
+function normalizeMachineId(accountId: string, machineId?: string): string {
+  const trimmed = machineId?.trim()
+  if (trimmed && UUID_V4_RE.test(trimmed)) return trimmed
+  const cacheKey = trimmed || accountId
+  const cached = fallbackMachineIds.get(cacheKey)
+  if (cached) return cached
+  const uuid = deriveStableUuid(trimmed ? `machine:${trimmed}` : `kiro-device-${accountId}`)
+  fallbackMachineIds.set(cacheKey, uuid)
+  return uuid
+}
+
+// 获取账号绑定的 Machine ID（保证永远不为空且为 UUID v4 格式）
 function getAccountMachineId(accountId: string, accountMachineId?: string): string {
-  if (accountMachineId) return accountMachineId
+  if (accountMachineId) return normalizeMachineId(accountId, accountMachineId)
   const kproxyService = getKProxyService()
   if (kproxyService) {
     const deviceId = kproxyService.getDeviceIdForAccount(accountId)
-    if (deviceId) return deviceId
+    if (deviceId) return normalizeMachineId(accountId, deviceId)
   }
-  return generateStableMachineId(accountId)
+  return normalizeMachineId(accountId)
 }
 
 // 获取认证方式对应的请求头
@@ -1304,9 +1581,14 @@ function getAuthHeaders(
   // identity for Builder ID, social, and enterprise requests alike.
   const headers: Record<string, string> = {
     'content-type': 'application/json',
+    // Accept + optout match the exact header set the official Kiro IDE (and Kiro-Go)
+    // send on every streaming call. Their absence here was one of the few concrete
+    // request-shape differences from Kiro-Go (which runs fine on the same account/IP).
+    'Accept': '*/*',
     'x-amzn-kiro-agent-mode': agentMode,
     'x-amz-user-agent': getKiroAmzUserAgent(machineId),
     'user-agent': getKiroUserAgent(machineId),
+    'x-amzn-codewhisperer-optout': 'true',
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=3',
     'Authorization': `Bearer ${getProxyBearerToken(account)}`
@@ -1317,13 +1599,21 @@ function getAuthHeaders(
 
 // 获取排序后的端点列表（根据首选端点配置）
 function getSortedEndpoints(preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'): typeof KIRO_ENDPOINTS {
-  if (!preferredEndpoint) return KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI')
-  
+  // Default: ONLY the "Kiro IDE" endpoint (q.us-east-1, no X-Amz-Target), no
+  // fallback cascade. Previously an unset preference tried all three endpoints in
+  // sequence, so ONE client request hammered AWS three times (Kiro IDE →
+  // CodeWhisperer → AmazonQ) against the SAME account. When that account is the
+  // sole opus-capable one, three hits per request is exactly what makes AWS flag
+  // "suspicious activity" (429 USER_REQUEST_RATE_EXCEEDED). Kiro-Go runs with
+  // preferredEndpoint=kiro + endpointFallback=false (single endpoint) and never
+  // gets throttled this way, so we mirror that: one request → one upstream call.
+  if (!preferredEndpoint) return KIRO_ENDPOINTS.filter(ep => ep.name === 'Kiro IDE')
+
   // AmazonQ CLI 模式：只用这一个端点，失败不回退
   if (preferredEndpoint === 'amazonq-cli') {
     return KIRO_ENDPOINTS.filter(ep => ep.name === 'AmazonQCLI')
   }
-  
+
   const preferredName = preferredEndpoint === 'codewhisperer' ? 'CodeWhisperer' : 'AmazonQ'
   
   const sorted = KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI')
@@ -1394,7 +1684,15 @@ export async function callKiroApiStream(
   signal?: AbortSignal,
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
 ): Promise<void> {
-  const endpoints = getSortedEndpoints(preferredEndpoint)
+  const sortedEndpoints = getSortedEndpoints(preferredEndpoint)
+  // 服务区域优先取 profile 区域（profileArn 内嵌），而非 SSO 区域；二者可能不同。
+  const svcRegion = resolveKiroServiceRegion(account)
+  // 区域感知端点过滤：codewhisperer.{region} 仅存在于 us-east-1（EU/其他区域没有该 host，
+  // 会 DNS/fetch failed）。对 non-us-east-1 账号跳过 CodeWhisperer，仅用 q.{region}（AmazonQ）。
+  // us-east-1（默认/未知）账号保持原有端点集不变。
+  const endpoints = mapKiroServiceRegion(svcRegion) === 'us-east-1'
+    ? sortedEndpoints
+    : sortedEndpoints.filter(ep => ep.name !== 'CodeWhisperer')
   let lastError: Error | null = null
 
   for (const endpoint of endpoints) {
@@ -1440,11 +1738,13 @@ export async function callKiroApiStream(
       console.log(`[KiroAPI]   - Agent mode: ${headers['x-amzn-kiro-agent-mode']}`)
       console.log(`[KiroAPI]   - Payload size: ${payloadStr.length} bytes`)
       
+      // 区域感知：EU 账号的 token/profileArn 绑定 eu-central-1，需将硬编码的
+      // us-east-1 端点重写到对应区域；us-east-1（默认）账号 URL 保持不变。
+      const endpointUrl = regionalizeKiroEndpointUrl(endpoint.url, svcRegion)
       const agent = getNetworkAgent(account)
-      if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
-      const sendRequest = async (): Promise<Response> => agent
-        ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
-        : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
+      if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name} (${endpointUrl})`)
+      const sendRequest = async (): Promise<Response> =>
+        await undiciFetch(endpointUrl, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent ?? getDirectDispatcher() } as UndiciRequestInit) as unknown as Response
 
       const retryWithCompactedPayload = async (status: number, body: string): Promise<Response> => {
         const compactResult = compactPayloadForKiroLimits(requestPayload, {
@@ -1460,12 +1760,29 @@ export async function callKiroApiStream(
         return await sendRequest()
       }
 
+      const retryWithTextifiedToolHistory = async (status: number, body: string): Promise<Response> => {
+        const flattened = flattenHistoricalToolBlocksForBedrock(requestPayload)
+        if (flattened <= 0) {
+          throw new Error(`API error ${status}: ${body}`)
+        }
+        const compactResult = compactPayloadForKiroLimits(requestPayload, {
+          mode: 'retry',
+          payloadSizeLimitBytes: Math.min(getPayloadSizeLimitBytes(), 768 * 1024)
+        })
+        payloadStr = JSON.stringify(requestPayload)
+        console.log(`[KiroAPI] Endpoint ${endpoint.name} rejected structured tool history as invalid JSON, retrying with textified history (flattened=${flattened}, text=${compactResult.textTrimmed}, toolResults=${compactResult.toolResultsTrimmed}, droppedHistory=${compactResult.historyDropped}, finalSize=${payloadStr.length} bytes)...`)
+        throwIfAborted(signal)
+        return await sendRequest()
+      }
+
       let response = await sendRequest()
       if (!response.ok && isPlaceholderProfileArn(requestPayload.profileArn)) {
         const originalStatus = response.status
         const originalBody = await response.text().catch(() => '')
         if (isContentLengthThresholdError(originalStatus, originalBody)) {
           response = await retryWithCompactedPayload(originalStatus, originalBody)
+        } else if (isRequestBodyInvalidJsonError(originalStatus, originalBody)) {
+          response = await retryWithTextifiedToolHistory(originalStatus, originalBody)
         } else {
           if (!shouldRetryWithoutPlaceholderProfileArn(originalStatus, originalBody, requestPayload.profileArn)) {
             throwIfAborted(signal)
@@ -1489,17 +1806,15 @@ export async function callKiroApiStream(
       }
 
       if (response.status === 429) {
-        const retryDelayMs = parseRetryAfterMs(response.headers) ?? 5000
-        const firstBody = await response.text().catch(() => '')
-        console.log(`[KiroAPI] Endpoint ${endpoint.name} rate limited, retrying once after ${retryDelayMs}ms...`)
-        await waitForRetry(retryDelayMs, signal)
-        response = await sendRequest()
-        if (response.status === 429) {
-          const body = await response.text().catch(() => firstBody)
-          console.log(`[KiroAPI] Endpoint ${endpoint.name} rate limited, trying next...`)
-          lastError = new Error(`Endpoint rate limited on ${endpoint.name} (429)${body ? `: ${body}` : ''}`)
-          continue
-        }
+        // Fail-fast on 429: do NOT wait-then-retry the SAME endpoint/account. AWS
+        // returns 429 USER_REQUEST_RATE_EXCEEDED as "suspicious activity"; hammering
+        // the same account it just warned makes the flag worse. Surface the error so
+        // the account-level failover (proxyServer) rotates to a different account and
+        // cools this one down — mirroring Kiro-Go's behavior.
+        const body = await response.text().catch(() => '')
+        console.log(`[KiroAPI] Endpoint ${endpoint.name} rate limited (429), trying next...`)
+        lastError = new Error(`Endpoint rate limited on ${endpoint.name} (429)${body ? `: ${body}` : ''}`)
+        continue
       }
 
       if (response.status === 401 || response.status === 403) {
@@ -1517,7 +1832,37 @@ export async function callKiroApiStream(
           response = await retryWithCompactedPayload(response.status, body)
           if (response.ok) {
             const inputChars = payloadStr.length
-            await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr)
+            await parseEventStream(
+              response.body!,
+              onChunk,
+              onComplete,
+              onError,
+              inputChars,
+              signal,
+              requestedModelId,
+              payloadStr,
+              getToolInputContracts(requestPayload)
+            )
+            return
+          }
+          const retryBody = await response.text().catch(() => body)
+          throw new Error(`API error ${response.status}: ${retryBody}`)
+        }
+        if (isRequestBodyInvalidJsonError(response.status, body)) {
+          response = await retryWithTextifiedToolHistory(response.status, body)
+          if (response.ok) {
+            const inputChars = payloadStr.length
+            await parseEventStream(
+              response.body!,
+              onChunk,
+              onComplete,
+              onError,
+              inputChars,
+              signal,
+              requestedModelId,
+              payloadStr,
+              getToolInputContracts(requestPayload)
+            )
             return
           }
           const retryBody = await response.text().catch(() => body)
@@ -1529,7 +1874,17 @@ export async function callKiroApiStream(
       // 解析 Event Stream
       // 传入 modelId + payloadStr 用于精确 token 计算（contextUsage 反推 + tiktoken）
       const inputChars = payloadStr.length
-      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr)
+      await parseEventStream(
+        response.body!,
+        onChunk,
+        onComplete,
+        onError,
+        inputChars,
+        signal,
+        requestedModelId,
+        payloadStr,
+        getToolInputContracts(requestPayload)
+      )
       return
     } catch (error) {
       if (signal?.aborted) {
@@ -1599,6 +1954,124 @@ interface ToolUseState {
   toolUseId: string
   name: string
   inputBuffer: string
+  inputReceived: boolean
+}
+
+type ToolInputContracts = ReadonlyMap<string, readonly string[]>
+
+export class KiroToolInputIntegrityError extends Error {
+  readonly code = 'KIRO_TOOL_INPUT_INVALID'
+  readonly toolUseId: string
+  readonly toolName: string
+  readonly reason: string
+  readonly partialInput: string
+
+  constructor(options: {
+    toolUseId: string
+    toolName: string
+    reason: string
+    partialInput?: string
+  }) {
+    super(`[KIRO_TOOL_INPUT_INVALID] Tool "${options.toolName}" (${options.toolUseId}) ${options.reason}`)
+    this.name = 'KiroToolInputIntegrityError'
+    this.toolUseId = options.toolUseId
+    this.toolName = options.toolName
+    this.reason = options.reason
+    this.partialInput = options.partialInput?.slice(0, 240) || ''
+  }
+}
+
+export function isKiroToolInputIntegrityError(error: unknown): boolean {
+  if (error instanceof KiroToolInputIntegrityError) return true
+  if (!error || typeof error !== 'object') return false
+  const candidate = error as { code?: unknown; message?: unknown }
+  return candidate.code === 'KIRO_TOOL_INPUT_INVALID'
+    || (typeof candidate.message === 'string' && candidate.message.includes('[KIRO_TOOL_INPUT_INVALID]'))
+}
+
+function isToolInputObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+export function parseKiroToolInput(
+  inputBuffer: string,
+  options: {
+    toolUseId: string
+    toolName: string
+    inputReceived?: boolean
+    requiredKeys?: readonly string[]
+  }
+): Record<string, unknown> {
+  const trimmed = inputBuffer.trim()
+  let parsed: unknown = {}
+
+  if (trimmed) {
+    try {
+      parsed = JSON.parse(trimmed)
+    } catch {
+      throw new KiroToolInputIntegrityError({
+        toolUseId: options.toolUseId,
+        toolName: options.toolName,
+        reason: 'returned malformed or truncated JSON arguments',
+        partialInput: trimmed
+      })
+    }
+  }
+
+  if (!isToolInputObject(parsed)) {
+    throw new KiroToolInputIntegrityError({
+      toolUseId: options.toolUseId,
+      toolName: options.toolName,
+      reason: 'returned non-object arguments',
+      partialInput: trimmed
+    })
+  }
+
+  const missingKeys = (options.requiredKeys ?? []).filter(key => (
+    !(key in parsed) || parsed[key] === undefined || parsed[key] === null
+  ))
+  if (missingKeys.length > 0) {
+    const received = options.inputReceived || trimmed
+      ? 'arguments missing required fields'
+      : 'no arguments for a tool with required fields'
+    throw new KiroToolInputIntegrityError({
+      toolUseId: options.toolUseId,
+      toolName: options.toolName,
+      reason: `${received}: ${missingKeys.join(', ')}`,
+      partialInput: trimmed
+    })
+  }
+
+  return parsed
+}
+
+function getToolInputContracts(payload: KiroPayload): ToolInputContracts {
+  const contracts = new Map<string, readonly string[]>()
+  for (const wrapper of getCurrentPayloadTools(payload)) {
+    if (!('toolSpecification' in wrapper)) continue
+    const schema = wrapper.toolSpecification.inputSchema?.json
+    const required = isToolInputObject(schema) && Array.isArray(schema.required)
+      ? schema.required.filter((key): key is string => typeof key === 'string' && key.length > 0)
+      : []
+    contracts.set(wrapper.toolSpecification.name, required)
+  }
+  return contracts
+}
+
+function finalizeToolUse(
+  state: ToolUseState,
+  contracts: ToolInputContracts
+): KiroToolUse {
+  return {
+    toolUseId: state.toolUseId,
+    name: state.name,
+    input: parseKiroToolInput(state.inputBuffer, {
+      toolUseId: state.toolUseId,
+      toolName: state.name,
+      inputReceived: state.inputReceived,
+      requiredKeys: contracts.get(state.name)
+    })
+  }
 }
 
 // Token 估算（被 promptCacheTracker 等模块使用，用于 cache 块大小判定）
@@ -1616,7 +2089,8 @@ async function parseEventStream(
   inputChars: number = 0,  // 输入字符长度（兜底估算用）
   signal?: AbortSignal,
   modelId?: string,        // 模型 ID，用于 contextUsagePercentage 反推 inputTokens
-  payloadStr?: string      // 请求 payload JSON 字符串，用于 tiktoken 精确计算
+  payloadStr?: string,     // 请求 payload JSON 字符串，用于 tiktoken 精确计算
+  toolInputContracts: ToolInputContracts = new Map()
 ): Promise<void> {
   const reader = body.getReader()
   const abort = () => {
@@ -1656,17 +2130,40 @@ async function parseEventStream(
   let currentToolUse: ToolUseState | null = null
   const processedIds = new Set<string>()
 
+  // 流读取超时：首字节用较长窗口（容忍思考延迟），之后每块用空闲窗口。
+  // 超时则 cancel reader 并抛错，交由上层 onError → callStreamWithFailover 处理
+  // （未 flush 给客户端则换号重来）。0 = 关闭对应超时。
+  let firstChunkSeen = false
+  const readWithTimeout = async (): Promise<Awaited<ReturnType<typeof reader.read>>> => {
+    const limitMs = firstChunkSeen ? streamIdleTimeoutMs : streamFirstByteTimeoutMs
+    if (!limitMs || limitMs <= 0) return reader.read()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const kind = firstChunkSeen ? 'idle' : 'first-byte'
+        abort()
+        reject(new Error(`Stream ${kind} timeout after ${limitMs}ms`))
+      }, limitMs)
+    })
+    try {
+      return await Promise.race([reader.read(), timeoutPromise])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
   try {
     throwIfAborted(signal)
     signal?.addEventListener('abort', abort, { once: true })
     while (true) {
       throwIfAborted(signal)
-      const { done, value } = await reader.read()
+      const { done, value } = await readWithTimeout()
       throwIfAborted(signal)
-      
+
       if (done) {
         break
       }
+      firstChunkSeen = true
 
       // 合并缓冲区
       const newBuffer = new Uint8Array(buffer.length + value.length)
@@ -1754,17 +2251,7 @@ async function parseEventStream(
                 if (currentToolUse && currentToolUse.toolUseId !== toolUseId) {
                   // 前一个 tool use 被中断，完成它
                   if (!processedIds.has(currentToolUse.toolUseId)) {
-                    let finalInput: Record<string, unknown> = {}
-                    try {
-                      if (currentToolUse.inputBuffer) {
-                        finalInput = JSON.parse(currentToolUse.inputBuffer)
-                      }
-                    } catch { /* 忽略解析错误 */ }
-                    onChunk('', {
-                      toolUseId: currentToolUse.toolUseId,
-                      name: currentToolUse.name,
-                      input: finalInput
-                    })
+                    onChunk('', finalizeToolUse(currentToolUse, toolInputContracts))
                     totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
                     processedIds.add(currentToolUse.toolUseId)
                   }
@@ -1778,56 +2265,36 @@ async function parseEventStream(
                     currentToolUse = {
                       toolUseId,
                       name: toolName,
-                      inputBuffer: ''
+                      inputBuffer: '',
+                      inputReceived: false
                     }
                   }
                 }
               }
               
               // 累积输入片段
-              if (currentToolUse && inputFragment) {
+              if (currentToolUse && typeof toolUseData.input === 'string') {
+                currentToolUse.inputReceived = true
                 currentToolUse.inputBuffer += inputFragment
               }
               
               // 如果直接提供了完整输入对象
               if (currentToolUse && inputObj) {
+                currentToolUse.inputReceived = true
                 currentToolUse.inputBuffer = JSON.stringify(inputObj)
               }
               
               // Tool use 完成
               if (isStop && currentToolUse) {
-                let finalInput: Record<string, unknown> = {}
-                let parseError = false
-                try {
-                  if (currentToolUse.inputBuffer) {
-                    if (logStreamEvents) proxyLogger.debug('Kiro', 'Tool input buffer: ' + currentToolUse.inputBuffer.substring(0, 200))
-                    finalInput = JSON.parse(currentToolUse.inputBuffer)
-                    if (logStreamEvents) proxyLogger.debug('Kiro', 'Parsed tool input: ' + JSON.stringify(finalInput).substring(0, 200))
-                  }
-                } catch (e) {
-                  parseError = true
-                  console.error('[Kiro] Failed to parse tool input:', e, 'Buffer:', currentToolUse.inputBuffer?.substring(0, 100))
-                  // 当 JSON 解析失败时，创建一个包含错误信息的 input
-                  // 这样客户端可以看到工具调用失败的原因
-                  finalInput = {
-                    _error: 'Tool input truncated by Kiro API (output token limit exceeded)',
-                    _partialInput: currentToolUse.inputBuffer?.substring(0, 500) || ''
-                  }
+                if (logStreamEvents && currentToolUse.inputBuffer) {
+                  proxyLogger.debug('Kiro', 'Tool input buffer: ' + currentToolUse.inputBuffer.substring(0, 200))
                 }
-                
-                // 只有在成功解析或有错误信息时才发送
-                onChunk('', {
-                  toolUseId: currentToolUse.toolUseId,
-                  name: currentToolUse.name,
-                  input: finalInput
-                })
+                const finalizedToolUse = finalizeToolUse(currentToolUse, toolInputContracts)
+                if (logStreamEvents) {
+                  proxyLogger.debug('Kiro', 'Parsed tool input: ' + JSON.stringify(finalizedToolUse.input).substring(0, 200))
+                }
+                onChunk('', finalizedToolUse)
                 totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
-                
-                // 如果解析失败，额外发送一条文本消息告知用户
-                if (parseError) {
-                  onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API. The output may be incomplete due to token limits.`)
-                }
-                
                 processedIds.add(currentToolUse.toolUseId)
                 currentToolUse = null
               }
@@ -2080,17 +2547,7 @@ async function parseEventStream(
     
     // 完成任何未完成的 tool use
     if (currentToolUse && !processedIds.has(currentToolUse.toolUseId)) {
-      let finalInput: Record<string, unknown> = {}
-      try {
-        if (currentToolUse.inputBuffer) {
-          finalInput = JSON.parse(currentToolUse.inputBuffer)
-        }
-      } catch { /* 忽略解析错误 */ }
-      onChunk('', {
-        toolUseId: currentToolUse.toolUseId,
-        name: currentToolUse.name,
-        input: finalInput
-      })
+      onChunk('', finalizeToolUse(currentToolUse, toolInputContracts))
       totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
     }
     
@@ -2200,14 +2657,14 @@ export interface KiroModel {
 }
 
 // 根据账号区域获取 Q Service 端点（官方插件使用 q.{region}.amazonaws.com）
+// 复用 mapKiroServiceRegion 作为唯一区域映射来源，外部行为保持不变。
 function getQServiceEndpoint(region?: string): string {
-  if (region?.startsWith('eu-')) return 'https://q.eu-central-1.amazonaws.com'
-  return 'https://q.us-east-1.amazonaws.com'
+  return 'https://q.' + mapKiroServiceRegion(region) + '.amazonaws.com'
 }
 
 // 获取 Kiro 官方模型列表（支持分页，与官方插件一致传递 profileArn）
 export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(resolveKiroServiceRegion(account))
   const machineId = getAccountMachineId(account.id, account.machineId)
   
   const headers: Record<string, string> = {
@@ -2290,7 +2747,7 @@ function getSubscriptionAmzUserAgent(machineId?: string): string {
 
 // 获取可用订阅列表
 export async function fetchAvailableSubscriptions(account: ProxyAccount): Promise<SubscriptionListResponse> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(resolveKiroServiceRegion(account))
   const url = `${baseUrl}/listAvailableSubscriptions`
   const machineId = getAccountMachineId(account.id, account.machineId)
   
@@ -2341,7 +2798,7 @@ export async function fetchSubscriptionToken(
   account: ProxyAccount,
   subscriptionType?: string
 ): Promise<SubscriptionTokenResponse> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(resolveKiroServiceRegion(account))
   const url = `${baseUrl}/CreateSubscriptionToken`
   const machineId = getAccountMachineId(account.id, account.machineId)
   
@@ -2391,7 +2848,7 @@ export async function setUserPreference(
   account: ProxyAccount,
   overageStatus: 'ENABLED' | 'DISABLED'
 ): Promise<{ success: boolean; error?: string }> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(resolveKiroServiceRegion(account))
   const url = `${baseUrl}/setUserPreference`
   const machineId = getAccountMachineId(account.id, account.machineId)
 

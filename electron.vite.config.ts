@@ -11,6 +11,9 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()]
   },
   renderer: {
+    define: {
+      'import.meta.env.VITE_API_BASE_URL': JSON.stringify('http://localhost:4011')
+    },
     resolve: {
       alias: {
         '@renderer': resolve('src/renderer/src'),

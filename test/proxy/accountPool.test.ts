@@ -471,3 +471,48 @@ describe('AccountPool — getQuotaStatus bounds (Property 15)', () => {
     )
   })
 })
+
+describe('getNextAccountFromCandidates (tier-grouped selection)', () => {
+  function poolWith(ids: string[]): AccountPool {
+    const pool = new AccountPool()
+    for (const id of ids) pool.addAccount({ id, accessToken: 'tok' })
+    return pool
+  }
+
+  it('only ever returns an account inside the candidate set', () => {
+    const pool = poolWith(['a', 'b', 'c', 'd'])
+    const candidates = new Set(['b', 'd'])
+    for (let i = 0; i < 20; i++) {
+      const picked = pool.getNextAccountFromCandidates(candidates)
+      expect(picked).not.toBeNull()
+      expect(candidates.has(picked!.id)).toBe(true)
+    }
+  })
+
+  it('respects excludeIds and empty candidate set', () => {
+    const pool = poolWith(['a', 'b', 'c'])
+    expect(pool.getNextAccountFromCandidates(new Set())).toBeNull()
+    const picked = pool.getNextAccountFromCandidates(new Set(['a', 'b']), new Set(['a']))
+    expect(picked?.id).toBe('b')
+  })
+
+  it('round-robin distributes across the candidate subset (cursor not thrashed)', () => {
+    // Regression for bug #5: selecting from a candidate subset must advance the
+    // global cursor by exactly one per successful pick, so repeated picks rotate.
+    const pool = poolWith(['a', 'b', 'c', 'd'])
+    pool.setStrategy('round-robin')
+    const candidates = new Set(['a', 'b', 'c', 'd'])
+    const seen: string[] = []
+    for (let i = 0; i < 4; i++) {
+      seen.push(pool.getNextAccountFromCandidates(candidates)!.id)
+    }
+    expect(new Set(seen).size).toBe(4)
+  })
+
+  it('skips unavailable (suspended) accounts within the candidate set', () => {
+    const pool = poolWith(['a', 'b'])
+    pool.markSuspended('a', 'TEMPORARILY_SUSPENDED')
+    const picked = pool.getNextAccountFromCandidates(new Set(['a', 'b']))
+    expect(picked?.id).toBe('b')
+  })
+})

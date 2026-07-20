@@ -1,7 +1,16 @@
 import { useState, useEffect } from 'react'
-import { X, RefreshCw, Loader2, Cpu, FileText, Image, Hash, Sparkles, Zap, Shuffle, Brain, Database, AlertTriangle, Globe } from 'lucide-react'
+import { X, RefreshCw, Loader2, Cpu, FileText, Image, Hash, Sparkles, Zap, Shuffle, Brain, Database, AlertTriangle, Globe, Crown } from 'lucide-react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Badge } from '../ui'
 import { cn } from '@/lib/utils'
+
+interface ModelProbeEntry {
+  modelId: string
+  tier: string
+  ok: boolean
+  error?: string
+  latencyMs?: number
+  checkedAt: number
+}
 
 interface ModelInfo {
   id: string
@@ -16,6 +25,12 @@ interface ModelInfo {
   thinkingEfforts?: string[]
   supportsPromptCaching?: boolean
   modelProvider?: string
+  tier?: 'premium' | 'standard'
+  availableInPool?: boolean
+  servableTiers?: string[]
+  availableForPool?: boolean
+  probedOk?: boolean
+  probeResults?: ModelProbeEntry[]
 }
 
 interface ModelsDialogProps {
@@ -37,6 +52,10 @@ export function ModelsDialog({
   const [loading, setLoading] = useState(false)
   const [fromCache, setFromCache] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Live model probe ("Test thật")
+  const [probing, setProbing] = useState(false)
+  const [probeProgress, setProbeProgress] = useState<{ done: number; total: number } | null>(null)
+  const [onlyWorking, setOnlyWorking] = useState(false)
   // IP 限制提示是否显示 (用户点击关闭后持久化)
   const [showIpTip, setShowIpTip] = useState(() => {
     return localStorage.getItem('models_dialog_ip_tip_dismissed') !== '1'
@@ -65,13 +84,50 @@ export function ModelsDialog({
     }
   }
 
+  const runProbe = async () => {
+    setProbing(true)
+    setProbeProgress({ done: 0, total: 0 })
+    setError(null)
+    try {
+      const result = await window.api.proxyProbeModels({ concurrency: 3 })
+      if (!result.success) {
+        setError(result.error || 'Failed to probe models')
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unknown error')
+    } finally {
+      setProbing(false)
+      setProbeProgress(null)
+      // Reload models to pick up freshly cached probe annotations.
+      fetchModels()
+    }
+  }
+
   useEffect(() => {
     if (open) {
       fetchModels()
     }
   }, [open])
 
+  useEffect(() => {
+    if (!open) return
+    const offProgress = window.api.onModelProbeProgress?.((data) => {
+      setProbeProgress({ done: data.done, total: data.total })
+    })
+    const offComplete = window.api.onModelProbeComplete?.(() => {
+      setProbeProgress(null)
+    })
+    return () => {
+      offProgress?.()
+      offComplete?.()
+    }
+  }, [open])
+
   if (!open) return null
+
+  const displayModels = onlyWorking
+    ? models.filter((m) => m.probedOk !== false)
+    : models
 
   const formatTokens = (tokens: number | null | undefined) => {
     if (tokens === null || tokens === undefined) return '-'
@@ -81,9 +137,9 @@ export function ModelsDialog({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4">
       <div className="absolute inset-0 bg-black/50" onClick={() => onOpenChange(false)} />
-      <Card className="relative w-[850px] max-h-[85vh] shadow-2xl border-0 overflow-hidden animate-in fade-in zoom-in-95 duration-200 glass-card-strong">
+      <Card className="relative w-full sm:w-[850px] max-w-[95vw] max-h-[90vh] sm:max-h-[85vh] shadow-2xl border-0 overflow-hidden animate-in fade-in zoom-in-95 duration-200 glass-card-strong">
         <CardHeader className="pb-4 border-b sticky top-0 z-10">
           <div className="flex items-center justify-between">
             <CardTitle className="text-xl flex items-center gap-3">
@@ -94,8 +150,21 @@ export function ModelsDialog({
                 <span className="font-bold">{isEn ? 'Available Models' : '可用模型'}</span>
                 <div className="flex items-center gap-2 mt-1">
                   <Badge className="bg-primary/10 text-primary border-primary/20 font-semibold">
-                    {models.length} {isEn ? 'models' : '个模型'}
+                    {displayModels.length}{onlyWorking && displayModels.length !== models.length ? `/${models.length}` : ''} {isEn ? 'models' : '个模型'}
                   </Badge>
+                  <button
+                    type="button"
+                    onClick={() => setOnlyWorking((v) => !v)}
+                    className={cn(
+                      'text-[11px] px-2 h-5 rounded-full border transition-colors',
+                      onlyWorking
+                        ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30'
+                        : 'bg-muted text-muted-foreground border-transparent hover:border-border'
+                    )}
+                    title={isEn ? 'Show only models confirmed working by live test' : 'Chỉ hiện model đã test thật chạy được'}
+                  >
+                    {isEn ? 'Working only' : 'Chỉ model chạy được'}
+                  </button>
                   {fromCache && (
                     <Badge variant="secondary" className="text-xs bg-warning/10 text-warning border-0">
                       <Sparkles className="h-3 w-3 mr-1" />
@@ -122,9 +191,28 @@ export function ModelsDialog({
                   )}
                 </Button>
               )}
-              <Button 
-                variant="outline" 
-                size="sm" 
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={runProbe}
+                disabled={loading || probing}
+                className="rounded-lg"
+                title={isEn ? 'Send a minimal ping to each model per tier to confirm what actually works' : 'Gửi ping tối thiểu tới từng model theo tier để xác nhận model nào chạy thật'}
+              >
+                {probing ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Zap className="h-4 w-4" />
+                )}
+                <span className="ml-1.5">
+                  {probing && probeProgress && probeProgress.total > 0
+                    ? `${probeProgress.done}/${probeProgress.total}`
+                    : isEn ? 'Test live' : 'Test thật'}
+                </span>
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
                 onClick={fetchModels}
                 disabled={loading}
                 className="rounded-lg"
@@ -180,7 +268,7 @@ export function ModelsDialog({
               </div>
             </div>
           )}
-          <div className="max-h-[calc(85vh-140px)] overflow-y-auto pr-2">
+          <div className="max-h-[calc(90vh-140px)] sm:max-h-[calc(85vh-140px)] overflow-y-auto pr-2">
             {loading && models.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
                 <div className="p-4 rounded-full bg-primary/10 mb-4">
@@ -204,13 +292,14 @@ export function ModelsDialog({
                 <p className="font-medium">{isEn ? 'No models available' : '暂无可用模型'}</p>
               </div>
             ) : (
-              <div className="grid grid-cols-2 gap-3">
-                {models.map((model, index) => (
-                  <div 
-                    key={model.id} 
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {displayModels.map((model, index) => (
+                  <div
+                    key={model.id}
                     className={cn(
                       "group p-3 rounded-xl border hover:shadow-md hover:border-primary/30 transition-all duration-200",
-                      index === 0 ? "border-primary/40 bg-primary/10" : "bg-background"
+                      index === 0 ? "border-primary/40 bg-primary/10" : "bg-background",
+                      model.tier === 'premium' && model.availableInPool === false && "opacity-50"
                     )}
                   >
                     <div className="flex items-start gap-2 mb-2">
@@ -219,7 +308,38 @@ export function ModelsDialog({
                         index === 0 ? "bg-primary" : "bg-muted-foreground/30"
                       )} />
                       <div className="flex-1 min-w-0">
-                        <code className="text-sm font-bold text-foreground">{model.id}</code>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <code className="text-sm font-bold text-foreground">{model.id}</code>
+                          {model.tier === 'premium' && (
+                            <Badge variant="secondary" className="text-[10px] px-1.5 h-4 bg-amber-500/15 text-amber-600 dark:text-amber-400 border-0" title={isEn ? 'Premium — served by Pro/Paid accounts' : 'Cao cấp — phục vụ bởi tài khoản Pro/Paid'}>
+                              <Crown className="h-2.5 w-2.5 mr-0.5" />
+                              {isEn ? 'Premium' : 'Cao cấp'}
+                            </Badge>
+                          )}
+                          {model.tier === 'premium' && model.availableInPool === false && (
+                            <Badge variant="secondary" className="text-[10px] px-1.5 h-4 bg-muted text-muted-foreground border-0" title={isEn ? 'No account in the pool currently serves this model' : 'Chưa có tài khoản nào trong pool phục vụ model này'}>
+                              {isEn ? 'No account' : 'Không có tài khoản'}
+                            </Badge>
+                          )}
+                          {/* Live-probe result badges per tier ("Test thật") */}
+                          {model.probeResults?.map((p) => (
+                            <Badge
+                              key={p.tier}
+                              variant="secondary"
+                              className={cn(
+                                'text-[10px] px-1.5 h-4 border-0',
+                                p.ok
+                                  ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                                  : 'bg-red-500/15 text-red-600 dark:text-red-400'
+                              )}
+                              title={p.ok
+                                ? `${p.tier}: ${isEn ? 'works' : 'chạy được'}${p.latencyMs ? ` (${p.latencyMs}ms)` : ''}`
+                                : `${p.tier}: ${p.error || (isEn ? 'failed' : 'lỗi')}`}
+                            >
+                              {p.ok ? '✓' : '✗'} {p.tier}
+                            </Badge>
+                          ))}
+                        </div>
                         {model.name && model.name !== model.id && (
                           <p className="text-[11px] text-primary/70 font-medium truncate">{model.name}</p>
                         )}

@@ -380,6 +380,8 @@ export interface ProxyAccount {
   region?: string
   authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp' | 'api_key' | 'apikey'
   provider?: string
+  /** Kiro subscription tier: 'Free' | 'Pro' | 'Pro_Plus' | 'Enterprise' | 'Teams'. Used for tier-based Bedrock routing. */
+  subscriptionType?: string
   profileArn?: string
   expiresAt?: number
   machineId?: string  // 账户绑定的设备 ID（64位十六进制）
@@ -407,6 +409,31 @@ export interface ProxyAccount {
   suspendedAt?: number       // 封禁时间戳
   suspendReason?: string     // 封禁原因 (如 'TEMPORARILY_SUSPENDED')
   suspendMessage?: string    // 封禁完整错误消息 (含联系链接)
+}
+
+// ============ Tier-based routing ============
+/** Kiro subscription tiers (2026). Paid = tất cả trừ 'free' và 'unknown'. */
+export type KiroTier = 'free' | 'pro' | 'pro_plus' | 'power' | 'enterprise' | 'teams' | 'unknown'
+
+/** Một rule trong Tier_Eligibility_Map: model nào, tier nào được phép, premium hay standard. */
+export interface TierEligibilityRule {
+  /** Khớp modelId (đã normalize). Hỗ trợ hậu tố '*' (prefix match), vd 'claude-opus-*'. */
+  modelPattern: string
+  /** Phân loại: 'premium' chỉ paid tier phục vụ; 'standard' mọi tier. */
+  class: 'premium' | 'standard'
+  /** Danh sách tier được phép phục vụ model này (dùng cho premium). */
+  allowedTiers: KiroTier[]
+}
+
+/** Kết quả live-probe một model trên một tier đại diện. */
+export interface ModelProbeResult {
+  modelId: string
+  tier: KiroTier
+  ok: boolean
+  error?: string
+  latencyMs?: number
+  accountId?: string
+  checkedAt: number
 }
 
 // API Key 格式类型
@@ -491,6 +518,25 @@ export interface ProxyConfig {
   // 重试配置
   maxRetries?: number
   retryDelayMs?: number
+  // 流式健壮性配置（防 Openclaw "聊到一半卡住"）
+  // 初始缓冲：先攒少量首帧再 flush 给客户端；只要还没 flush，中途出错就能无缝换号重来。
+  // - streamInitialBufferBytes: 缓冲字节阈值（默认 2048），达到即 flush
+  // - streamInitialBufferMs: 缓冲时间阈值（默认 150ms），超时即 flush
+  streamInitialBufferBytes?: number
+  streamInitialBufferMs?: number
+  // 流超时（0 = 关闭）：AWS 长时间不吐字节时主动 abort，避免客户端无限等待
+  // - streamFirstByteTimeoutMs: 首字节超时（默认 30000）
+  // - streamIdleTimeoutMs: 中途空闲超时（默认 60000，每收到一块即重置）
+  streamFirstByteTimeoutMs?: number
+  streamIdleTimeoutMs?: number
+  // 心跳（0 = 关闭）：等待首帧/换号期间定期发送 SSE 注释，避免中间代理/CDN 掐断空闲连接
+  streamHeartbeatIntervalMs?: number
+  // 自动 prompt cache：为 OpenAI 路径（客户端不发 cache_control，如 Openclaw）自动在
+  // 稳定前缀（tools/system/history）插入 cachePoint 标记，让 AWS Kiro 真正缓存并回传
+  // cacheRead/cacheWrite token。默认开启。
+  autoCachePoint?: boolean
+  // cachePoint 数量上限（AWS Bedrock 单请求最多 4 个）。若某模型/账号 400 可下调。默认 4。
+  autoCachePointMaxPoints?: number
   // 首选端点配置
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
   // Token 刷新提前量（秒）
@@ -564,6 +610,36 @@ export interface ProxyConfig {
    * giữ hành vi hiện tại dựa trên accountSupportsModel.
    */
   strictTierRouting?: boolean
+  /**
+   * Bật lọc account theo tier (Subscription_Tag) trước khi kiểm tra capability.
+   * - true (mặc định): pipeline chọn account phân nhóm Free → unknown → paid, model
+   *   premium chỉ xét paid; capability-cache xác nhận thật ở bước sau (hybrid).
+   * - false: dùng đúng legacy path (chỉ capability-cache), không lọc theo tag.
+   * Runtime-updatable (không nằm trong restartTriggerFields). Xem tierRouting.ts.
+   */
+  tierRoutingEnabled?: boolean
+  /**
+   * Tier_Eligibility_Map: quy tắc model → tier được phép phục vụ. Nếu không đặt,
+   * dùng DEFAULT_TIER_ELIGIBILITY_MAP trong modelCatalog.ts. Mỗi rule khớp modelId
+   * theo pattern (hỗ trợ '*' cuối), phân loại premium/standard + tier cho phép.
+   */
+  tierEligibilityMap?: TierEligibilityRule[]
+  /**
+   * User-defined custom models added from the one-click client config dialog.
+   * Persisted so they survive reopening the dialog and app restarts. These are
+   * merged into the model list the dialog shows; they are never fetched from Kiro.
+   */
+  customModels?: Array<{
+    id: string
+    name?: string
+    inputTypes?: string[]
+    maxInputTokens?: number
+    maxOutputTokens?: number
+  }>
+  /** AWS Bedrock upstream provider (SigV4). Routed in parallel to the Kiro account pool. */
+  bedrock?: import('./bedrock').BedrockConfig
+  /** Xpixi third-party API provider. Routed in parallel to Kiro and Bedrock. */
+  xpixi?: import('./xpixi').XpixiConfig
 }
 
 export interface TlsConfig {
@@ -644,6 +720,8 @@ export interface RequestLog {
   responseTime: number
   success: boolean
   error?: string
+  /** Whether tier-tag routing was active when this request's account was selected. */
+  tierRoutingActive?: boolean
 }
 
 // ============ Event Stream 解析 ============

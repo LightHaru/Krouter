@@ -29,7 +29,7 @@ export interface WebStoreData {
   auditEvents: Array<{ ts: number; userId: string; type: string; data: Record<string, unknown> }>
 }
 
-const SENSITIVE_KEY_RE = /^(accessToken|refreshToken|csrfToken|clientSecret|password|apiKey|key|token|secret)$/i
+const SENSITIVE_KEY_RE = /^(accessToken|refreshToken|csrfToken|clientSecret|password|apiKey|key|token|secret|secretAccessKey|sessionToken)$/i
 const ENCRYPTED_MARKER = '__kiroWebEncrypted'
 
 function dataDir(): string {
@@ -246,8 +246,49 @@ export class WebStore {
   }
 
   async setAccountData(userId: string, accountData: unknown): Promise<void> {
-    this.data.accountDataByUser[userId] = protect(accountData)
+    this.data.accountDataByUser[userId] = protect(this.enforceDeletionTombstones(userId, accountData))
     await this.save()
+  }
+
+  // Safety net against deleted accounts resurrecting. Multiple writers (backend
+  // auto-refresh, proxy maintenance, proxy runtime sync) each capture an in-memory
+  // snapshot of accounts, do slow async work, then write back. If a delete lands
+  // during that window, a stale write-back would re-add the just-deleted account.
+  // Rather than fix every writer, we enforce the invariant at the single disk-write
+  // boundary: union the tombstone list already on disk with the incoming one, then
+  // drop any account whose id is tombstoned. Re-added accounts always get a fresh
+  // UUID, so a tombstoned id can never legitimately reappear.
+  private enforceDeletionTombstones(userId: string, accountData: unknown): unknown {
+    if (!accountData || typeof accountData !== 'object' || Array.isArray(accountData)) return accountData
+    const incoming = accountData as Record<string, unknown>
+    const onDisk = this.data.accountDataByUser[userId]
+    const existingTombstones = onDisk && typeof onDisk === 'object' && !Array.isArray(onDisk)
+      ? (onDisk as Record<string, unknown>)._deletedAccountIds
+      : undefined
+    const tombstones = new Set<string>()
+    for (const source of [existingTombstones, incoming._deletedAccountIds]) {
+      if (Array.isArray(source)) {
+        for (const id of source) if (typeof id === 'string') tombstones.add(id)
+      }
+    }
+    if (tombstones.size === 0) return accountData
+    const accounts = incoming.accounts
+    let accountsChanged = false
+    let nextAccounts = accounts
+    if (accounts && typeof accounts === 'object' && !Array.isArray(accounts)) {
+      const filtered: Record<string, unknown> = {}
+      for (const [id, value] of Object.entries(accounts as Record<string, unknown>)) {
+        if (tombstones.has(id)) {
+          accountsChanged = true
+          continue
+        }
+        filtered[id] = value
+      }
+      nextAccounts = filtered
+    }
+    // Cap the tombstone list so it can't grow without bound across the app lifetime.
+    const merged = Array.from(tombstones).slice(-5000)
+    return { ...incoming, accounts: accountsChanged ? nextAccounts : accounts, _deletedAccountIds: merged }
   }
 
   getUserSettings(userId: string): Record<string, unknown> {

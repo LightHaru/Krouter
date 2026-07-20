@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertCircle, Bot, Check, Code2, Copy, Cpu, FileCog, KeyRound, Loader2, Settings2, Sparkles, Terminal, Workflow, X, type LucideIcon } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { AlertCircle, Bot, Check, Code2, Copy, Cpu, FileCog, KeyRound, Loader2, Plus, Settings2, Sparkles, Terminal, Workflow, X, type LucideIcon } from 'lucide-react'
 import { Badge, Button, Card, CardContent, CardHeader, CardTitle, Select } from '../ui'
 import { useAccountsStore } from '../../store/accounts'
 import { cn } from '@/lib/utils'
@@ -123,6 +123,14 @@ function chooseDefaultModelIds(items: ModelInfo[], current: string[]): string[] 
 export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDialogProps) {
   const accounts = useAccountsStore(state => state.accounts)
   const activeAccountId = useAccountsStore(state => state.activeAccountId)
+  // Keep the latest accounts/activeAccountId in refs so loadModels can read them
+  // without listing them as deps. Otherwise every background token refresh mutates
+  // the accounts Map, changes loadModels' identity, re-runs the open-effect, and
+  // rebuilds the model list — the visible "giật giật" flicker while the dialog is open.
+  const accountsRef = useRef(accounts)
+  const activeAccountIdRef = useRef(activeAccountId)
+  accountsRef.current = accounts
+  activeAccountIdRef.current = activeAccountId
   const [models, setModels] = useState<ModelInfo[]>([])
   const [selectedModelId, setSelectedModelId] = useState('')
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([])
@@ -137,6 +145,14 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
   const [, setApiKeys] = useState<ProxyApiKeyInfo[]>([])
   const [proxyKey, setProxyKey] = useState<ProxyApiKeyInfo | null>(null)
   const [keyCopied, setKeyCopied] = useState(false)
+  // User-defined models persisted in ProxyConfig.customModels. Merged into the
+  // model list so they survive dialog reopens and app restarts.
+  const [customModels, setCustomModels] = useState<ModelInfo[]>([])
+  const customModelsRef = useRef<ModelInfo[]>([])
+  customModelsRef.current = customModels
+  const [showAddModel, setShowAddModel] = useState(false)
+  const [newModelId, setNewModelId] = useState('')
+  const [newModelName, setNewModelName] = useState('')
 
   const clientOptions: ClientOption[] = useMemo(() => [
     {
@@ -200,17 +216,19 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
     try {
       const proxyModels = await window.api.proxyGetModels()
       if (proxyModels.success && proxyModels.models.length > 0) {
-        const mergedModels = mergeModelPresets(proxyModels.models)
+        const mergedModels = mergeModelPresets([...proxyModels.models, ...customModelsRef.current])
         setModels(mergedModels)
         setSelectedModelId(current => chooseDefaultModelId(mergedModels, current))
         setSelectedModelIds(current => chooseDefaultModelIds(mergedModels, current))
         return
       }
 
-      const activeAccount = activeAccountId ? accounts.get(activeAccountId) : undefined
+      const currentAccounts = accountsRef.current
+      const currentActiveId = activeAccountIdRef.current
+      const activeAccount = currentActiveId ? currentAccounts.get(currentActiveId) : undefined
       const account = activeAccount?.status === 'active' && activeAccount.credentials?.accessToken
         ? activeAccount
-        : Array.from(accounts.values()).find(item => item.status === 'active' && item.credentials?.accessToken)
+        : Array.from(currentAccounts.values()).find(item => item.status === 'active' && item.credentials?.accessToken)
 
       if (account) {
         const accountModels = await window.api.accountGetModels(
@@ -223,7 +241,7 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
           account.id
         )
         if (accountModels.success && accountModels.models.length > 0) {
-          const mergedModels = mergeModelPresets(accountModels.models as ModelInfo[])
+          const mergedModels = mergeModelPresets([...(accountModels.models as ModelInfo[]), ...customModelsRef.current])
           setModels(mergedModels)
           setSelectedModelId(current => chooseDefaultModelId(mergedModels, current))
           setSelectedModelIds(current => chooseDefaultModelIds(mergedModels, current))
@@ -231,9 +249,12 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
         }
       }
 
-      setModels([])
-      setSelectedModelId('')
-      setSelectedModelIds([])
+      // Network fetch produced nothing, but presets + any user-defined custom
+      // models should still be selectable so the dialog stays usable offline.
+      const fallbackModels = mergeModelPresets([...customModelsRef.current])
+      setModels(fallbackModels)
+      setSelectedModelId(current => chooseDefaultModelId(fallbackModels, current))
+      setSelectedModelIds(current => chooseDefaultModelIds(fallbackModels, current))
       setError(isEn ? 'No models were loaded. Please check whether the account is active and try reloading.' : 'Chưa tải được model. Hãy kiểm tra tài khoản đang active rồi tải lại.')
     } catch (err) {
       setModels([])
@@ -243,7 +264,10 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
     } finally {
       setLoadingModels(false)
     }
-  }, [accounts, activeAccountId, isEn])
+    // accounts/activeAccountId are read via refs (see accountsRef/activeAccountIdRef)
+    // so background token refreshes don't change this callback's identity and retrigger
+    // the open-effect — that was the source of the model-list flicker.
+  }, [isEn])
 
   const loadApiKeys = useCallback(async () => {
     setLoadingKeys(true)
@@ -261,12 +285,75 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
     }
   }, [])
 
+  // Read persisted custom models from ProxyConfig and prime both state and the
+  // ref synchronously, so the loadModels call that follows already sees them.
+  const loadCustomModels = useCallback(async (): Promise<void> => {
+    try {
+      const status = await window.api.proxyGetStatus()
+      const cfg = (status?.config || {}) as { customModels?: ModelInfo[] }
+      const list = Array.isArray(cfg.customModels) ? cfg.customModels.filter(m => m?.id?.trim()) : []
+      customModelsRef.current = list
+      setCustomModels(list)
+    } catch (err) {
+      console.error('[ClientConfig] Failed to load custom models:', err)
+    }
+  }, [])
+
+  const persistCustomModels = useCallback(async (next: ModelInfo[]): Promise<void> => {
+    customModelsRef.current = next
+    setCustomModels(next)
+    try {
+      await window.api.proxyUpdateConfig({ customModels: next })
+    } catch (err) {
+      console.error('[ClientConfig] Failed to persist custom models:', err)
+    }
+  }, [])
+
+  const addCustomModel = useCallback(() => {
+    const id = newModelId.trim()
+    if (!id) return
+    const key = normalizeModelId(id)
+    const existing = customModelsRef.current
+    if (existing.some(m => normalizeModelId(m.id) === key)) {
+      setNewModelId('')
+      setNewModelName('')
+      setShowAddModel(false)
+      return
+    }
+    const entry: ModelInfo = { id, name: newModelName.trim() || id, inputTypes: ['TEXT', 'IMAGE'] }
+    const next = [...existing, entry]
+    void persistCustomModels(next)
+    // Reflect immediately in the visible list and preselect it.
+    const merged = mergeModelPresets([...models, entry])
+    setModels(merged)
+    setSelectedModelIds(current => current.some(x => normalizeModelId(x) === key) ? current : [...current, id])
+    setNewModelId('')
+    setNewModelName('')
+    setShowAddModel(false)
+    setResults([])
+  }, [newModelId, newModelName, models, persistCustomModels])
+
+  const removeCustomModel = useCallback((modelId: string) => {
+    const key = normalizeModelId(modelId)
+    const next = customModelsRef.current.filter(m => normalizeModelId(m.id) !== key)
+    void persistCustomModels(next)
+    setModels(current => current.filter(m => normalizeModelId(m.id) !== key))
+    setSelectedModelIds(current => current.filter(id => normalizeModelId(id) !== key))
+    setResults([])
+  }, [persistCustomModels])
+
+  const customModelIdSet = useMemo(
+    () => new Set(customModels.map(m => normalizeModelId(m.id))),
+    [customModels]
+  )
+
   useEffect(() => {
     if (open) {
-      void loadModels()
+      // Load persisted custom models first so loadModels merges them in.
+      void loadCustomModels().then(() => loadModels())
       void loadApiKeys()
     }
-  }, [open, loadModels, loadApiKeys])
+  }, [open, loadCustomModels, loadModels, loadApiKeys])
 
   if (!open) return null
 
@@ -384,9 +471,9 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4">
       <div className="absolute inset-0 bg-black/50" onClick={() => onOpenChange(false)} />
-      <Card className="relative w-[780px] max-h-[85vh] shadow-2xl border-0 overflow-hidden animate-in fade-in zoom-in-95 duration-200 glass-card-strong">
+      <Card className="relative w-full sm:w-[780px] max-w-[95vw] max-h-[90vh] sm:max-h-[85vh] shadow-2xl border-0 overflow-hidden animate-in fade-in zoom-in-95 duration-200 glass-card-strong">
         <CardHeader className="pb-4 border-b sticky top-0 z-10">
           <div className="flex items-center justify-between">
             <CardTitle className="text-xl flex items-center gap-3">
@@ -413,7 +500,7 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
           </div>
         </CardHeader>
         <CardContent className="p-4">
-          <div className="max-h-[calc(85vh-140px)] overflow-y-auto pr-2 space-y-4">
+          <div className="max-h-[calc(90vh-140px)] sm:max-h-[calc(85vh-140px)] overflow-y-auto pr-2 space-y-4">
             <div className="rounded-xl border bg-background p-4 space-y-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
@@ -489,6 +576,10 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
                         <span className="text-sm font-medium">{isEn ? 'Models to add' : 'Model sẽ thêm'}</span>
                       </div>
                       <div className="flex items-center gap-2">
+                        <Button type="button" variant="outline" size="sm" onClick={() => setShowAddModel(v => !v)}>
+                          <Plus className="h-3.5 w-3.5" />
+                          {isEn ? 'Add model' : 'Thêm model'}
+                        </Button>
                         <Button type="button" variant="outline" size="sm" onClick={selectRecommendedModels}>
                           <Check className="h-3.5 w-3.5" />
                           {isEn ? 'Recommended' : 'Đề xuất'}
@@ -498,18 +589,42 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
                         </Button>
                       </div>
                     </div>
+                    {showAddModel && (
+                      <div className="flex flex-col gap-2 rounded-lg border border-primary/30 bg-primary/5 p-3 sm:flex-row sm:items-center">
+                        <input
+                          type="text"
+                          value={newModelId}
+                          onChange={e => setNewModelId(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter') addCustomModel() }}
+                          placeholder={isEn ? 'Model ID (e.g. claude-opus-4.8)' : 'Model ID (vd claude-opus-4.8)'}
+                          className="flex-1 rounded-md border bg-background px-3 py-1.5 text-xs outline-none focus:border-primary"
+                          autoFocus
+                        />
+                        <input
+                          type="text"
+                          value={newModelName}
+                          onChange={e => setNewModelName(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter') addCustomModel() }}
+                          placeholder={isEn ? 'Display name (optional)' : 'Tên hiển thị (tùy chọn)'}
+                          className="flex-1 rounded-md border bg-background px-3 py-1.5 text-xs outline-none focus:border-primary"
+                        />
+                        <Button type="button" size="sm" onClick={addCustomModel} disabled={!newModelId.trim()}>
+                          {isEn ? 'Add' : 'Thêm'}
+                        </Button>
+                      </div>
+                    )}
                     <div className="grid grid-cols-2 gap-2 max-h-56 overflow-y-auto pr-1">
                       {models.filter(model => normalizeModelId(model.id) !== 'auto').map(model => {
                         const checked = selectedModelIdSet.has(normalizeModelId(model.id))
+                        const isCustom = customModelIdSet.has(normalizeModelId(model.id))
                         return (
-                          <button
+                          <div
                             key={model.id}
-                            type="button"
-                            onClick={() => toggleModel(model.id)}
                             className={cn(
-                              'flex items-start gap-2 rounded-lg border px-3 py-2 text-left text-xs transition-colors',
+                              'relative flex items-start gap-2 rounded-lg border px-3 py-2 text-left text-xs transition-colors cursor-pointer',
                               checked ? 'border-primary/50 bg-primary/10' : 'border-border bg-background hover:border-primary/40'
                             )}
+                            onClick={() => toggleModel(model.id)}
                           >
                             <span className={cn(
                               'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border',
@@ -517,13 +632,30 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
                             )}>
                               {checked && <Check className="h-3 w-3" />}
                             </span>
-                            <span className="min-w-0">
-                              <span className="block truncate font-semibold">{model.id}</span>
+                            <span className="min-w-0 flex-1">
+                              <span className="flex items-center gap-1.5">
+                                <span className="truncate font-semibold">{model.id}</span>
+                                {isCustom && (
+                                  <Badge variant="secondary" className="h-4 shrink-0 border-0 bg-violet-500/15 px-1 text-[9px] text-violet-600 dark:text-violet-400">
+                                    {isEn ? 'Custom' : 'Tùy chỉnh'}
+                                  </Badge>
+                                )}
+                              </span>
                               {model.name && model.name !== model.id && (
                                 <span className="block truncate text-muted-foreground">{model.name}</span>
                               )}
                             </span>
-                          </button>
+                            {isCustom && (
+                              <button
+                                type="button"
+                                onClick={e => { e.stopPropagation(); removeCustomModel(model.id) }}
+                                className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                                title={isEn ? 'Remove custom model' : 'Xóa model tùy chỉnh'}
+                              >
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                          </div>
                         )
                       })}
                     </div>

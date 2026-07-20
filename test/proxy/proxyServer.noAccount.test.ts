@@ -51,7 +51,12 @@ function addAccount(
     email: `${id}@test`,
     accessToken: 'tok',
     errorCount: 0,
-    groupId: undefined
+    groupId: undefined,
+    // Tier routing is always on: power accounts get a Paid tag so the tag
+    // pre-filter admits them for the premium OPUS model (leaving the capability
+    // cache to govern eligibility); free accounts stay tag-ineligible for premium,
+    // which matches their capability-cache state (no opus id) — eligible set = power.
+    subscriptionType: opts.tier === 'power' ? 'Pro' : 'Free'
   }
   if (opts.quotaExhausted) {
     account.quotaExhaustedAt = now

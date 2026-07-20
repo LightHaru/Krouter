@@ -882,7 +882,7 @@ const phraseReplacements: Array<[RegExp, string]> = [
   [/Detected\s+(\d+)\s+valid link\(s\)/g, 'Đã nhận diện $1 link hợp lệ'],
   [/Imported\s+(\d+)\s+link\(s\)/g, 'Đã nhập $1 link'],
   [/(\d+)d left/g, 'Còn $1 ngày'],
-  [/(\d+)d/g, '$1 ngày'],
+  [/(\d+)d\b/g, '$1 ngày'],
   [/(\d+)m(?!s)\b/g, '$1 phút'],
   [/Base:/g, 'Cơ bản:'],
   [/Trial:/g, 'Dùng thử:'],
@@ -1061,6 +1061,9 @@ function preserveOuterWhitespace(original: string, translated: string): string {
 export function translateVietnameseText(input: string): string {
   const trimmed = input.trim()
   if (!trimmed) return input
+  // Keep URLs and signed identifiers byte-for-byte intact. Broad UI
+  // replacements such as "3d" -> "3 days" can corrupt checkout links.
+  if (/\b(?:https?|wss?):\/\/\S+/i.test(trimmed)) return input
   let translated = extraExactText[trimmed] || exactText[trimmed] || trimmed
   for (const [pattern, replacement] of [...phraseReplacements, ...extraPhraseReplacements]) {
     translated = translated.replace(pattern, replacement)
@@ -1068,12 +1071,18 @@ export function translateVietnameseText(input: string): string {
   return translated === trimmed ? input : preserveOuterWhitespace(input, translated)
 }
 
+function isTranslationProtected(element: Element | null): boolean {
+  return Boolean(element?.closest('script, style, textarea, code, pre, kbd, samp, [data-no-translate], [translate="no"]'))
+}
+
 function translateNodeText(node: Text): void {
+  if (isTranslationProtected(node.parentElement)) return
   const next = translateVietnameseText(node.nodeValue || '')
   if (next !== node.nodeValue) node.nodeValue = next
 }
 
 function translateElementAttributes(element: Element): void {
+  if (isTranslationProtected(element)) return
   for (const attr of ['title', 'placeholder', 'aria-label', 'alt']) {
     const value = element.getAttribute(attr)
     if (!value) continue
@@ -1092,7 +1101,7 @@ function translateTree(root: Node): void {
   const element = root as Element
   if (element.nodeType === Node.ELEMENT_NODE) {
     const tag = element.tagName
-    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'TEXTAREA') return
+    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'TEXTAREA' || isTranslationProtected(element)) return
     translateElementAttributes(element)
   }
 

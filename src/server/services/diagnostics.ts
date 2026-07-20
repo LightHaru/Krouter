@@ -37,8 +37,9 @@ export async function proxyPoolValidate(params: {
   testUrl?: string
   timeoutMs?: number
   upstreamProxy?: string
+  requireAwsSigninRoute?: boolean
 }): Promise<{ success: boolean; latencyMs?: number; externalIp?: string; error?: string }> {
-  const { url, testUrl = 'https://api.ipify.org?format=json', timeoutMs = 8000, upstreamProxy } = params || {}
+  const { url, testUrl = 'https://api.ipify.org?format=json', timeoutMs = 8000, upstreamProxy, requireAwsSigninRoute = false } = params || {}
   if (!url) return { success: false, error: 'Missing proxy URL' }
 
   let chainRelay: ChainProxyRelay | null = null
@@ -72,7 +73,20 @@ export async function proxyPoolValidate(params: {
     if (response.status < 200 || response.status >= 400) return { success: false, latencyMs, error: `HTTP ${response.status}` }
 
     const text = await response.text().catch(() => '')
-    return { success: true, latencyMs, externalIp: extractIp(response.headers.get('content-type') || '', text) }
+    const externalIp = extractIp(response.headers.get('content-type') || '', text)
+    if (requireAwsSigninRoute) {
+      const route = await validateAwsSigninRoute(agent, timeoutMs)
+      if (!route.success) {
+        return {
+          success: false,
+          latencyMs: Math.max(latencyMs, route.latencyMs || 0),
+          externalIp,
+          error: route.error
+        }
+      }
+      return { success: true, latencyMs: Math.max(latencyMs, route.latencyMs || 0), externalIp }
+    }
+    return { success: true, latencyMs, externalIp }
   } catch (error) {
     return {
       success: false,
@@ -126,6 +140,50 @@ export async function networkRouteValidate(params?: {
   } finally {
     clearTimeout(timer)
   }
+}
+
+async function validateAwsSigninRoute(
+  dispatcher: NonNullable<UndiciRequestInit['dispatcher']>,
+  timeoutMs: number
+): Promise<{ success: boolean; latencyMs: number; error?: string }> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const started = Date.now()
+  try {
+    const response = await undiciFetch('https://us-east-1.signin.aws/', {
+      method: 'GET',
+      dispatcher,
+      signal: controller.signal,
+      headers: { 'User-Agent': 'KiroAccountManager-AwsRouteValidator/1.0' }
+    } as UndiciRequestInit)
+    const latencyMs = Date.now() - started
+    const contentType = response.headers.get('content-type') || ''
+    const text = await response.text().catch(() => '')
+    if (response.status < 200 || response.status >= 400) {
+      return { success: false, latencyMs, error: formatAwsSigninRouteError(response.status, contentType, text) }
+    }
+    return { success: true, latencyMs }
+  } catch (error) {
+    return {
+      success: false,
+      latencyMs: Date.now() - started,
+      error: controller.signal.aborted
+        ? `AWS sign-in route timed out (${timeoutMs}ms)`
+        : `AWS sign-in route failed: ${error instanceof Error ? error.message : String(error)}`
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function formatAwsSigninRouteError(status: number, contentType: string, body: string): string {
+  const compactBody = body.replace(/\s+/g, ' ').trim()
+  const isHtml = /html/i.test(contentType) || /<html[\s>]/i.test(compactBody)
+  if (status === 403 && isHtml && /forbidden/i.test(compactBody)) {
+    return 'AWS sign-in route failed: proxy gateway returned an HTML 403 page before Kiro produced an API response'
+  }
+  const snippet = compactBody ? ` body=${compactBody.slice(0, 160)}` : ''
+  return `AWS sign-in route failed: HTTP ${status}${snippet}`
 }
 
 export async function proxyPoolDiagnoseChain(params: {

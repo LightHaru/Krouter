@@ -196,7 +196,7 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
   if (request.top_p !== undefined) chatRequest.top_p = request.top_p
   if (request.max_output_tokens !== undefined) chatRequest.max_tokens = request.max_output_tokens
   if (request.stream !== undefined) chatRequest.stream = request.stream
-  if (request.tools !== undefined) chatRequest.tools = request.tools
+  if (request.tools !== undefined) chatRequest.tools = convertResponseTools(request.tools)
   const toolChoice = convertResponseToolChoice(request.tool_choice)
   if (toolChoice !== undefined) chatRequest.tool_choice = toolChoice
   if (request.previous_response_id !== undefined) chatRequest.conversation_id = request.previous_response_id
@@ -205,6 +205,52 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
   const reasoningEffort = extractResponsesReasoningEffort(request.reasoning)
   if (reasoningEffort !== undefined) chatRequest.reasoning_effort = reasoningEffort
   return chatRequest
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function convertResponseTools(tools: unknown): OpenAITool[] | undefined {
+  if (!Array.isArray(tools)) return undefined
+  const converted: OpenAITool[] = []
+
+  for (const tool of tools) {
+    if (!isRecord(tool)) continue
+    const cacheControl = isRecord(tool.cache_control)
+      ? tool.cache_control as unknown as OpenAITool['cache_control']
+      : undefined
+
+    if (isRecord(tool.function)) {
+      const name = typeof tool.function.name === 'string' ? tool.function.name : ''
+      if (!name) continue
+      converted.push({
+        type: 'function',
+        function: {
+          name,
+          description: typeof tool.function.description === 'string' ? tool.function.description : `Tool: ${name}`,
+          parameters: tool.function.parameters ?? { type: 'object', properties: {} }
+        },
+        ...(cacheControl ? { cache_control: cacheControl } : {})
+      })
+      continue
+    }
+
+    const type = typeof tool.type === 'string' ? tool.type : ''
+    const name = typeof tool.name === 'string' ? tool.name : ''
+    if (type !== 'function' || !name) continue
+    converted.push({
+      type: 'function',
+      function: {
+        name,
+        description: typeof tool.description === 'string' ? tool.description : `Tool: ${name}`,
+        parameters: tool.parameters ?? { type: 'object', properties: {} }
+      },
+      ...(cacheControl ? { cache_control: cacheControl } : {})
+    })
+  }
+
+  return converted.length ? converted : undefined
 }
 
 function convertResponseInputContent(content: string | OpenAIResponseContentPart[] | undefined): OpenAIMessage['content'] {
@@ -305,10 +351,20 @@ export function openAIChatToResponsesResponse(
 
 // ============ OpenAI -> Kiro 转换 ============
 
+export interface CacheOptions {
+  autoCachePoint: boolean
+  maxPoints: number
+}
+
+// Ngưỡng token tối thiểu để một breakpoint đáng được cache (tránh phí cachePoint quota
+// cho prefix ngắn). Ước lượng thô theo độ dài chuỗi ~4 char/token.
+const AUTO_CACHE_MIN_CHARS = 1024 * 4
+
 export function openaiToKiro(
   request: OpenAIChatRequest,
   profileArn?: string,
-  toolNameRegistry: ToolNameRegistry = new ToolNameRegistry()
+  toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
+  cacheOptions?: CacheOptions
 ): KiroPayload {
   const modelId = mapModelId(request.model)
   const origin = 'AI_EDITOR'
@@ -336,9 +392,10 @@ export function openaiToKiro(
     }
   }
 
-  // 注入时间戳
+  // 时间戳：故意 NOT 注入到 system prompt。system 前缀必须稳定才能命中 prompt cache；
+  // 每次请求变化的时间戳会让缓存前缀永远 miss。改为注入到「当前轮」内容（见 finalContent），
+  // 当前轮从不被缓存，放这里既无害又能让模型拿到当前时间。
   const timestamp = new Date().toISOString()
-  systemPrompt = `[Context: Current time is ${timestamp}]\n\n${systemPrompt}`
 
   // 注入执行导向指令（防止 AI 在探索过程中丢失目标）
   const executionDirective = `
@@ -397,17 +454,26 @@ export function openaiToKiro(
       if (!assistantContent.trim() && msg.tool_calls && msg.tool_calls.length > 0) {
         assistantContent = ' '
       } else if (!assistantContent.trim()) {
-        assistantContent = 'I understand.'
+        assistantContent = ' '
       }
       const toolUses: KiroToolUse[] = []
 
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           if (tc.type === 'function') {
-            let input = {}
+            let input: unknown = {}
             try {
               input = JSON.parse(tc.function.arguments)
-            } catch { /* ignore */ }
+            } catch {
+              throw new Error(
+                `[Krouter] Invalid JSON arguments in tool-call history for "${tc.function.name}" (${tc.id})`
+              )
+            }
+            if (!isRecord(input)) {
+              throw new Error(
+                `[Krouter] Tool-call history arguments must be a JSON object for "${tc.function.name}" (${tc.id})`
+              )
+            }
             toolUses.push({
               toolUseId: tc.id,
               name: toolNameRegistry.toKiroName(tc.function.name),
@@ -510,10 +576,23 @@ export function openaiToKiro(
     ]
     history.unshift(...systemMessages)
   }
-  const finalContent = currentContent || 'Continue.'
+  // 时间戳注入到当前轮（非缓存区），保证 system 前缀稳定可缓存
+  const finalContent = `[Context: Current time is ${timestamp}]\n\n${currentContent || 'Continue.'}`
 
   // 转换工具定义
   const kiroTools = convertOpenAITools(request.tools, toolNameRegistry)
+
+  // 自动 prompt cache：客户端（如 Openclaw）不发 cache_control 时，主动在稳定前缀插入
+  // cachePoint，让 AWS Kiro 真正缓存。若客户端已自带 cache_control 则尊重客户端、不重复插。
+  const clientSuppliedCache = Boolean(
+    systemCachePoint ||
+    currentCachePoint ||
+    history.some(h => h.userInputMessage?.cachePoint) ||
+    kiroTools.some(t => 'cachePoint' in t)
+  )
+  if (cacheOptions?.autoCachePoint && !clientSuppliedCache) {
+    applyAutoCachePoints(history, kiroTools, systemPrompt, cacheOptions.maxPoints)
+  }
 
   // OpenAI 兼容请求的 thinking 映射到 Kiro additionalModelRequestFields
   // 仅对支持 thinking 的模型传递（Claude 4+ 系列）
@@ -669,6 +748,59 @@ function normalizeDocumentFormat(mediaType: string | undefined, name: string): s
   return 'txt'
 }
 
+
+/**
+ * 自动在稳定前缀插入 cachePoint（就地修改 history / kiroTools）。
+ * AWS Bedrock 单请求最多 4 个 cachePoint，按「越靠前越稳定 → 优先级越高」分配：
+ *   1) tools 末尾（工具定义通常最大且最稳定）
+ *   2) system 消息（history 头部那条 userInputMessage）
+ *   3) 最靠近当前轮的最多 2 条 history user 消息（让多轮对话复用已有前缀）
+ * 不在 currentMessage 上打点（当前轮每次都变，缓存无意义且浪费额度）。
+ * 仅当对应前缀「足够大」才打点，避免为短前缀浪费 cachePoint 额度。
+ */
+function applyAutoCachePoints(
+  history: KiroHistoryMessage[],
+  kiroTools: KiroToolWrapper[],
+  systemPrompt: string,
+  maxPoints: number
+): void {
+  const cap = Math.max(0, Math.min(4, maxPoints))
+  if (cap === 0) return
+  let used = 0
+
+  // 1) tools 末尾
+  if (used < cap && kiroTools.length > 0 && !kiroTools.some(t => 'cachePoint' in t)) {
+    const toolsChars = kiroTools.reduce((n, t) => n + ('toolSpecification' in t ? JSON.stringify(t).length : 0), 0)
+    if (toolsChars >= AUTO_CACHE_MIN_CHARS) {
+      kiroTools.push({ cachePoint: KIRO_CACHE_POINT })
+      used++
+    }
+  }
+
+  // 2) system 消息（history 头部的 userInputMessage，成对结构的第一条）
+  if (used < cap && systemPrompt.length >= AUTO_CACHE_MIN_CHARS) {
+    const systemMsg = history.find(h => h.userInputMessage && h.userInputMessage.content === systemPrompt)
+    if (systemMsg?.userInputMessage && !systemMsg.userInputMessage.cachePoint) {
+      systemMsg.userInputMessage.cachePoint = KIRO_CACHE_POINT
+      used++
+    }
+  }
+
+  // 3) 最靠近当前轮的历史 user 消息，最多 2 条（从后往前）
+  if (used < cap) {
+    let historyPoints = 0
+    for (let i = history.length - 1; i >= 0 && used < cap && historyPoints < 2; i--) {
+      const uim = history[i].userInputMessage
+      if (!uim || uim.cachePoint) continue
+      if (uim.content === systemPrompt) continue // 已在 step 2 处理
+      const chars = JSON.stringify(uim).length
+      if (chars < AUTO_CACHE_MIN_CHARS) continue
+      uim.cachePoint = KIRO_CACHE_POINT
+      used++
+      historyPoints++
+    }
+  }
+}
 
 // Kiro API 工具描述最大长度
 const KIRO_MAX_TOOL_DESC_LEN = 10237 // 留出 "..." 的空间

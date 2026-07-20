@@ -13,6 +13,10 @@ interface SidebarProps {
   onPageChange: (page: PageType) => void
   collapsed: boolean
   onToggleCollapse: () => void
+  /** 'static' = desktop cột cố định (có collapse); 'drawer' = mobile trượt (luôn full). */
+  variant?: 'static' | 'drawer'
+  /** Gọi sau khi chọn trang — drawer dùng để tự đóng. */
+  onNavigate?: () => void
 }
 
 const menuItemsConfig: { id: PageType; labelKey: string; icon: React.ElementType }[] = [
@@ -34,26 +38,38 @@ const menuItemsConfig: { id: PageType; labelKey: string; icon: React.ElementType
   { id: 'about', labelKey: 'nav.about', icon: Info },
 ]
 
-export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse }: SidebarProps): React.ReactNode {
+export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse, variant = 'static', onNavigate }: SidebarProps): React.ReactNode {
   const { t } = useTranslation()
+  const isDrawer = variant === 'drawer'
   const [isNarrow, setIsNarrow] = useState(false)
 
   useEffect(() => {
+    // Drawer luôn full-width nên không cần theo dõi bề rộng.
+    if (isDrawer) return
     const query = window.matchMedia('(max-width: 900px)')
     const update = (): void => setIsNarrow(query.matches)
     update()
     query.addEventListener('change', update)
     return () => query.removeEventListener('change', update)
-  }, [])
+  }, [isDrawer])
 
-  const compact = collapsed || isNarrow
+  // Drawer: luôn hiển thị đầy đủ label. Static: compact khi collapse hoặc màn hẹp.
+  const compact = !isDrawer && (collapsed || isNarrow)
+
+  const handleSelect = (page: PageType): void => {
+    onPageChange(page)
+    onNavigate?.()
+  }
 
   return (
     <motion.aside
       initial={false}
-      animate={{ width: isNarrow ? 56 : collapsed ? 64 : 224, height: 'auto' }}
+      animate={isDrawer ? { width: 264, height: 'auto' } : { width: isNarrow ? 56 : collapsed ? 64 : 224, height: 'auto' }}
       transition={{ type: 'spring', stiffness: 320, damping: 30 }}
-      className="glass-sidebar flex h-full min-h-0 shrink-0 flex-col overflow-hidden rounded-2xl md:rounded-3xl"
+      className={cn(
+        'glass-sidebar flex h-full min-h-0 shrink-0 flex-col overflow-hidden',
+        isDrawer ? 'w-[264px] rounded-none' : 'rounded-2xl md:rounded-3xl'
+      )}
     >
       <div className={cn(
         'flex h-14 shrink-0 items-center justify-center gap-2 overflow-hidden border-b border-white/10 px-2 dark:border-white/5',
@@ -98,7 +114,7 @@ export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse
           return (
             <button
               key={item.id}
-              onClick={() => onPageChange(item.id)}
+              onClick={() => handleSelect(item.id)}
               className={cn(
                 'group relative flex w-full items-center overflow-hidden rounded-xl text-sm font-medium transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50',
                 isActive
@@ -136,7 +152,7 @@ export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse
         })}
       </nav>
 
-      {!isNarrow && (
+      {!isNarrow && !isDrawer && (
         <div className="border-t border-white/10 p-2 dark:border-white/5">
           <button
             onClick={onToggleCollapse}

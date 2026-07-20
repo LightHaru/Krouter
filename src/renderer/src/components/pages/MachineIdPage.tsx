@@ -684,15 +684,15 @@ export function MachineIdPage() {
 
       {/* 账户机器码管理对话框 */}
       {showAccountBindings && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4">
           {/* 背景遮罩 */}
-          <div 
+          <div
             className="absolute inset-0 bg-black/50"
             onClick={() => setShowAccountBindings(false)}
           />
-          
+
           {/* 对话框内容 */}
-          <div className="relative bg-background rounded-xl shadow-2xl w-[600px] max-h-[80vh] flex flex-col animate-in fade-in zoom-in-95 duration-200">
+          <div className="relative bg-background rounded-xl shadow-2xl w-full sm:w-[600px] max-w-[95vw] max-h-[90vh] sm:max-h-[80vh] flex flex-col animate-in fade-in zoom-in-95 duration-200">
             {/* 标题栏 */}
             <div className="flex items-center justify-between px-6 py-4 border-b">
               <div className="flex items-center gap-2">
@@ -910,7 +910,7 @@ export function MachineIdPage() {
 
       {/* 历史记录对话框 */}
       {showHistory && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4">
           {/* 背景遮罩 */}
           <div 
             className="absolute inset-0 bg-black/50"
@@ -918,7 +918,7 @@ export function MachineIdPage() {
           />
           
           {/* 对话框内容 */}
-          <div className="relative bg-background rounded-xl shadow-2xl w-[550px] max-h-[80vh] flex flex-col animate-in fade-in zoom-in-95 duration-200">
+          <div className="relative bg-background rounded-xl shadow-2xl w-full sm:w-[550px] max-w-[95vw] max-h-[90vh] sm:max-h-[80vh] flex flex-col animate-in fade-in zoom-in-95 duration-200">
             {/* 标题栏 */}
             <div className="flex items-center justify-between px-6 py-4 border-b">
               <div className="flex items-center gap-2">

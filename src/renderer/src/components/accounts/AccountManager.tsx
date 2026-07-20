@@ -5,14 +5,17 @@ import { AccountToolbar, type AccountViewMode } from './AccountToolbar'
 import { AccountGrid } from './AccountGrid'
 import { AccountList } from './AccountList'
 import { AddAccountDialog } from './AddAccountDialog'
+import { BedrockAccountsPanel } from './BedrockAccountsPanel'
+import { XpixiAccountsPanel } from './XpixiAccountsPanel'
 import { EditAccountDialog } from './EditAccountDialog'
 import { GroupManageDialog } from './GroupManageDialog'
 import { TagManageDialog } from './TagManageDialog'
 import { ExportDialog } from './ExportDialog'
 import { Button } from '../ui'
+import { useIsMobile } from '@/hooks/useIsMobile'
 import type { Account } from '@/types/account'
 import { splitCredentialLine } from '@/lib/utils'
-import { ArrowLeft, Loader2, Users } from 'lucide-react'
+import { ArrowLeft, Loader2, Users, Cloud, Key, SlidersHorizontal, ChevronUp } from 'lucide-react'
 
 interface AccountManagerProps {
   onBack?: () => void
@@ -30,11 +33,18 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   } = useAccountsStore()
 
   const [showAddDialog, setShowAddDialog] = useState(false)
+  const [accountTab, setAccountTab] = useState<'kiro' | 'bedrock' | 'xpixi'>('kiro')
+  const [addDialogMode, setAddDialogMode] = useState<'login' | 'bedrock' | 'xpixi' | undefined>(undefined)
+  const [bedrockRefreshKey, setBedrockRefreshKey] = useState(0)
   const [editingAccount, setEditingAccount] = useState<Account | null>(null)
   const [showGroupDialog, setShowGroupDialog] = useState(false)
   const [showTagDialog, setShowTagDialog] = useState(false)
   const [showExportDialog, setShowExportDialog] = useState(false)
   const [isFilterExpanded, setIsFilterExpanded] = useState(false)
+  const isMobile = useIsMobile()
+  // Trên mobile header chiếm gần nửa màn hình -> cho phép thu gọn thanh công cụ,
+  // mặc định gập lại để nhường chỗ cho danh sách tài khoản.
+  const [toolbarOpen, setToolbarOpen] = useState(false)
   // 视图模式：grid（卡片，默认）/ list（紧凑列表），持久化到 localStorage
   const [viewMode, setViewMode] = useState<AccountViewMode>(() => {
     const saved = localStorage.getItem('accounts_viewMode')
@@ -235,8 +245,8 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   return (
     <div className="flex flex-col h-full">
       {/* 顶部工具栏 - 玻璃态（relative z-20 抬升 stacking context，确保下拉菜单浮在卡片之上） */}
-      <header className="relative z-20 flex items-center justify-between gap-4 px-3 py-3 glass-toolbar">
-        <div className="flex items-center gap-4">
+      <header className="relative z-20 flex flex-wrap items-center justify-between gap-3 px-3 py-3 glass-toolbar">
+        <div className="flex flex-wrap items-center gap-3 sm:gap-4">
           {onBack && (
             <Button variant="ghost" size="icon" onClick={onBack}>
               <ArrowLeft className="h-5 w-5" />
@@ -248,34 +258,88 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
             </div>
             <h1 className="text-lg font-semibold text-primary">{isEn ? 'Accounts' : '账户管理'}</h1>
           </div>
+          {/* Nút gập/mở thanh công cụ — chỉ hiện trên mobile để lấy lại tầm nhìn */}
+          {isMobile && (
+            <Button
+              variant={toolbarOpen ? 'default' : 'outline'}
+              size="sm"
+              className="rounded-xl ml-auto"
+              onClick={() => setToolbarOpen((v) => !v)}
+              title={toolbarOpen ? (isEn ? 'Collapse toolbar' : 'Thu gọn công cụ') : (isEn ? 'Show toolbar' : 'Hiện công cụ')}
+            >
+              {toolbarOpen ? <ChevronUp className="h-4 w-4" /> : <SlidersHorizontal className="h-4 w-4" />}
+            </Button>
+          )}
+          <div className="flex items-center gap-1 p-1 rounded-xl bg-muted/50 border">
+            <button
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-all font-medium ${accountTab === 'kiro' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => setAccountTab('kiro')}
+            >
+              <Users className="h-4 w-4" />
+              {isEn ? 'Kiro' : 'Kiro'}
+            </button>
+            <button
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-all font-medium ${accountTab === 'bedrock' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => setAccountTab('bedrock')}
+            >
+              <Cloud className="h-4 w-4" />
+              Bedrock
+            </button>
+            <button
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-all font-medium ${accountTab === 'xpixi' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => setAccountTab('xpixi')}
+            >
+              <Key className="h-4 w-4" />
+              Xpixi
+            </button>
+          </div>
         </div>
         
-        {/* 工具栏 */}
-        <AccountToolbar
-          onAddAccount={() => setShowAddDialog(true)}
-          onImport={handleImport}
-          onExport={handleExport}
-          viewMode={viewMode}
-          onViewModeChange={setViewMode}
-          onManageGroups={handleManageGroups}
-          onManageTags={handleManageTags}
-          isFilterExpanded={isFilterExpanded}
-          onToggleFilter={() => setIsFilterExpanded(!isFilterExpanded)}
-        />
+        {/* 工具栏 — mobile 折叠时隐藏，桌面端始终显示 */}
+        {(!isMobile || toolbarOpen) && (
+          <div className="w-full sm:w-auto">
+            {accountTab === 'kiro' && (
+              <AccountToolbar
+                onAddAccount={() => { setAddDialogMode(undefined); setShowAddDialog(true) }}
+                onImport={handleImport}
+                onExport={handleExport}
+                viewMode={viewMode}
+                onViewModeChange={setViewMode}
+                onManageGroups={handleManageGroups}
+                onManageTags={handleManageTags}
+                isFilterExpanded={isFilterExpanded}
+                onToggleFilter={() => setIsFilterExpanded(!isFilterExpanded)}
+              />
+            )}
+            {accountTab === 'bedrock' && (
+              <Button onClick={() => { setAddDialogMode('bedrock'); setShowAddDialog(true) }} className="rounded-xl">
+                {isEn ? 'Add Bedrock' : 'Thêm Bedrock'}
+              </Button>
+            )}
+            {accountTab === 'xpixi' && (
+              <Button onClick={() => { setAddDialogMode('xpixi'); setShowAddDialog(true) }} className="rounded-xl">
+                {isEn ? 'Add Xpixi' : 'Thêm Xpixi'}
+              </Button>
+            )}
+          </div>
+        )}
       </header>
 
       {/* 主内容区域 */}
       <div className="flex-1 overflow-hidden flex flex-col px-3 py-3 gap-3">
-        {/* 账号列表（卡片 或 紧凑列表） */}
         <div className="flex-1 overflow-hidden">
-          {viewMode === 'grid' ? (
+          {accountTab === 'bedrock' ? (
+            <BedrockAccountsPanel key={bedrockRefreshKey} isEn={isEn} onAddBedrock={() => { setAddDialogMode('bedrock'); setShowAddDialog(true) }} />
+          ) : accountTab === 'xpixi' ? (
+            <XpixiAccountsPanel key={bedrockRefreshKey} isEn={isEn} onAddXpixi={() => { setAddDialogMode('xpixi'); setShowAddDialog(true) }} />
+          ) : viewMode === 'grid' ? (
             <AccountGrid
-              onAddAccount={() => setShowAddDialog(true)}
+              onAddAccount={() => { setAddDialogMode(undefined); setShowAddDialog(true) }}
               onEditAccount={handleEditAccount}
             />
           ) : (
             <AccountList
-              onAddAccount={() => setShowAddDialog(true)}
+              onAddAccount={() => { setAddDialogMode(undefined); setShowAddDialog(true) }}
               onEditAccount={handleEditAccount}
             />
           )}
@@ -285,7 +349,8 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
       {/* 添加账号对话框 */}
       <AddAccountDialog
         isOpen={showAddDialog}
-        onClose={() => setShowAddDialog(false)}
+        onClose={() => { setShowAddDialog(false); setBedrockRefreshKey(k => k + 1) }}
+        defaultMode={addDialogMode}
       />
 
       {/* 编辑账号对话框 */}

@@ -80,7 +80,7 @@ export function WebhooksPage(): React.ReactNode {
 
       {/* Webhook 列表 */}
       <Card>
-        <CardHeader className="pb-3 flex flex-row items-center justify-between">
+        <CardHeader className="pb-3 flex flex-row flex-wrap items-center justify-between gap-2">
           <CardTitle className="text-base flex items-center gap-2">
             <MessageSquare className="h-4 w-4 text-primary" />
             {isEn ? `Webhooks (${webhookList.length})` : `Webhook 列表 (${webhookList.length})`}

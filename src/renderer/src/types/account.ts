@@ -6,7 +6,7 @@ export type IdpType = 'Google' | 'Github' | 'BuilderId' | 'Enterprise' | 'AWSIdC
 
 export type SubscriptionType = 'Free' | 'Pro' | 'Pro_Plus' | 'Enterprise' | 'Teams'
 
-export type AccountStatus = 'active' | 'expired' | 'error' | 'refreshing' | 'unknown'
+export type AccountStatus = 'active' | 'expired' | 'error' | 'refreshing' | 'unknown' | 'blocked' | 'quota_exhausted'
 
 /**
  * 账号凭证信息
@@ -54,6 +54,10 @@ export interface AccountUsage {
   freeTrialExpiry?: string
   bonuses?: BonusUsage[]  // 奖励额度列表
   nextResetDate?: string  // 重置日期
+  quotaExhaustedAt?: number
+  suspendedAt?: number
+  suspendReason?: string
+  suspendMessage?: string
   resourceDetail?: ResourceDetail // 资源详情
 }
 
@@ -160,6 +164,7 @@ export interface AccountFilter {
   daysRemainingMin?: number
   daysRemainingMax?: number
   bannedOnly?: boolean // 仅显示封禁账号
+  quotaExhaustedOnly?: boolean
 }
 
 /**
@@ -232,4 +237,5 @@ export interface AccountStats {
   activeCount: number
   expiringSoonCount: number // 7天内到期
   bannedCount: number // 封禁账号数
+  quotaExhaustedCount: number
 }

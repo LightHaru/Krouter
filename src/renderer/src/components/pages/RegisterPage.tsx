@@ -5,7 +5,7 @@ import { isPlaceholderProfileArn, useAccountsStore } from '@/store/accounts'
 import { useTaskStore } from '@/store/tasks'
 import { createRateLimiter, type RateLimiter, type RateLimiterSnapshot } from '@/store/rateLimiter'
 import { useWebhookStore } from '@/store/webhooks'
-import type { ProxyEntry, ProxyPoolConfig } from '@/types/proxy'
+import type { ProxyEntry, ProxyPoolConfig, ProxyValidationResult } from '@/types/proxy'
 import type { Account } from '@/types/account'
 import { Card, CardContent, CardHeader, CardTitle, Button, Input, Label, Progress, Badge, Switch } from '../ui'
 import { cn, randomUuid } from '@/lib/utils'
@@ -1307,6 +1307,119 @@ export function RegisterPage(): React.JSX.Element {
     addLog(`[NetworkGuard] Tam ne proxy ${proxy.protocol}://${proxy.host}:${proxy.port} trong ${Math.ceil(ms / 60000)} phut: ${reason}`)
   }, [addLog])
 
+  const reportRegistrationProxyOutcome = useCallback((
+    binding: ImportProxyBinding | null | undefined,
+    success: boolean,
+    email?: string,
+    error?: unknown
+  ): void => {
+    if (!binding?.proxyId) return
+    const normalizedError = error ? compactLogError(error, 360) : undefined
+    useAccountsStore.getState().reportProxyResult(binding.proxyId, success, email, normalizedError)
+    if (!success && normalizedError && isHtmlProxyGatewayFailure(String(error || normalizedError))) {
+      addLog(`[Proxy] Route nay bi gateway tu choi AWS sign-in; da ghi nhan vao proxy pool: ${normalizedError}`)
+    }
+  }, [addLog])
+
+  const prepareRegistrationProxyRoute = async (
+    scope: string
+  ): Promise<{ success: boolean; patch: Record<string, unknown>; binding: ImportProxyBinding | null; error?: string }> => {
+    if (networkSource === 'client-proxy') {
+      const route = resolveRegistrationNetworkRoute()
+      if (!route.success) {
+        addLog(`[Network] ${route.error}`)
+        return { success: false, patch: {}, binding: null, error: route.error }
+      }
+      route.logLines.forEach(addLog)
+      const proxyUrl = route.patch?.proxy ? String(route.patch.proxy) : ''
+      if (proxyUrl) {
+        const preflight: ProxyValidationResult = await window.api.proxyPoolValidate({
+          url: proxyUrl,
+          upstreamProxy: route.patch?.upstreamProxy ? String(route.patch.upstreamProxy) : undefined,
+          testUrl: 'https://api.ipify.org?format=json',
+          timeoutMs: useAccountsStore.getState().proxyPoolConfig.testTimeoutMs || 8000,
+          requireAwsSigninRoute: true
+        }).catch((error): ProxyValidationResult => ({
+          success: false,
+          error: error instanceof Error ? error.message : String(error)
+        }))
+        if (!preflight.success || !preflight.externalIp) {
+          const error = `Client route cannot reach AWS sign-in: ${preflight.error || 'missing exit IP'}`
+          addLog(`[NetworkGuard] ${error}`)
+          return { success: false, patch: {}, binding: { proxyUrl }, error }
+        }
+        addLog(`[NetworkGuard] Client route OK, exit IP ${preflight.externalIp}, latency ${fmtLatencyMs(preflight.latencyMs)}`)
+      }
+      return {
+        success: true,
+        patch: route.patch || {},
+        binding: proxyUrl ? { proxyUrl } : null
+      }
+    }
+
+    const readiness = getProxyPoolReadiness()
+    if (!readiness.enabled) {
+      addLog(proxyFallbackLog(scope))
+      return { success: true, patch: {}, binding: null }
+    }
+    if (readiness.total === 0 || readiness.usable === 0) {
+      const error = readiness.total === 0
+        ? 'Proxy pool is ON but empty; registration was stopped before using direct/server IP.'
+        : 'Proxy pool is ON but has no usable proxy; registration was stopped before using direct/server IP.'
+      addLog(`[Proxy] ${error}`)
+      return { success: false, patch: {}, binding: null, error }
+    }
+
+    const excludedIds = new Set<string>()
+    const excludedHosts = new Set<string>()
+    const maxAttempts = Math.max(1, readiness.total)
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const live = useAccountsStore.getState()
+      const entry = live.pickNextProxy({ excludeIds: excludedIds, excludeHosts: excludedHosts })
+      if (!entry) break
+      const proxiedUrl = injectProxySession(entry.url)
+      const masked = proxiedUrl.replace(/:([^:@/]+)@/, ':***@')
+      addLog(`[Proxy] Sử dụng kho proxy: ${masked}`)
+      if (proxiedUrl === entry.url) {
+        addLog('[Proxy] This proxy URL has no {session} placeholder or supported session username pattern; if the provider assigns a fixed endpoint, the exit IP can remain unchanged.')
+      }
+
+      const preflight: ProxyValidationResult = await window.api.proxyPoolValidate({
+        url: proxiedUrl,
+        upstreamProxy: live.proxyPoolConfig.upstreamProxy || undefined,
+        testUrl: 'https://api.ipify.org?format=json',
+        timeoutMs: live.proxyPoolConfig.testTimeoutMs || 8000,
+        requireAwsSigninRoute: true
+      }).catch((error): ProxyValidationResult => ({
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      }))
+
+      if (preflight.success && preflight.externalIp) {
+        addLog(`[NetworkGuard] Proxy route OK, exit IP ${preflight.externalIp}, latency ${fmtLatencyMs(preflight.latencyMs)}`)
+        return {
+          success: true,
+          patch: {
+            proxy: proxiedUrl,
+            upstreamProxy: live.proxyPoolConfig.upstreamProxy || '',
+            strictProxy: true
+          },
+          binding: { proxyId: entry.id, proxyUrl: proxiedUrl }
+        }
+      }
+
+      const error = `AWS sign-in preflight failed before ${scope}: ${preflight.error || 'missing exit IP'}`
+      addLog(`[NetworkGuard] ${entry.protocol}://${entry.host}:${entry.port} bị loại: ${error}`)
+      live.reportProxyResult(entry.id, false, undefined, error)
+      excludedIds.add(entry.id)
+      excludedHosts.add(entry.host)
+    }
+
+    const error = `No proxy route can reach AWS sign-in; ${scope} was stopped before WorkflowInit`
+    addLog(`[NetworkGuard] ${error}`)
+    return { success: false, patch: {}, binding: null, error }
+  }
+
   useEffect(() => {
     saveRemoteSyncConfig({
       targetUrl: remoteSyncUrl,
@@ -1611,53 +1724,22 @@ export function RegisterPage(): React.JSX.Element {
     setImported(false)
     addLog(t('register.logManualInit'))
 
-    const config: Record<string, string> = {}
+    const config: Record<string, unknown> = {}
     currentRegistrationProxyBinding.current = null
     if (fullName.trim()) config.fullName = fullName.trim()
 
-    // 代理池注入：如果代理池启用且有可用代理，自动取一个并传入 config
-    if (networkSource === 'client-proxy') {
-      const route = resolveRegistrationNetworkRoute()
-      if (!route.success) {
-        addLog(`[Network] ${route.error}`)
-        setResult(makeFailedRegResult(route.error))
-        setPhase('idle')
-        return
-      }
-      Object.assign(config, route.patch)
-      currentRegistrationProxyBinding.current = route.patch?.proxy
-        ? { proxyUrl: route.patch.proxy }
-        : null
-      route.logLines.forEach(addLog)
+    const preparedRoute = await prepareRegistrationProxyRoute('manual registration')
+    if (!preparedRoute.success) {
+      setResult(makeFailedRegResult(preparedRoute.error, preEmail))
+      setPhase('idle')
+      return
     }
-    const proxyInfo = networkSource === 'client-proxy' ? null : getRegistrationProxy()
-    if (proxyInfo) {
-      const proxiedUrl = injectProxySession(proxyInfo.proxy)
-      config.proxy = proxiedUrl
-      config.upstreamProxy = proxyInfo.upstreamProxy
-      ;(config as Record<string, unknown>).strictProxy = true
-      currentRegistrationProxyBinding.current = { proxyId: proxyInfo.proxyId, proxyUrl: proxiedUrl }
-      addLog(`[Proxy] Sử dụng kho proxy: ${config.proxy.replace(/:([^:@/]+)@/, ':***@')}`)
-      if (proxiedUrl === proxyInfo.proxy) {
-        addLog('[Proxy] This proxy URL has no {session} placeholder or supported session username pattern; if the provider assigns a fixed endpoint, the exit IP can remain unchanged.')
-      }
-    } else if (networkSource !== 'client-proxy') {
-      const readiness = getProxyPoolReadiness()
-      if (readiness.enabled) {
-        const message = readiness.total === 0
-          ? 'Proxy pool is ON but empty; registration was stopped before using direct/server IP.'
-          : 'Proxy pool is ON but has no usable proxy; registration was stopped before using direct/server IP.'
-        addLog(`[Proxy] ${message}`)
-        setResult(makeFailedRegResult(message, preEmail))
-        setPhase('idle')
-        return
-      }
-      currentRegistrationProxyBinding.current = null
-      addLog(proxyFallbackLog('registration'))
-    }
+    Object.assign(config, preparedRoute.patch)
+    currentRegistrationProxyBinding.current = preparedRoute.binding
 
     const res = await window.api.registrationManualPhase1(config)
     if (!res.success) {
+      reportRegistrationProxyOutcome(currentRegistrationProxyBinding.current, false, preEmail, res.error)
       addLog(`${t('register.logInitFailed')} ${res.error}`)
       setResult(makeFailedRegResult(res.error, preEmail))
       setPhase('idle')
@@ -1675,6 +1757,7 @@ export function RegisterPage(): React.JSX.Element {
         addLog(t('register.logOtpSent'))
         setPhase('otp')
       } else {
+        reportRegistrationProxyOutcome(currentRegistrationProxyBinding.current, false, preEmail, phase2Res.error)
         addLog(`${t('register.logFailed')} ${phase2Res.error}`)
         setResult(makeFailedRegResult(phase2Res.error, preEmail))
         setPhase('idle')
@@ -1692,6 +1775,7 @@ export function RegisterPage(): React.JSX.Element {
       addLog(t('register.logOtpSent'))
       setPhase('otp')
     } else {
+      reportRegistrationProxyOutcome(currentRegistrationProxyBinding.current, false, email.trim(), res.error)
       addLog(`${t('register.logFailed')} ${res.error}`)
       setResult(makeFailedRegResult(res.error, email.trim()))
       setPhase('idle')
@@ -1706,6 +1790,7 @@ export function RegisterPage(): React.JSX.Element {
     const res = await window.api.registrationManualPhase3(otp.trim())
     if (res.success) {
       const regResult = res.result as RegResult
+      reportRegistrationProxyOutcome(currentRegistrationProxyBinding.current, regResult.status === 'success', regResult.email, regResult.error)
       setResult(regResult)
       setPhase('done')
       addHistory({ email: regResult.email, status: regResult.status, password: regResult.password, result: regResult })
@@ -1735,6 +1820,7 @@ export function RegisterPage(): React.JSX.Element {
         setPhase('finalized')
       }
     } else {
+      reportRegistrationProxyOutcome(currentRegistrationProxyBinding.current, false, email.trim(), res.error)
       addLog(`${t('register.logFailed')} ${res.error}`)
       setResult(makeFailedRegResult(res.error, email.trim()))
       setPhase('idle')
@@ -1779,49 +1865,24 @@ export function RegisterPage(): React.JSX.Element {
       addLog(`[Proton] Sử dụng bí danh dấu chấm: ${variant}`)
     }
 
-    // 代理池注入
-    if (networkSource === 'client-proxy') {
-      const route = resolveRegistrationNetworkRoute()
-      if (!route.success) {
-        addLog(`[Network] ${route.error}`)
-        setResult(makeFailedRegResult(route.error))
-        setPhase('idle')
-        return
-      }
-      Object.assign(config, route.patch)
-      currentRegistrationProxyBinding.current = route.patch?.proxy
-        ? { proxyUrl: route.patch.proxy }
-        : null
-      route.logLines.forEach(addLog)
+    const preparedRoute = await prepareRegistrationProxyRoute('auto registration')
+    if (!preparedRoute.success) {
+      setResult(makeFailedRegResult(preparedRoute.error))
+      setPhase('idle')
+      return
     }
-    const proxyInfo = networkSource === 'client-proxy' ? null : getRegistrationProxy()
-    if (proxyInfo) {
-      const proxiedUrl = injectProxySession(proxyInfo.proxy)
-      config.proxy = proxiedUrl
-      config.upstreamProxy = proxyInfo.upstreamProxy
-      config.strictProxy = true
-      currentRegistrationProxyBinding.current = { proxyId: proxyInfo.proxyId, proxyUrl: proxiedUrl }
-      addLog(`[Proxy] Sử dụng kho proxy: ${String(config.proxy).replace(/:([^:@/]+)@/, ':***@')}`)
-      if (proxiedUrl === proxyInfo.proxy) {
-        addLog('[Proxy] This proxy URL has no {session} placeholder or supported session username pattern; if the provider assigns a fixed endpoint, the exit IP can remain unchanged.')
-      }
-    } else if (networkSource !== 'client-proxy') {
-      const readiness = getProxyPoolReadiness()
-      if (readiness.enabled) {
-        const message = readiness.total === 0
-          ? 'Proxy pool is ON but empty; registration was stopped before using direct/server IP.'
-          : 'Proxy pool is ON but has no usable proxy; registration was stopped before using direct/server IP.'
-        addLog(`[Proxy] ${message}`)
-        setResult(makeFailedRegResult(message))
-        setPhase('idle')
-        return
-      }
-      currentRegistrationProxyBinding.current = null
-      addLog(proxyFallbackLog('registration'))
-    }
+    Object.assign(config, preparedRoute.patch)
+    currentRegistrationProxyBinding.current = preparedRoute.binding
 
     try {
       const res = await window.api.registrationStartAuto(config as Parameters<typeof window.api.registrationStartAuto>[0])
+      const autoResult = res.result as RegResult | undefined
+      reportRegistrationProxyOutcome(
+        currentRegistrationProxyBinding.current,
+        Boolean(res.success && autoResult?.status === 'success'),
+        autoResult?.email,
+        res.error || autoResult?.error
+      )
       if (res.success && res.result) {
         await onRegComplete(res.result as RegResult)
       } else if (!res.success) {
@@ -2004,7 +2065,8 @@ export function RegisterPage(): React.JSX.Element {
         url: clientRoute.url,
         upstreamProxy: clientRoute.upstreamProxy || undefined,
         testUrl: 'https://api.ipify.org?format=json',
-        timeoutMs: safeTimeoutMs
+        timeoutMs: safeTimeoutMs,
+        requireAwsSigninRoute: true
       })
     }
     return pinned
@@ -2012,7 +2074,8 @@ export function RegisterPage(): React.JSX.Element {
           url: pinned.url,
           upstreamProxy: pinned.upstreamProxy || undefined,
           testUrl: 'https://api.ipify.org?format=json',
-          timeoutMs: safeTimeoutMs
+          timeoutMs: safeTimeoutMs,
+          requireAwsSigninRoute: true
         })
       : window.api.networkRouteValidate({
           testUrl: 'https://api.ipify.org?format=json',
@@ -2097,8 +2160,8 @@ export function RegisterPage(): React.JSX.Element {
       : terminal.category === 'risk_control'
         ? 'risk_control'
         : null
-    const safetyDecision = safetyEvent ? registrationCircuit.current.record(safetyEvent) : null
-    if (batchContinueOnError && !safetyDecision?.stop) {
+    if (safetyEvent) registrationCircuit.current.record(safetyEvent)
+    if (batchContinueOnError) {
       const detail = err || 'unknown error'
       addLog(`[BatchGuard] ${terminal.label} in ${context}; continuing batch because Continue on task error is enabled: ${detail}`)
       void useWebhookStore.getState().triggerEvent('risk-warning', {
@@ -2134,6 +2197,16 @@ export function RegisterPage(): React.JSX.Element {
   }, [addLog, batchContinueOnError])
 
   const requestBatchStopForSafetyCircuit = useCallback((reason: string, context: string): void => {
+    if (batchContinueOnError) {
+      addLog(`[BatchGuard] Safety circuit warning in ${context}; continuing batch because Continue on task error is enabled: ${reason}`)
+      void useWebhookStore.getState().triggerEvent('risk-warning', {
+        title: 'Registration safety circuit warning',
+        message: reason,
+        level: 'warn',
+        fields: { Context: context, Reason: reason }
+      })
+      return
+    }
     if (batchAbort.current) return
     batchAbort.current = true
     batchPause.current = false
@@ -2153,7 +2226,7 @@ export function RegisterPage(): React.JSX.Element {
       fields: { Context: context, Reason: reason }
     })
     void window.api.registrationCancel()
-  }, [addLog])
+  }, [addLog, batchContinueOnError])
 
   const requestBatchStopForProxyConfigError = useCallback((err: string): void => {
     if (!batchAbort.current) {
@@ -3361,6 +3434,25 @@ export function RegisterPage(): React.JSX.Element {
       if (rotateProxyPerTask) {
         const taskProxy = useAccountsStore.getState().pickNextProxy(getBatchProxyExclusions())
         if (!taskProxy) {
+          if (batchContinueOnError) {
+            const routeError = `No usable proxy route before task ${i + 1}/${totalCount}`
+            addLog(`[NetworkGuard] ${routeError}; marking task failed and continuing because Continue on task error is enabled.`)
+            await handleBatchOutcome(itemId, {
+              success: false,
+              result: { status: 'failed', email: '', error: routeError } as RegResult
+            })
+            const doneForRun = clampRunCount(_batchDone, totalCount)
+            useTaskStore.getState().updateTask(taskCenterId, {
+              done: doneForRun,
+              successCount: _batchSuccess,
+              failedCount: _batchFail,
+              progress: totalCount > 0 ? Math.round((doneForRun / totalCount) * 100) : 0
+            })
+            if (i < items.length - 1 && !batchAbort.current && batchInterval > 0) {
+              await new Promise((r) => setTimeout(r, batchInterval * 1000))
+            }
+            continue
+          }
           requestBatchStopForProxyConfigError(`No usable proxy route before task ${i + 1}/${totalCount}`)
           break
         }
@@ -3410,7 +3502,6 @@ export function RegisterPage(): React.JSX.Element {
               circuitDecision.reason || routeError,
               `proxy preflight ${i + 1}/${totalCount}`
             )
-            break
           }
           continue
         }
@@ -4855,7 +4946,7 @@ export function RegisterPage(): React.JSX.Element {
 
             {result.status === 'success' && (
               <>
-                <div className="grid grid-cols-2 gap-3 text-sm p-3 bg-background/50 rounded-lg">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm p-3 bg-background/50 rounded-lg">
                   <div><span className="text-muted-foreground">{t('register.emailField')}</span> <span className="font-mono font-medium">{result.email}</span></div>
                   <div><span className="text-muted-foreground">{t('register.passwordField')}</span> <span className="font-mono font-medium">{result.password}</span></div>
                 </div>

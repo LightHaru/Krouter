@@ -357,7 +357,7 @@ export function ConfigSyncPage(): React.ReactNode {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
-          <div className="grid grid-cols-2 gap-2 text-sm">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm">
             <ExportToggle
               label={`${isEn ? 'Proxy Pool' : '代理池'} (${store.proxyPool.size})`}
               checked={opts.proxyPool}

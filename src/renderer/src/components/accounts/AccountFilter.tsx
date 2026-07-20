@@ -13,6 +13,8 @@ const SubscriptionOptions: { value: SubscriptionType; label: string; color: stri
 
 const StatusOptionsZh: { value: AccountStatus; label: string }[] = [
   { value: 'active', label: '正常' },
+  { value: 'blocked', label: 'Bị khóa' },
+  { value: 'quota_exhausted', label: 'Hết quota' },
   { value: 'expired', label: '已过期' },
   { value: 'error', label: '错误' },
   { value: 'unknown', label: '未知' }
@@ -20,6 +22,8 @@ const StatusOptionsZh: { value: AccountStatus; label: string }[] = [
 
 const StatusOptionsEn: { value: AccountStatus; label: string }[] = [
   { value: 'active', label: 'Active' },
+  { value: 'blocked', label: 'Blocked' },
+  { value: 'quota_exhausted', label: 'Quota exhausted' },
   { value: 'expired', label: 'Expired' },
   { value: 'error', label: 'Error' },
   { value: 'unknown', label: 'Unknown' }
@@ -67,7 +71,8 @@ export function AccountFilterPanel(): React.ReactNode {
     filter.usageMax !== undefined ||
     filter.daysRemainingMin !== undefined ||
     filter.daysRemainingMax !== undefined ||
-    filter.bannedOnly
+    filter.bannedOnly ||
+    filter.quotaExhaustedOnly
   )
 
   const toggleArrayFilter = <T extends string>(
@@ -171,6 +176,17 @@ export function AccountFilterPanel(): React.ReactNode {
                   onClick={() => setFilter({ ...filter, bannedOnly: !filter.bannedOnly })}
                 >
                   {isEn ? 'Banned' : '已封禁'}({stats.bannedCount})
+                </button>
+                <button
+                  className={cn(
+                    'px-2 py-0.5 text-xs rounded border transition-colors',
+                    filter.quotaExhaustedOnly
+                      ? 'bg-amber-500 text-white border-amber-500'
+                      : 'hover:bg-muted text-amber-600 border-amber-200'
+                  )}
+                  onClick={() => setFilter({ ...filter, quotaExhaustedOnly: !filter.quotaExhaustedOnly })}
+                >
+                  {isEn ? 'Quota exhausted' : 'Hết quota'}({stats.quotaExhaustedCount})
                 </button>
               </div>
             </div>

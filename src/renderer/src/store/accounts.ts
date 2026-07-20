@@ -64,6 +64,10 @@ type ProxyAccountUpdate = {
   quotaUsedDelta?: number
   quotaLimit?: number
   quotaResetAt?: number
+  quotaExhaustedAt?: number
+  suspendedAt?: number
+  suspendReason?: string
+  suspendMessage?: string
   requestCount?: number
   lastUsed?: number
 }
@@ -198,53 +202,103 @@ async function syncLocalSsoAccountAsync(
     })
     if (!verifyResult.success || !verifyResult.data) return
 
+    const verified = verifyResult.data
     const now = Date.now()
-    const newId = `${verifyResult.data.email}-${now}`
+
+    // Kiro rotates the refreshToken on every renewal, so the refreshToken match
+    // above misses a re-imported account that is already in the app under a
+    // different (older) token. Before creating a new account, look for an existing
+    // one with the same stable identity (userId / email+provider / profileArn). If
+    // found, update that account's credentials in place instead of adding a clone —
+    // otherwise the account visibly duplicates on every token rotation and cannot
+    // be deleted (a fresh clone reappears immediately).
+    const identityCandidate: Partial<Account> = {
+      email: verified.email,
+      userId: verified.userId,
+      profileArn: verified.profileArn || importResult.data.profileArn,
+      idp: (importResult.data.provider || 'BuilderId') as Account['idp'],
+      credentials: {
+        refreshToken: verified.refreshToken,
+        provider: (importResult.data.provider || 'BuilderId') as Account['credentials']['provider'],
+        authMethod: importResult.data.authMethod as 'IdC' | 'social'
+      } as Account['credentials']
+    }
+    const existingId = findDuplicateAccountId(get().accounts, identityCandidate)
+    if (existingId) {
+      set((state) => {
+        const accounts = new Map(state.accounts)
+        const existing = accounts.get(existingId)
+        if (existing) {
+          accounts.set(existingId, {
+            ...existing,
+            credentials: {
+              ...existing.credentials,
+              accessToken: verified.accessToken,
+              refreshToken: verified.refreshToken,
+              expiresAt: verified.expiresIn ? now + verified.expiresIn * 1000 : existing.credentials.expiresAt
+            },
+            isActive: true,
+            lastUsedAt: now
+          })
+        }
+        for (const [id, account] of accounts) {
+          if (id !== existingId && account.isActive) {
+            accounts.set(id, { ...account, isActive: false })
+          }
+        }
+        return { accounts, activeAccountId: existingId }
+      })
+      console.log('[Store] Refreshed credentials for existing local SSO account (no duplicate):', existingId)
+      get().saveToStorage()
+      return
+    }
+
+    const newId = `${verified.email}-${now}`
     const newAccount: Account = {
       id: newId,
-      email: verifyResult.data.email,
-      userId: verifyResult.data.userId,
-      nickname: verifyResult.data.email ? verifyResult.data.email.split('@')[0] : undefined,
+      email: verified.email,
+      userId: verified.userId,
+      nickname: verified.email ? verified.email.split('@')[0] : undefined,
       idp: (importResult.data.provider || 'BuilderId') as Account['idp'],
-      profileArn: verifyResult.data.profileArn || importResult.data.profileArn,
+      profileArn: verified.profileArn || importResult.data.profileArn,
       machineId: importResult.data.machineId,
       credentials: {
-        accessToken: verifyResult.data.accessToken,
+        accessToken: verified.accessToken,
         csrfToken: '',
-        refreshToken: verifyResult.data.refreshToken,
+        refreshToken: verified.refreshToken,
         clientId: importResult.data.clientId || '',
         clientSecret: importResult.data.clientSecret || '',
         region: importResult.data.region || 'us-east-1',
         startUrl: importResult.data.startUrl,
-        expiresAt: verifyResult.data.expiresIn ? now + verifyResult.data.expiresIn * 1000 : now + 3600 * 1000,
+        expiresAt: verified.expiresIn ? now + verified.expiresIn * 1000 : now + 3600 * 1000,
         authMethod: importResult.data.authMethod as 'IdC' | 'social',
         provider: (importResult.data.provider || 'BuilderId') as Account['credentials']['provider']
       },
       subscription: {
-        type: verifyResult.data.subscriptionType as SubscriptionType,
-        title: verifyResult.data.subscriptionTitle,
-        rawType: verifyResult.data.subscription?.rawType,
-        daysRemaining: verifyResult.data.daysRemaining,
-        expiresAt: verifyResult.data.expiresAt,
-        managementTarget: verifyResult.data.subscription?.managementTarget,
-        upgradeCapability: verifyResult.data.subscription?.upgradeCapability,
-        overageCapability: verifyResult.data.subscription?.overageCapability
+        type: verified.subscriptionType as SubscriptionType,
+        title: verified.subscriptionTitle,
+        rawType: verified.subscription?.rawType,
+        daysRemaining: verified.daysRemaining,
+        expiresAt: verified.expiresAt,
+        managementTarget: verified.subscription?.managementTarget,
+        upgradeCapability: verified.subscription?.upgradeCapability,
+        overageCapability: verified.subscription?.overageCapability
       },
       usage: {
-        current: verifyResult.data.usage.current,
-        limit: verifyResult.data.usage.limit,
-        percentUsed: verifyResult.data.usage.limit > 0
-          ? verifyResult.data.usage.current / verifyResult.data.usage.limit
+        current: verified.usage.current,
+        limit: verified.usage.limit,
+        percentUsed: verified.usage.limit > 0
+          ? verified.usage.current / verified.usage.limit
           : 0,
         lastUpdated: now,
-        baseLimit: verifyResult.data.usage.baseLimit,
-        baseCurrent: verifyResult.data.usage.baseCurrent,
-        freeTrialLimit: verifyResult.data.usage.freeTrialLimit,
-        freeTrialCurrent: verifyResult.data.usage.freeTrialCurrent,
-        freeTrialExpiry: verifyResult.data.usage.freeTrialExpiry,
-        bonuses: verifyResult.data.usage.bonuses,
-        nextResetDate: verifyResult.data.usage.nextResetDate,
-        resourceDetail: verifyResult.data.usage.resourceDetail
+        baseLimit: verified.usage.baseLimit,
+        baseCurrent: verified.usage.baseCurrent,
+        freeTrialLimit: verified.usage.freeTrialLimit,
+        freeTrialCurrent: verified.usage.freeTrialCurrent,
+        freeTrialExpiry: verified.usage.freeTrialExpiry,
+        bonuses: verified.usage.bonuses,
+        nextResetDate: verified.usage.nextResetDate,
+        resourceDetail: verified.usage.resourceDetail
       },
       status: 'active',
       createdAt: now,
@@ -264,7 +318,7 @@ async function syncLocalSsoAccountAsync(
       accounts.set(newId, newAccount)
       return { accounts, activeAccountId: newId }
     })
-    console.log('[Store] Auto-imported account from local SSO cache:', verifyResult.data.email)
+    console.log('[Store] Auto-imported account from local SSO cache:', verified.email)
     get().saveToStorage()
   } catch (e) {
     console.warn('[Store] Failed to sync local active account:', e)
@@ -303,6 +357,60 @@ function isBannedAccountError(error?: string): boolean {
     return false
   }
   return false
+}
+
+function parseUsageResetTime(value: unknown): number | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function usageResetDue(usage: Partial<AccountUsage> | undefined, now = Date.now()): boolean {
+  const resetAt = parseUsageResetTime(usage?.nextResetDate)
+  return typeof resetAt === 'number' && resetAt <= now
+}
+
+function isUsageQuotaExhausted(usage: Partial<AccountUsage> | undefined, now = Date.now()): boolean {
+  if (!usage || usageResetDue(usage, now)) return false
+  if (typeof usage.quotaExhaustedAt === 'number' && usage.quotaExhaustedAt > 0) return true
+  const current = Number(usage.current)
+  const limit = Number(usage.limit)
+  return Number.isFinite(current) && Number.isFinite(limit) && limit > 0 && current >= limit
+}
+
+function accountIsBlocked(account: Account): boolean {
+  return account.status === 'blocked' ||
+    (typeof account.usage?.suspendedAt === 'number' && account.usage.suspendedAt > 0) ||
+    isBannedAccountError(account.lastError)
+}
+
+function normalizeAccountLifecycle(account: Account, now = Date.now(), forceClearBlocked = false): Account {
+  const resetDue = usageResetDue(account.usage, now)
+  const usage = resetDue && account.usage.quotaExhaustedAt
+    ? { ...account.usage, quotaExhaustedAt: undefined }
+    : account.usage
+
+  const blocked = !forceClearBlocked && (
+    account.status === 'blocked' ||
+    (typeof usage.suspendedAt === 'number' && usage.suspendedAt > 0) ||
+    isBannedAccountError(account.lastError)
+  )
+  const quotaExhausted = !blocked && isUsageQuotaExhausted(usage, now)
+
+  let status: AccountStatus = account.status
+  let lastError = account.lastError
+  if (blocked) {
+    status = 'blocked'
+  } else if (quotaExhausted) {
+    status = 'quota_exhausted'
+    lastError = lastError || 'Quota exhausted until reset'
+  } else if (status === 'blocked' || status === 'quota_exhausted') {
+    status = 'active'
+    if (lastError === 'Quota exhausted until reset') lastError = undefined
+  }
+
+  if (usage === account.usage && status === account.status && lastError === account.lastError) return account
+  return { ...account, usage, status, lastError }
 }
 
 // 自动换号定时器
@@ -387,18 +495,56 @@ function resolveIncomingAccountStatus(account: Account, status: string | undefin
 function preserveBannedState<T extends Account>(current: Account, next: T, forceClearBanned = false): T {
   const currentBanned = isBannedAccountError(current.lastError)
   const incomingBanned = isBannedAccountError(next.lastError)
+
+  // Always preserve incoming banned errors
   if (incomingBanned) {
-    return {
+    return normalizeAccountLifecycle({
       ...next,
-      status: 'error'
+      status: 'blocked'
+    }, Date.now()) as T
+  }
+
+  // Clear banned state if forced
+  if (forceClearBanned) {
+    return normalizeAccountLifecycle({
+      ...next,
+      usage: {
+        ...next.usage,
+        suspendedAt: undefined,
+        suspendReason: undefined,
+        suspendMessage: undefined
+      }
+    }, Date.now(), true) as T
+  }
+
+  // Preserve existing banned errors
+  if (currentBanned) {
+    return normalizeAccountLifecycle({
+      ...next,
+      status: 'blocked',
+      lastError: current.lastError
+    }, Date.now()) as T
+  }
+
+  // NEW: Preserve diagnostic/liveness errors when incoming update does not have error info
+  // This prevents proxy updates from overriding diagnostic test results
+  if (current.status === "error" && current.lastError && !next.lastError) {
+    // Check if current error is from diagnostic test (not transient network errors)
+    const isLivenessError = current.lastError.includes("Liveness test failed") ||
+                            current.lastError.includes("Kiểm tra liveness thất bại") ||
+                            current.lastError.includes("test failed") ||
+                            current.lastError.includes("model test")
+
+    if (isLivenessError) {
+      return {
+        ...next,
+        status: "error",
+        lastError: current.lastError
+      }
     }
   }
-  if (!currentBanned || forceClearBanned) return next
-  return {
-    ...next,
-    status: 'error',
-    lastError: current.lastError
-  }
+
+  return normalizeAccountLifecycle(next, Date.now()) as T
 }
 
 function normalizeUsagePercent(usage: { current?: number; limit?: number; percentUsed?: number }): number {
@@ -414,14 +560,14 @@ function normalizeUsagePercent(usage: { current?: number; limit?: number; percen
 
 function normalizeAccountUsage(account: Account): Account {
   const percentUsed = normalizeUsagePercent(account.usage)
-  if (account.usage.percentUsed === percentUsed) return account
-  return {
+  const withPercent = account.usage.percentUsed === percentUsed ? account : {
     ...account,
     usage: {
       ...account.usage,
       percentUsed
     }
   }
+  return normalizeAccountLifecycle(withPercent)
 }
 
 function usageResetAdvanced(currentUsage: AccountUsage, incomingUsage: Partial<AccountUsage>): boolean {
@@ -875,12 +1021,32 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const nextResetDate = typeof proxyAccount.quotaResetAt === 'number'
         ? new Date(proxyAccount.quotaResetAt).toISOString().slice(0, 10)
         : account.usage.nextResetDate
+      const quotaExhaustedAt = typeof proxyAccount.quotaExhaustedAt === 'number'
+        ? proxyAccount.quotaExhaustedAt
+        : account.usage.quotaExhaustedAt
+      const suspendedAt = typeof proxyAccount.suspendedAt === 'number'
+        ? proxyAccount.suspendedAt
+        : account.usage.suspendedAt
       const delta = typeof proxyAccount.quotaUsedDelta === 'number' && proxyAccount.quotaUsedDelta > 0
         ? proxyAccount.quotaUsedDelta
         : 0
       const current = delta > 0 && account.usage.current > incomingCurrent
         ? account.usage.current + delta
         : Math.max(account.usage.current, incomingCurrent)
+      const nextUsage: AccountUsage = {
+        ...account.usage,
+        current,
+        limit,
+        percentUsed: limit > 0 ? current / limit : 0,
+        lastUpdated: now,
+        nextResetDate,
+        quotaExhaustedAt,
+        suspendedAt,
+        suspendReason: proxyAccount.suspendReason || account.usage.suspendReason,
+        suspendMessage: proxyAccount.suspendMessage || account.usage.suspendMessage
+      }
+      const isBlockedUpdate = typeof suspendedAt === 'number' && suspendedAt > 0
+      const isQuotaUpdate = isUsageQuotaExhausted(nextUsage, now)
 
       accounts.set(proxyAccount.id, preserveBannedState(account, normalizeAccountUsage({
         ...account,
@@ -891,17 +1057,14 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           refreshToken: proxyAccount.refreshToken || account.credentials.refreshToken,
           expiresAt: proxyAccount.expiresAt || account.credentials.expiresAt
         },
-        usage: {
-          ...account.usage,
-          current,
-          limit,
-          percentUsed: limit > 0 ? current / limit : 0,
-          lastUpdated: now,
-          nextResetDate
-        },
+        usage: nextUsage,
         lastUsedAt: proxyAccount.lastUsed || now,
-        status: 'active',
-        lastError: undefined
+        status: isBlockedUpdate ? 'blocked' : isQuotaUpdate ? 'quota_exhausted' : 'active',
+        lastError: isBlockedUpdate
+          ? `[${proxyAccount.suspendReason || account.usage.suspendReason || 'ACCOUNT_BLOCKED'}] ${proxyAccount.suspendMessage || account.usage.suspendMessage || 'Account blocked by Kiro'}`
+          : isQuotaUpdate
+            ? 'Quota exhausted until reset'
+            : undefined
       })))
 
       return { accounts }
@@ -926,7 +1089,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
       return { accounts, selectedIds, activeAccountId, accountProxyBindings: bindings }
     })
-    get().saveToStorage()
+    // Flush immediately (bypass the 500ms debounce) so the deletion + tombstone
+    // reach disk before any polling loadFromStorage can race and resurrect it.
+    void get().flushSaveImmediately()
   },
 
   removeAccounts: (ids) => {
@@ -955,7 +1120,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       return { accounts, selectedIds, activeAccountId, accountProxyBindings: bindings }
     })
 
-    get().saveToStorage()
+    // Flush immediately (bypass debounce) so batch deletions + tombstones persist
+    // before any polling loadFromStorage can race and resurrect them.
+    void get().flushSaveImmediately()
     return result
   },
 
@@ -1287,7 +1454,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     // 封禁筛选
     if (filter.bannedOnly) {
-      result = result.filter((a) => isBannedAccountError(a.lastError))
+      result = result.filter((a) => accountIsBlocked(a))
+    }
+
+    if (filter.quotaExhaustedOnly) {
+      result = result.filter((a) => isUsageQuotaExhausted(a.usage))
     }
 
     // 应用排序
@@ -1946,7 +2117,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         expired: 0,
         error: 0,
         refreshing: 0,
-        unknown: 0
+        unknown: 0,
+        blocked: 0,
+        quota_exhausted: 0
       },
       bySubscription: {
         Free: 0,
@@ -1967,7 +2140,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       },
       activeCount: 0,
       expiringSoonCount: 0,
-      bannedCount: 0
+      bannedCount: 0,
+      quotaExhaustedCount: 0
     }
 
     for (const account of accountList) {
@@ -1981,8 +2155,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         stats.expiringSoonCount++
       }
       // 统计封禁账号
-      if (isBannedAccountError(account.lastError)) {
+      if (accountIsBlocked(account)) {
         stats.bannedCount++
+      }
+      if (isUsageQuotaExhausted(account.usage)) {
+        stats.quotaExhaustedCount++
       }
     }
 
@@ -2004,11 +2181,21 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const data = await window.api.loadAccounts()
 
       if (data) {
-        // Keep this set session-local. Persisted delete tombstones are enforced by
-        // the server merge layer; re-sending old tombstones from every browser tab
-        // can delete accounts restored or added by another session.
-        deletedAccountIds.clear()
-        const accounts = new Map(Object.entries(data.accounts ?? {}) as [string, Account][])
+        // Reconcile local delete tombstones against server-confirmed ones.
+        // Previously this unconditionally cleared the local set, which created a
+        // race: a poll landing between a delete and its debounced save would wipe
+        // the pending tombstone AND reload the just-deleted account from stale
+        // server data, resurrecting it permanently. Instead we drop only tombstones
+        // the server has already persisted, and keep the still-pending ones so the
+        // deleted account is neither shown nor re-saved until the delete lands.
+        const serverConfirmedDeletes = Array.isArray(data._deletedAccountIds)
+          ? data._deletedAccountIds.filter((id): id is string => typeof id === 'string')
+          : []
+        for (const id of serverConfirmedDeletes) deletedAccountIds.delete(id)
+        const accounts = new Map(
+          (Object.entries(data.accounts ?? {}) as [string, Account][])
+            .filter(([id]) => !deletedAccountIds.has(id))
+        )
         const activeAccountId = data.activeAccountId ?? null
 
         // 为没有 machineId 的现有账户生成一个
@@ -2066,7 +2253,16 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           proxyPool: data.proxyPool
             ? new Map(Object.entries(data.proxyPool as Record<string, ProxyEntry>))
             : new Map<string, ProxyEntry>(),
-          proxyPoolConfig: { ...DEFAULT_PROXY_POOL_CONFIG, ...(data.proxyPoolConfig as Partial<ProxyPoolConfig> | undefined) },
+          proxyPoolConfig: {
+            ...DEFAULT_PROXY_POOL_CONFIG,
+            ...(data.proxyPoolConfig as Partial<ProxyPoolConfig> | undefined),
+            sourceRemoveDead: true,
+            maxUsableLatencyMs: Math.max(
+              100,
+              Number((data.proxyPoolConfig as Partial<ProxyPoolConfig> | undefined)?.maxUsableLatencyMs) ||
+                DEFAULT_PROXY_POOL_CONFIG.maxUsableLatencyMs
+            )
+          },
           proxyPoolCursor: typeof data.proxyPoolCursor === 'number' ? data.proxyPoolCursor : 0,
           accountProxyBindings: (data.accountProxyBindings as Record<string, string> | undefined) || {}
         })
@@ -3371,7 +3567,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         url: entry.url,
         testUrl: proxyPoolConfig.testUrl,
         timeoutMs: proxyPoolConfig.testTimeoutMs,
-        upstreamProxy: proxyPoolConfig.upstreamProxy
+        upstreamProxy: proxyPoolConfig.upstreamProxy,
+        requireAwsSigninRoute: true
       })
     } catch (err) {
       result = { success: false, error: err instanceof Error ? err.message : String(err) }
@@ -3382,25 +3579,27 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const existing = next.get(id)
       if (existing) {
         const latencyMs = result.latencyMs
+        const fastEnough = result.success &&
+          typeof latencyMs === 'number' &&
+          Number.isFinite(latencyMs) &&
+          latencyMs <= state.proxyPoolConfig.maxUsableLatencyMs
         const status: ProxyEntry['status'] = result.success
-          ? (latencyMs !== undefined && latencyMs > 3000 ? 'slow' : 'alive')
+          ? (fastEnough ? 'alive' : 'slow')
           : 'dead'
         next.set(id, {
           ...existing,
           status,
           latencyMs: result.latencyMs,
           lastTestedAt: Date.now(),
-          lastError: result.success ? undefined : result.error,
+          lastError: fastEnough
+            ? undefined
+            : result.success
+              ? `Latency ${latencyMs ?? 'unknown'}ms exceeds ${state.proxyPoolConfig.maxUsableLatencyMs}ms quality limit`
+              : result.error,
           // 验活失败也累计到 failCount，但不计入 reportProxyResult 的注册失败
-          failCount: result.success ? existing.failCount : existing.failCount + 1,
+          failCount: fastEnough ? 0 : existing.failCount + 1,
           // 自动停用：累计失败超过阈值；但池中可用代理 <= 1 时保护性保留（轮换代理避免变直连）
-          enabled: result.success
-            ? existing.enabled
-            : (state.proxyPoolConfig.autoDisableDead
-              && existing.failCount + 1 >= state.proxyPoolConfig.failureThreshold
-              && Array.from(state.proxyPool.values()).filter((p) => p.enabled && p.status !== 'dead').length > 1
-              ? false
-              : existing.enabled)
+          enabled: fastEnough ? existing.enabled : false
         })
       }
       return { proxyPool: next }
@@ -3435,7 +3634,16 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   setProxyPoolConfig: (config) => {
     set((state) => ({
-      proxyPoolConfig: { ...state.proxyPoolConfig, ...config }
+      proxyPoolConfig: {
+        ...state.proxyPoolConfig,
+        ...config,
+        sourceRemoveDead: true,
+        maxUsableLatencyMs: Math.max(
+          100,
+          Number(config.maxUsableLatencyMs ?? state.proxyPoolConfig.maxUsableLatencyMs) ||
+            DEFAULT_PROXY_POOL_CONFIG.maxUsableLatencyMs
+        )
+      }
     }))
     get().saveToStorage()
   },
@@ -3451,8 +3659,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       : new Set<string>()
 
     // 仅在启用且非 dead 的代理中挑选
-    const candidates = Array.from(proxyPool.values())
-      .filter(p => p.enabled && p.status !== 'dead' && !excludeIds.has(p.id) && !excludeHosts.has(p.host))
+    const eligible = Array.from(proxyPool.values())
+      .filter(p => isProxyUsable(p, proxyPoolConfig) && !excludeIds.has(p.id) && !excludeHosts.has(p.host))
+    const candidates = eligible
     if (candidates.length === 0) return null
 
     let picked: ProxyEntry
@@ -3501,14 +3710,13 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       if (!existing) return state
       // 仅「代理连接层错误」才累加 failCount；AWS 业务/风控失败（如 Portal/EOF/邮箱已注册）不计，
       // 避免把好代理（尤其只配了一条的轮换代理）误判停用导致变直连暴露真实 IP。
-      const isProxyFail = !success && isProxyConnectionError(errorMsg)
+      const hardRouteFail = !success && isHardProxyRouteFailure(errorMsg)
+      const isProxyFail = !success && (hardRouteFail || isProxyConnectionError(errorMsg))
       const failCount = isProxyFail ? existing.failCount + 1 : existing.failCount
       // 轮换代理保护：池中可用代理 <= 1 时不自动停用
-      const enabledCount = Array.from(state.proxyPool.values()).filter((p) => p.enabled && p.status !== 'dead').length
       const autoDisable = isProxyFail
         && state.proxyPoolConfig.autoDisableDead
-        && failCount >= state.proxyPoolConfig.failureThreshold
-        && enabledCount > 1
+        && (hardRouteFail || failCount >= state.proxyPoolConfig.failureThreshold)
       autoDisabled = autoDisable
       next.set(id, {
         ...existing,
@@ -3580,7 +3788,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   autoDistributeAccountsToProxies: ({ accountsPerProxy = 0, onlyUnbound = false, accountIds }) => {
     const state = get()
     const aliveProxies = Array.from(state.proxyPool.values())
-      .filter((p) => p.enabled && p.status !== 'dead')
+      .filter((p) => isProxyUsable(p, state.proxyPoolConfig))
     if (aliveProxies.length === 0) {
       return { distributed: 0, perProxy: {}, skipped: 0 }
     }
@@ -3653,7 +3861,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     if (!binding) return undefined
     const proxy = state.proxyPool.get(binding)
     if (proxy) {
-      if (!proxy.enabled || proxy.status === 'dead') return undefined
+      if (!isProxyUsable(proxy, state.proxyPoolConfig)) return undefined
       return proxy.url
     }
     const direct = parseProxyUrl(binding)
@@ -3726,26 +3934,52 @@ interface ParsedProxy {
 function isProxyConnectionError(msg: string | undefined): boolean {
   const m = (msg || '').toLowerCase()
   if (!m) return false
-  return m.includes('proxy')
-    || m.includes('fetch failed')
-    || m.includes('timeout')
-    || m.includes('timed out')
-    || m.includes('aborted due to timeout')
-    || m.includes('network route check failed')
-    || m.includes('missing exit ip')
-    || m.includes('status=0')
-    || m.includes('failed to do request')
-    || m.includes('econnrefused')
-    || m.includes('econnreset')
-    || m.includes('etimedout')
-    || m.includes('ehostunreach')
-    || m.includes('enetunreach')
-    || m.includes('tunnel')
-    || m.includes('dial tcp')
-    || m.includes('connection refused')
-    || m.includes('connection reset')
-    || m.includes('407')
-    || m.includes('socks')
+  const ascii = m.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  const searchable = `${m} ${ascii}`
+  return searchable.includes('proxy')
+    || searchable.includes('fetch failed')
+    || searchable.includes('timeout')
+    || searchable.includes('timed out')
+    || searchable.includes('aborted due to timeout')
+    || searchable.includes('het thoi gian')
+    || searchable.includes('thoi gian cho')
+    || (searchable.includes('workflowinit') && searchable.includes('35') && searchable.includes('gi'))
+    || searchable.includes('network route check failed')
+    || searchable.includes('missing exit ip')
+    || searchable.includes('status=0')
+    || searchable.includes('failed to do request')
+    || searchable.includes('econnrefused')
+    || searchable.includes('econnreset')
+    || searchable.includes('etimedout')
+    || searchable.includes('ehostunreach')
+    || searchable.includes('enetunreach')
+    || searchable.includes('tunnel')
+    || searchable.includes('dial tcp')
+    || searchable.includes('connection refused')
+    || searchable.includes('connection reset')
+    || searchable.includes('407')
+    || searchable.includes('socks')
+}
+
+function isHardProxyRouteFailure(msg: string | undefined): boolean {
+  const m = (msg || '').toLowerCase()
+  if (!m) return false
+  const ascii = m.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  const searchable = `${m} ${ascii}`
+  return searchable.includes('proxy gateway returned an html 403')
+    || searchable.includes('gateway returned an html forbidden page')
+    || searchable.includes('aws sign-in route failed')
+    || searchable.includes('route/proxy is not usable for aws sign-in')
+    || searchable.includes('route nay bi gateway tu choi aws sign-in')
+}
+
+function isProxyUsable(proxy: ProxyEntry, config: ProxyPoolConfig): boolean {
+  return proxy.enabled === true &&
+    proxy.status === 'alive' &&
+    typeof proxy.latencyMs === 'number' &&
+    Number.isFinite(proxy.latencyMs) &&
+    proxy.latencyMs >= 0 &&
+    proxy.latencyMs <= config.maxUsableLatencyMs
 }
 
 function parseProxyUrl(raw: string): ParsedProxy | null {

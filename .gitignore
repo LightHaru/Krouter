@@ -15,3 +15,43 @@ out-server
 krouter-*.png
 test-openclaw-import.cjs
 docs/codex-thread-summary.md
+
+# Environment variables (CRITICAL: không commit credentials)
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Data directories (chứa API keys, accounts, sensitive data)
+.krouter-data/
+.krouter/
+UsersADMIN.krouter/
+.e2e-data/
+*.db
+*.sqlite
+
+# Test outputs
+test-bedrock-key.py
+1
+
+# Build artifacts
+tsconfig.node.tsbuildinfo
+tsconfig.web.tsbuildinfo
+
+# Development logs
+devlog.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Temporary
+tmp/
+temp/
+*.tmp

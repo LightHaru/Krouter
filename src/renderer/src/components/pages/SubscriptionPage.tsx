@@ -1741,7 +1741,7 @@ function ImportLinksDialog({ open, onClose, onImport, isEn }: ImportLinksDialogP
       <div className="absolute inset-0 bg-black/50" onClick={onClose} />
       <div className="relative bg-background rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col animate-in fade-in zoom-in-95 duration-200">
         {/* 标题栏 */}
-        <div className="flex items-center justify-between px-6 py-4 border-b">
+        <div className="flex items-center justify-between flex-wrap gap-2 px-6 py-4 border-b">
           <div className="flex items-center gap-2">
             <Upload className="h-5 w-5 text-primary" />
             <h2 className="text-lg font-semibold">{isEn ? 'Import Links' : '批量导入链接'}</h2>

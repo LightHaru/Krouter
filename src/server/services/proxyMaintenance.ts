@@ -27,6 +27,7 @@ export interface ProxyMaintenanceConfig {
   accountCheckConcurrency: number
   testUrl: string
   testTimeoutMs: number
+  maxUsableLatencyMs: number
   upstreamProxy?: string
 }
 
@@ -79,6 +80,12 @@ type StoredAccount = AccountLike & {
   lastError?: string
   lastCheckedAt?: number
   maintenanceFailureCount?: number
+  usage?: {
+    suspendedAt?: number
+    suspendReason?: string
+    suspendMessage?: string
+    [key: string]: unknown
+  }
 }
 
 type AccountCheckResult = {
@@ -141,6 +148,7 @@ const DEFAULT_CONFIG: ProxyMaintenanceConfig = {
   accountCheckConcurrency: 8,
   testUrl: 'https://api.iplocate.io/ip',
   testTimeoutMs: 6000,
+  maxUsableLatencyMs: 1000,
   upstreamProxy: ''
 }
 
@@ -165,6 +173,7 @@ export function normalizeProxyMaintenanceConfig(raw: unknown): ProxyMaintenanceC
     accountCheckConcurrency: clampNumber(config.accountCheckConcurrency, 8, 1, 50),
     testUrl: String(config.testUrl || DEFAULT_CONFIG.testUrl).trim() || DEFAULT_CONFIG.testUrl,
     testTimeoutMs: clampNumber(config.testTimeoutMs, DEFAULT_CONFIG.testTimeoutMs, 1000, 30000),
+    maxUsableLatencyMs: clampNumber(config.maxUsableLatencyMs, DEFAULT_CONFIG.maxUsableLatencyMs, 100, 10000),
     upstreamProxy: typeof config.upstreamProxy === 'string' ? config.upstreamProxy.trim() : ''
   }
 }
@@ -290,6 +299,22 @@ function shouldKeepForTransientFailure(message: string): boolean {
   )
 }
 
+function isFastProxyOutcome(validation: ProxyValidationOutcome, maxLatencyMs: number): boolean {
+  return validation.success === true &&
+    typeof validation.latencyMs === 'number' &&
+    Number.isFinite(validation.latencyMs) &&
+    validation.latencyMs >= 0 &&
+    validation.latencyMs <= maxLatencyMs
+}
+
+function isStoredProxyFast(proxy: StoredProxy, maxLatencyMs: number): boolean {
+  return proxy.enabled === true &&
+    proxy.status === 'alive' &&
+    typeof proxy.latencyMs === 'number' &&
+    Number.isFinite(proxy.latencyMs) &&
+    proxy.latencyMs <= maxLatencyMs
+}
+
 function buildProxyEntry(proxy: ParsedProxy, validation: ProxyValidationOutcome, now: number): StoredProxy {
   return {
     id: crypto.randomUUID(),
@@ -302,7 +327,7 @@ function buildProxyEntry(proxy: ParsedProxy, validation: ProxyValidationOutcome,
     label: 'IPLocate',
     source: IPLOCATE_PROXY_SOURCE,
     tags: ['iplocate', 'free-proxy'],
-    status: (validation.latencyMs || 0) > 3000 ? 'slow' : 'alive',
+    status: 'alive',
     latencyMs: validation.latencyMs,
     lastTestedAt: now,
     usedCount: 0,
@@ -325,7 +350,7 @@ function updateProxyEntry(entry: StoredProxy, validation: ProxyValidationOutcome
   }
   return {
     ...entry,
-    status: (validation.latencyMs || 0) > 3000 ? 'slow' : 'alive',
+    status: 'alive',
     latencyMs: validation.latencyMs,
     lastTestedAt: now,
     lastError: undefined,
@@ -489,14 +514,15 @@ export class ProxyMaintenanceRuntime {
                 url: proxy.url,
                 testUrl: config.testUrl,
                 timeoutMs: config.testTimeoutMs,
-                upstreamProxy: config.upstreamProxy
+                upstreamProxy: config.upstreamProxy,
+                requireAwsSigninRoute: true
               })
               outcome = { proxy, ...result }
             } catch (error) {
               outcome = { proxy, success: false, error: errorText(error) }
             }
             proxiesChecked++
-            if (outcome.success) proxiesAlive++
+            if (isFastProxyOutcome(outcome, config.maxUsableLatencyMs)) proxiesAlive++
             this.status.proxiesChecked = proxiesChecked
             this.status.proxiesAlive = proxiesAlive
             if (proxiesChecked % 50 === 0 || proxiesChecked === candidates.length) {
@@ -506,7 +532,7 @@ export class ProxyMaintenanceRuntime {
           }
         )
         this.status.proxiesChecked = proxyOutcomes.length
-        this.status.proxiesAlive = proxyOutcomes.filter((item) => item.success).length
+        this.status.proxiesAlive = proxyOutcomes.filter((item) => isFastProxyOutcome(item, config.maxUsableLatencyMs)).length
       }
 
       const accountDataAtStart = this.getAccountData()
@@ -636,11 +662,21 @@ export class ProxyMaintenanceRuntime {
     const now = this.now()
 
     if (config.sourceSyncEnabled && proxyOutcomes.length > 0) {
-      const alive = proxyOutcomes.filter((item) => item.success)
+      const reachable = proxyOutcomes.filter((item) => item.success)
+      const alive = proxyOutcomes.filter((item) => isFastProxyOutcome(item, config.maxUsableLatencyMs))
       const minimumAlive = Math.min(3, proxyOutcomes.length)
-      const systemicFailure = alive.length < minimumAlive && alive.length / proxyOutcomes.length < 0.01
+      const systemicFailure = reachable.length < minimumAlive && reachable.length / proxyOutcomes.length < 0.01
       if (systemicFailure) {
-        const message = `Source validation returned only ${alive.length}/${proxyOutcomes.length} live proxies; existing managed proxies were preserved`
+        for (const [id, entry] of Object.entries(proxyPool)) {
+          if (entry.source !== IPLOCATE_PROXY_SOURCE || isStoredProxyFast(entry, config.maxUsableLatencyMs)) continue
+          delete proxyPool[id]
+          deletedProxyIds.add(id)
+          this.status.proxiesRemoved++
+          for (const [accountId, proxyId] of Object.entries(bindings)) {
+            if (proxyId === id) delete bindings[accountId]
+          }
+        }
+        const message = `Source validation returned only ${reachable.length}/${proxyOutcomes.length} reachable proxies; only previously verified fast proxies were preserved`
         this.status.recentErrors = [message, ...this.status.recentErrors].slice(0, 10)
       } else {
         const outcomesByUrl = new Map(proxyOutcomes.map((item) => [item.proxy.url, item]))
@@ -652,14 +688,14 @@ export class ProxyMaintenanceRuntime {
         for (const [id, entry] of Object.entries(proxyPool)) {
           if (entry.source !== IPLOCATE_PROXY_SOURCE) continue
           const outcome = outcomesByUrl.get(entry.url)
-          if (!outcome || (!outcome.success && config.sourceRemoveDead)) {
+          if (!outcome || !isFastProxyOutcome(outcome, config.maxUsableLatencyMs)) {
             delete proxyPool[id]
             deletedProxyIds.add(id)
             this.status.proxiesRemoved++
             for (const [accountId, proxyId] of Object.entries(bindings)) {
               if (proxyId === id) delete bindings[accountId]
             }
-          } else if (outcome) {
+          } else {
             proxyPool[id] = updateProxyEntry(entry, outcome, now)
           }
         }
@@ -674,15 +710,29 @@ export class ProxyMaintenanceRuntime {
       }
     }
 
+    for (const [id, entry] of Object.entries(proxyPool)) {
+      if (isStoredProxyFast(entry, config.maxUsableLatencyMs)) continue
+      delete proxyPool[id]
+      deletedProxyIds.add(id)
+      this.status.proxiesRemoved++
+      for (const [accountId, proxyId] of Object.entries(bindings)) {
+        if (proxyId === id || proxyId === entry.url) delete bindings[accountId]
+      }
+    }
+
     for (const outcome of accountOutcomes) {
       const current = accounts[outcome.id]
       if (!current) continue
       if (outcome.result.success) {
         const newCredentials = outcome.result.data?.newCredentials
+        const alreadyBlocked = current.status === 'blocked' ||
+          (typeof current.usage?.suspendedAt === 'number' && current.usage.suspendedAt > 0) ||
+          Boolean(classifyKiroAccountError(current.lastError).isBanned)
         accounts[outcome.id] = {
           ...current,
-          status: outcome.result.data?.status || 'active',
-          lastError: undefined,
+          // Credential/quota success does not prove that model access was unblocked.
+          status: alreadyBlocked ? 'blocked' : outcome.result.data?.status || 'active',
+          lastError: alreadyBlocked ? current.lastError : undefined,
           lastCheckedAt: now,
           maintenanceFailureCount: 0,
           credentials: newCredentials
@@ -706,9 +756,27 @@ export class ProxyMaintenanceRuntime {
         continue
       }
 
+      if (outcome.removeImmediately) {
+        accounts[outcome.id] = {
+          ...current,
+          status: 'blocked',
+          lastError: outcome.error || current.lastError || 'Account blocked by Kiro',
+          lastCheckedAt: now,
+          maintenanceFailureCount: 0,
+          usage: {
+            ...(current.usage || {}),
+            suspendedAt: current.usage?.suspendedAt || now,
+            suspendReason: current.usage?.suspendReason || 'TEMPORARILY_SUSPENDED',
+            suspendMessage: outcome.error || current.usage?.suspendMessage || 'Account blocked by Kiro'
+          }
+        }
+        if (accountData.activeAccountId === outcome.id) accountData.activeAccountId = null
+        continue
+      }
+
       const failureCount = (Number(current.maintenanceFailureCount) || 0) + 1
       const shouldDelete = config.accountDeleteDead &&
-        (outcome.removeImmediately || failureCount >= config.accountFailureThreshold)
+        failureCount >= config.accountFailureThreshold
       if (!shouldDelete) {
         accounts[outcome.id] = {
           ...current,
@@ -729,6 +797,14 @@ export class ProxyMaintenanceRuntime {
 
     accountData.accounts = accounts
     accountData.proxyPool = proxyPool
+    accountData.proxyPoolConfig = {
+      ...(accountData.proxyPoolConfig && typeof accountData.proxyPoolConfig === 'object'
+        ? accountData.proxyPoolConfig as Record<string, unknown>
+        : {}),
+      ...config,
+      sourceRemoveDead: true,
+      maxUsableLatencyMs: config.maxUsableLatencyMs
+    }
     accountData.accountProxyBindings = bindings
     accountData._deletedAccountIds = Array.from(deletedAccountIds)
     accountData._deletedProxyIds = Array.from(deletedProxyIds)

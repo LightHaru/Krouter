@@ -189,7 +189,11 @@ describe('ProxyServer capability — getNextAccountForModel selection invariants
               email: `${id}@test`,
               accessToken: 'tok',
               errorCount: 0,
-              groupId: undefined
+              groupId: undefined,
+              // Tier routing is always on: give a Paid tag so the tag pre-filter
+              // admits these accounts for the premium OPUS model, leaving the
+              // capability-cache + availability logic to govern final selection.
+              subscriptionType: 'Pro'
             }
             ps.accountPool.addAccount(applyState(base, spec.state, now))
             seedTierCache(ps, id, spec.tier)
@@ -250,7 +254,10 @@ describe('ProxyServer capability — getNextAccountForModel selection invariants
               email: `${id}@test`,
               accessToken: 'tok',
               errorCount: 0,
-              groupId: spec.groupId
+              groupId: spec.groupId,
+              // Tier routing is always on: Paid tag admits these accounts for the
+              // premium OPUS model so only bindings/group membership decide.
+              subscriptionType: 'Pro'
             } as any)
             seedTierCache(ps, id, 'power')
           })

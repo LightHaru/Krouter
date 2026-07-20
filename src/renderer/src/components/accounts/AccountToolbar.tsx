@@ -476,7 +476,7 @@ export function AccountToolbar({
               )
 
               return (
-                <div className="absolute left-0 top-full mt-2 z-50 w-[320px] max-h-[80vh] overflow-y-auto bg-popover border rounded-lg shadow-lg p-2">
+                <div className="absolute left-0 top-full mt-2 z-50 w-[320px] max-w-[90vw] max-h-[80vh] overflow-y-auto bg-popover border rounded-lg shadow-lg p-2">
                   <div className="absolute -top-2 left-4 w-4 h-4 bg-popover border-l border-t rotate-45" />
 
                   {/* === 区头：标题 + 选中提示 === */}
@@ -680,7 +680,7 @@ export function AccountToolbar({
               const aliveProxies = Array.from(proxyPool.values()).filter((p) => p.enabled && p.status !== 'dead')
               const { proxyCounts, total } = getSelectedProxyBindingStatus()
               return (
-                <div className="absolute right-0 top-full mt-2 z-50 w-[320px] max-h-[80vh] overflow-y-auto bg-popover border rounded-lg shadow-lg p-2">
+                <div className="absolute right-0 top-full mt-2 z-50 w-[320px] max-w-[90vw] max-h-[80vh] overflow-y-auto bg-popover border rounded-lg shadow-lg p-2">
                   <div className="absolute -top-2 right-4 w-4 h-4 bg-popover border-l border-t rotate-45" />
 
                   <div className="flex items-center justify-between px-2 py-1 mb-1">
@@ -798,7 +798,7 @@ export function AccountToolbar({
             </Button>
             {/* 筛选气泡面板 */}
             {isFilterExpanded && (
-              <div className="absolute right-0 top-full mt-2 z-50 min-w-[600px] bg-popover border rounded-lg shadow-lg">
+              <div className="absolute right-0 top-full mt-2 z-50 w-[min(600px,90vw)] max-w-[90vw] bg-popover border rounded-lg shadow-lg">
                 {/* 气泡箭头 */}
                 <div className="absolute -top-2 right-4 w-4 h-4 bg-popover border-l border-t rotate-45" />
                 <AccountFilterPanel />

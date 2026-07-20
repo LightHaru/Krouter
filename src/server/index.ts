@@ -1,7 +1,8 @@
 import http, { IncomingMessage, ServerResponse } from 'http'
 import crypto from 'crypto'
 import { execFile, spawn } from 'child_process'
-import { promises as fs } from 'fs'
+import { promises as fs, readFileSync } from 'fs'
+import os from 'os'
 import path from 'path'
 import { WebStore, hashPassword, verifyPassword, type UserRecord } from './store'
 import {
@@ -99,6 +100,47 @@ import {
 
 type JsonValue = unknown
 type SseClient = ServerResponse
+
+function loadRuntimeEnvFile(): void {
+  const configuredDataDir = process.env.KROUTER_DATA_DIR
+    || process.env.KAM_DATA_DIR
+    || process.env.KIRO_WEB_DATA_DIR
+  const dataDir = path.resolve(configuredDataDir || path.join(os.homedir(), '.krouter'))
+  const envFile = path.resolve(
+    process.env.KROUTER_ENV_FILE
+      || process.env.KAM_ENV_FILE
+      || path.join(dataDir, '.env')
+  )
+
+  try {
+    const raw = readFileSync(envFile, 'utf8')
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith('#')) continue
+      const separator = trimmed.indexOf('=')
+      if (separator <= 0) continue
+      const key = trimmed.slice(0, separator).trim()
+      if (!key || process.env[key] !== undefined) continue
+      process.env[key] = trimmed
+        .slice(separator + 1)
+        .trim()
+        .replace(/^['"]|['"]$/g, '')
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.warn(`[Server] Could not load runtime env ${envFile}:`, error)
+    }
+  }
+
+  if (!process.env.KROUTER_DATA_DIR && !process.env.KAM_DATA_DIR && !process.env.KIRO_WEB_DATA_DIR) {
+    process.env.KIRO_WEB_DATA_DIR = dataDir
+  }
+  if (!process.env.KIRO_RUNTIME_DATA_DIR) {
+    process.env.KIRO_RUNTIME_DATA_DIR = process.env.KIRO_WEB_DATA_DIR || dataDir
+  }
+}
+
+loadRuntimeEnvFile()
 
 const store = new WebStore()
 const sseClients = new Set<SseClient>()
@@ -384,6 +426,7 @@ function defaultAccountData(): Record<string, unknown> {
       failureThreshold: 3,
       testUrl: 'https://api.ipify.org?format=json',
       testTimeoutMs: 8000,
+      maxUsableLatencyMs: 1000,
       autoValidateIntervalMin: 0,
       autoValidateConcurrency: 5,
       upstreamProxy: '',
@@ -400,6 +443,31 @@ function defaultAccountData(): Record<string, unknown> {
     },
     proxyPoolCursor: 0,
     accountProxyBindings: {}
+  }
+}
+
+function mergeAccountRecordPreservingBlockedState(currentValue: unknown, incomingValue: unknown): unknown {
+  if (!isPlainRecord(currentValue) || !isPlainRecord(incomingValue)) return incomingValue
+  const currentUsage = isPlainRecord(currentValue.usage) ? currentValue.usage : {}
+  const incomingUsage = isPlainRecord(incomingValue.usage) ? incomingValue.usage : {}
+  const currentBlocked = currentValue.status === 'blocked' ||
+    (typeof currentUsage.suspendedAt === 'number' && currentUsage.suspendedAt > 0) ||
+    isBannedAccountError(typeof currentValue.lastError === 'string' ? currentValue.lastError : undefined)
+  const incomingBlocked = incomingValue.status === 'blocked' ||
+    (typeof incomingUsage.suspendedAt === 'number' && incomingUsage.suspendedAt > 0) ||
+    isBannedAccountError(typeof incomingValue.lastError === 'string' ? incomingValue.lastError : undefined)
+
+  if (!currentBlocked || incomingBlocked) return incomingValue
+  return {
+    ...incomingValue,
+    status: 'blocked',
+    lastError: currentValue.lastError || incomingValue.lastError || 'Account blocked by Kiro',
+    usage: {
+      ...incomingUsage,
+      suspendedAt: currentUsage.suspendedAt || Date.now(),
+      suspendReason: currentUsage.suspendReason,
+      suspendMessage: currentUsage.suspendMessage
+    }
   }
 }
 
@@ -420,7 +488,10 @@ function mergeAccountData(currentRaw: unknown, incomingRaw: unknown): Record<str
     ...(Array.isArray(current._deletedAccountIds) ? current._deletedAccountIds.filter((id): id is string => typeof id === 'string') : []),
     ...(Array.isArray(incoming._deletedAccountIds) ? incoming._deletedAccountIds.filter((id): id is string => typeof id === 'string') : [])
   ])
-  const accounts = { ...currentAccounts, ...incomingAccounts }
+  const accounts = { ...currentAccounts }
+  for (const [id, incomingAccount] of Object.entries(incomingAccounts)) {
+    accounts[id] = mergeAccountRecordPreservingBlockedState(currentAccounts[id], incomingAccount)
+  }
   for (const id of deletedIds) delete accounts[id]
   const currentProxyPool = current.proxyPool && typeof current.proxyPool === 'object'
     ? current.proxyPool as Record<string, unknown>
@@ -429,6 +500,29 @@ function mergeAccountData(currentRaw: unknown, incomingRaw: unknown): Record<str
   const incomingProxyPool = incomingHasProxyPool
     ? incoming.proxyPool as Record<string, unknown>
     : currentProxyPool
+  const currentProxyPoolConfig = current.proxyPoolConfig && typeof current.proxyPoolConfig === 'object'
+    ? current.proxyPoolConfig as Record<string, unknown>
+    : {}
+  const incomingProxyPoolConfig = incoming.proxyPoolConfig && typeof incoming.proxyPoolConfig === 'object'
+    ? incoming.proxyPoolConfig as Record<string, unknown>
+    : {}
+  const maxUsableLatencyMs = Math.max(
+    100,
+    Number(incomingProxyPoolConfig.maxUsableLatencyMs ?? currentProxyPoolConfig.maxUsableLatencyMs) || 1000
+  )
+  const proxyPoolConfig = {
+    ...currentProxyPoolConfig,
+    ...incomingProxyPoolConfig,
+    sourceRemoveDead: true,
+    maxUsableLatencyMs
+  }
+  const currentBindings = current.accountProxyBindings && typeof current.accountProxyBindings === 'object'
+    ? current.accountProxyBindings as Record<string, string>
+    : {}
+  const incomingBindings = incoming.accountProxyBindings && typeof incoming.accountProxyBindings === 'object'
+    ? incoming.accountProxyBindings as Record<string, string>
+    : currentBindings
+  const accountProxyBindings = { ...incomingBindings }
   const deletedProxyIds = new Set<string>([
     ...(Array.isArray(current._deletedProxyIds) ? current._deletedProxyIds.filter((id): id is string => typeof id === 'string') : []),
     ...(Array.isArray(incoming._deletedProxyIds) ? incoming._deletedProxyIds.filter((id): id is string => typeof id === 'string') : [])
@@ -442,12 +536,39 @@ function mergeAccountData(currentRaw: unknown, incomingRaw: unknown): Record<str
       proxyPool[id] = value
     }
   }
-  for (const id of deletedProxyIds) delete proxyPool[id]
+  const rejectedProxyIds = new Set<string>(deletedProxyIds)
+  const rejectedProxyUrls = new Set<string>()
+  for (const id of deletedProxyIds) {
+    const removed = (proxyPool[id] || currentProxyPool[id]) as Record<string, unknown> | undefined
+    if (typeof removed?.url === 'string') rejectedProxyUrls.add(removed.url)
+    delete proxyPool[id]
+  }
+  for (const [id, value] of Object.entries(proxyPool)) {
+    const entry = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+    const latencyMs = Number(entry.latencyMs)
+    const usable = entry.enabled === true &&
+      entry.status === 'alive' &&
+      Number.isFinite(latencyMs) &&
+      latencyMs >= 0 &&
+      latencyMs <= maxUsableLatencyMs
+    if (!usable) {
+      rejectedProxyIds.add(id)
+      if (typeof entry.url === 'string') rejectedProxyUrls.add(entry.url)
+      delete proxyPool[id]
+    }
+  }
+  for (const [accountId, binding] of Object.entries(accountProxyBindings)) {
+    if (rejectedProxyIds.has(binding) || rejectedProxyUrls.has(binding)) {
+      delete accountProxyBindings[accountId]
+    }
+  }
   return {
     ...current,
     ...incoming,
     accounts,
     proxyPool,
+    proxyPoolConfig,
+    accountProxyBindings,
     _deletedAccountIds: Array.from(deletedIds),
     _deletedProxyIds: Array.from(deletedProxyIds)
   }
@@ -879,6 +1000,49 @@ function mergeStoredUsage(currentUsage: Record<string, unknown>, incomingUsage: 
   return normalizeStoredUsagePercent(merged)
 }
 
+function quotaResetDueForStoredAccount(account: StoredAccount, now = Date.now()): boolean {
+  const reset = typeof account.usage?.nextResetDate === 'string' ? Date.parse(account.usage.nextResetDate) : NaN
+  return Number.isFinite(reset) && reset <= now
+}
+
+function isStoredAccountQuotaExhausted(account: StoredAccount, now = Date.now()): boolean {
+  if (quotaResetDueForStoredAccount(account, now)) return false
+  const usage = account.usage || {}
+  if (typeof usage.quotaExhaustedAt === 'number' && usage.quotaExhaustedAt > 0) return true
+  const current = Number(usage.current)
+  const limit = Number(usage.limit)
+  return Number.isFinite(current) && Number.isFinite(limit) && limit > 0 && current >= limit
+}
+
+function normalizeStoredAccountLifecycle(account: StoredAccount, now = Date.now()): StoredAccount {
+  const usage = isPlainRecord(account.usage) ? { ...account.usage } : {}
+  const suspended = typeof usage.suspendedAt === 'number' && usage.suspendedAt > 0
+  if (suspended || isBannedAccountError(account.lastError)) {
+    if (typeof usage.suspendedAt !== 'number' || usage.suspendedAt <= 0) {
+      usage.suspendedAt = now
+    }
+    return { ...account, status: 'blocked', usage }
+  }
+
+  if (quotaResetDueForStoredAccount({ ...account, usage }, now)) {
+    delete usage.quotaExhaustedAt
+    return {
+      ...account,
+      usage,
+      status: account.status === 'quota_exhausted' ? 'active' : account.status,
+      lastError: account.lastError === 'Quota exhausted until reset' ? undefined : account.lastError
+    }
+  }
+
+  if (isStoredAccountQuotaExhausted({ ...account, usage }, now)) {
+    return { ...account, usage, status: 'quota_exhausted', lastError: account.lastError || 'Quota exhausted until reset' }
+  }
+
+  return account.status === 'quota_exhausted'
+    ? { ...account, usage, status: 'active', lastError: account.lastError === 'Quota exhausted until reset' ? undefined : account.lastError }
+    : account
+}
+
 function getStoredAccounts(accountData: StoredAccountData): Record<string, StoredAccount> {
   return isPlainRecord(accountData.accounts) ? accountData.accounts as Record<string, StoredAccount> : {}
 }
@@ -925,7 +1089,7 @@ function applyRefreshDataToStoredAccount(
   const lastError = keepLive ? account.lastError : incomingBanned ? errorMessage : currentBanned ? account.lastError : errorMessage
   const lastCheckedAt = keepLive ? account.lastCheckedAt : now
 
-  return {
+  return normalizeStoredAccountLifecycle({
     ...account,
     id: account.id || id,
     email: typeof userInfo.email === 'string' && userInfo.email ? userInfo.email : account.email,
@@ -937,28 +1101,28 @@ function applyRefreshDataToStoredAccount(
     status,
     lastError,
     lastCheckedAt
-  }
+  }, now)
 }
 
 function applyBackendRefreshFailure(id: string, account: StoredAccount, error: string, now: number): StoredAccount {
   const currentBanned = isBannedAccountError(account.lastError)
   const incomingBanned = isBannedAccountError(error)
   if (shouldKeepStoredAccountLiveState(account, error)) {
-    return {
+    return normalizeStoredAccountLifecycle({
       ...account,
       id: account.id || id,
       status: 'active',
       lastError: account.lastError,
       lastCheckedAt: account.lastCheckedAt
-    }
+    }, now)
   }
-  return {
+  return normalizeStoredAccountLifecycle({
     ...account,
     id: account.id || id,
     status: 'error',
     lastError: currentBanned && !incomingBanned ? account.lastError : error,
     lastCheckedAt: now
-  }
+  }, now)
 }
 
 function backendAutoRefreshEnabled(): boolean {
@@ -971,11 +1135,26 @@ async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): P
   backendAutoRefreshRunning.add(user.id)
   try {
     const accountData = (store.getAccountData(user.id) || defaultAccountData()) as StoredAccountData
-    if (accountData.autoRefreshEnabled === false) return
-
     const accounts = getStoredAccounts(accountData)
-    const entries = Object.entries(accounts)
+    let lifecycleChanged = false
     const now = Date.now()
+    for (const [id, account] of Object.entries(accounts)) {
+      const seeded = account.id ? account : { ...account, id }
+      const normalized = normalizeStoredAccountLifecycle(seeded, now)
+      if (seeded !== account || normalized !== seeded) {
+        accounts[id] = normalized
+        lifecycleChanged = true
+      }
+    }
+    if (accountData.autoRefreshEnabled === false) {
+      if (lifecycleChanged) {
+        accountData.accounts = accounts
+        await store.setAccountData(user.id, accountData)
+        await getProxyRuntime(store, user.id, emit).syncAccountsFromStoreAsync()
+      }
+      return
+    }
+    const entries = Object.entries(accounts)
     const syncInfo = accountData.autoRefreshSyncInfo !== false
     const autoSwitch = Boolean(accountData.autoSwitchEnabled)
     const pending = entries
@@ -985,18 +1164,30 @@ async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): P
         needsTokenRefresh: accountNeedsBackendRefresh(account, now)
       }))
       .filter(({ account, needsTokenRefresh }) => {
-        if (isBannedAccountError(account.lastError)) return false
+        if (account.status === 'blocked' || isBannedAccountError(account.lastError)) return false
+        if (isStoredAccountQuotaExhausted(account, now)) return false
         if (!account.credentials?.refreshToken) return false
         return needsTokenRefresh || syncInfo || autoSwitch
       })
 
-    if (pending.length === 0) return
+    if (pending.length === 0) {
+      if (lifecycleChanged) {
+        accountData.accounts = accounts
+        await store.setAccountData(user.id, accountData)
+        await getProxyRuntime(store, user.id, emit).syncAccountsFromStoreAsync()
+      }
+      return
+    }
 
     const concurrency = clampNumber(accountData.autoRefreshConcurrency, 5, 1, 100)
     let completed = 0
     let successCount = 0
     let failedCount = 0
     let changed = false
+    // Collect refresh outcomes instead of mutating the stale snapshot. The write-back
+    // re-reads fresh store state so a delete that lands during the (slow, networked)
+    // refresh loop is not clobbered — otherwise the stale snapshot resurrects it.
+    const refreshPayloads: Array<{ id: string; success: boolean; data?: Record<string, any>; error?: string; finishedAt: number }> = []
     console.log(`[BackendAutoRefresh] ${user.email}: processing ${pending.length} account(s), reason=${reason}, syncInfo=${syncInfo}`)
 
     for (let index = 0; index < pending.length; index += concurrency) {
@@ -1028,11 +1219,16 @@ async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): P
         const finishedAt = Date.now()
         if (payload.success) {
           successCount++
-          accounts[id] = applyRefreshDataToStoredAccount(id, accounts[id] || account, payload.data as Record<string, any> | undefined, finishedAt)
         } else {
           failedCount++
-          accounts[id] = applyBackendRefreshFailure(id, accounts[id] || account, payload.error || 'Unknown error', finishedAt)
         }
+        refreshPayloads.push({
+          id,
+          success: payload.success,
+          data: payload.data as Record<string, any> | undefined,
+          error: payload.error,
+          finishedAt
+        })
         changed = true
         emit('background-refresh-result', payload)
       }))
@@ -1042,9 +1238,42 @@ async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): P
       if (index + concurrency < pending.length) await new Promise((resolve) => setTimeout(resolve, 100))
     }
 
-    if (changed) {
-      accountData.accounts = accounts
-      await store.setAccountData(user.id, accountData)
+    if (changed || lifecycleChanged) {
+      // Re-read fresh store state at write-back time. Between the initial snapshot
+      // (top of this function) and now, the user may have deleted accounts via
+      // saveAccounts — which persists a tombstone AND removes the account. If we wrote
+      // back the stale in-memory snapshot we'd resurrect the just-deleted account.
+      // So we merge our refresh results into the FRESH data, skipping any account that
+      // no longer exists or is tombstoned.
+      const freshData = (store.getAccountData(user.id) || defaultAccountData()) as StoredAccountData
+      const freshAccounts = getStoredAccounts(freshData)
+      const tombstoned = new Set<string>(
+        Array.isArray(freshData._deletedAccountIds)
+          ? (freshData._deletedAccountIds as unknown[]).filter((id): id is string => typeof id === 'string')
+          : []
+      )
+      const writeBackNow = Date.now()
+
+      // Re-apply lifecycle normalization on the fresh accounts (cheap, idempotent).
+      for (const [id, account] of Object.entries(freshAccounts)) {
+        if (tombstoned.has(id)) continue
+        const seeded = account.id ? account : { ...account, id }
+        freshAccounts[id] = normalizeStoredAccountLifecycle(seeded, writeBackNow)
+      }
+
+      // Apply refresh outcomes only to accounts that still exist and are not tombstoned.
+      for (const payload of refreshPayloads) {
+        if (tombstoned.has(payload.id)) continue
+        const current = freshAccounts[payload.id]
+        if (!current) continue
+        freshAccounts[payload.id] = payload.success
+          ? applyRefreshDataToStoredAccount(payload.id, current, payload.data, payload.finishedAt)
+          : applyBackendRefreshFailure(payload.id, current, payload.error || 'Unknown error', payload.finishedAt)
+      }
+
+      freshData.accounts = freshAccounts
+      await store.setAccountData(user.id, freshData)
+      await getProxyRuntime(store, user.id, emit).syncAccountsFromStoreAsync()
       await store.audit(user.id, 'backend-token-refresh', {
         reason,
         completed,
@@ -1070,8 +1299,7 @@ function scheduleBackendAutoRefreshForUser(user: UserRecord, runNow: boolean): v
   if (!backendAutoRefreshEnabled()) return
   const accountData = (store.getAccountData(user.id) || defaultAccountData()) as StoredAccountData
   if (accountData.autoRefreshEnabled === false) {
-    console.log(`[BackendAutoRefresh] ${user.email}: disabled by account settings`)
-    return
+    console.log(`[BackendAutoRefresh] ${user.email}: token refresh disabled; account lifecycle reconciliation remains enabled`)
   }
 
   const intervalMinutes = clampNumber(accountData.autoRefreshInterval, 5, 1, 1440)
@@ -1389,6 +1617,14 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
       return proxyRuntime.refreshModels()
     case 'proxyGetModels':
       return proxyRuntime.getModels()
+    case 'proxyProbeModels':
+      return proxyRuntime.probeModels(args[0] as { modelIds?: string[]; concurrency?: number } | undefined)
+    case 'proxyGetModelProbeResults':
+      return proxyRuntime.getModelProbeResults()
+    case 'proxyTestBedrock':
+      return proxyRuntime.testBedrock(args[0] as Parameters<typeof proxyRuntime.testBedrock>[0])
+    case 'proxyTestXpixi':
+      return proxyRuntime.testXpixi(args[0] as Parameters<typeof proxyRuntime.testXpixi>[0])
     case 'getKiroAvailableModels':
       return proxyRuntime.getModels()
     case 'getKiroSettings':

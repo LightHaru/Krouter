@@ -64,8 +64,11 @@ afterEach(() => {
 describe('ProxyServer capability examples — criterion 2.5 (non-capability model uses normal flow)', () => {
   it('returns an account via the normal flow without calling accountSupportsModel', async () => {
     const ps = createServer({ enableMultiAccount: true })
-    addAvailableAccount(ps, 'normal-acct-1')
-    addAvailableAccount(ps, 'normal-acct-2')
+    // Tier routing is always on: a known tier tag places the account in a
+    // selectable group (Free) for the standard model. The capability path is
+    // still never taken (standard models skip accountSupportsModel).
+    addAvailableAccount(ps, 'normal-acct-1', { subscriptionType: 'Free' })
+    addAvailableAccount(ps, 'normal-acct-2', { subscriptionType: 'Free' })
 
     // Guard: confirm the model genuinely does not require capability selection.
     expect(ps.requiresModelCapabilitySelection('claude-sonnet-4.5')).toBe(false)
@@ -84,7 +87,9 @@ describe('ProxyServer capability examples — criterion 2.5 (non-capability mode
 
   it('still returns an account with only a single account in the pool (normal flow)', async () => {
     const ps = createServer({ enableMultiAccount: true })
-    addAvailableAccount(ps, 'solo-acct')
+    // Tier routing is always on: a Free tag places the sole account in a
+    // selectable group for the standard model (capability path still skipped).
+    addAvailableAccount(ps, 'solo-acct', { subscriptionType: 'Free' })
 
     const spy = vi.spyOn(ps, 'accountSupportsModel')
 
@@ -98,30 +103,42 @@ describe('ProxyServer capability examples — criterion 2.5 (non-capability mode
 })
 
 // ===========================================================================
-// Criterion 1.6 — when fetching a tier-requiring model list fails (throws) even
-// after a token refresh attempt, accountSupportsModel must:
-//   - cache an EMPTY model set for the account,
-//   - return false (account treated as not supporting the model),
-//   - log a warning (proxyLogger.warn).
+// Criterion 1.6 — capability inspection is now OUT-OF-BAND (mirrors Kiro-Go's
+// accountHasModel). accountSupportsModel never blocks the request on a live
+// fetchKiroModels; on a cache miss it answers optimistically (true) and kicks
+// off a single background warm (deduped via capabilityWarmInFlight). The tag
+// pre-filter already excluded ineligible tiers before this point, so an
+// optimistic "yes" only applies to a tier-eligible account.
 //
-// 'claude-opus-4.8' requiresModelCapabilitySelection, forcing the fetch path.
-// No seeded capability cache => a fresh fetch is attempted.
+// When the background warm's fetch fails (throws) even after a refresh attempt,
+// the warm must still: cache an EMPTY model set and log a warning. We await the
+// in-flight warm promise to observe that terminal state.
+//
+// 'claude-opus-4.8' requiresModelCapabilitySelection, forcing the warm path.
 // ===========================================================================
-describe('ProxyServer capability examples — criterion 1.6 (fetch failure → not supported + warning)', () => {
+describe('ProxyServer capability examples — criterion 1.6 (out-of-band warm; fetch failure → empty cache + warning)', () => {
   const OPUS_MODEL = 'claude-opus-4.8'
 
-  it('returns false, caches an empty model set, and warns when fetch throws (no refresh token)', async () => {
+  it('answers optimistically, then the background warm caches an empty set + warns when fetch throws (no refresh token)', async () => {
     const ps = createServer({ enableMultiAccount: true })
     // No refreshToken => the refresh branch is not eligible; the very first
-    // fetchKiroModels throw lands directly in the catch block.
+    // fetchKiroModels throw lands directly in the catch block of the warm.
     const account = addAvailableAccount(ps, 'fetch-fail-1', { refreshToken: undefined })
 
     mockFetchKiroModels.mockRejectedValue(new Error('network down'))
     const warnSpy = vi.spyOn(proxyLogger, 'warn')
 
+    // Optimistic immediate answer — never blocks on the network.
     const supports = await ps.accountSupportsModel(account, OPUS_MODEL)
+    expect(supports).toBe(true)
 
-    expect(supports).toBe(false)
+    // A background warm was kicked off; await it to observe the terminal state.
+    // The warm may already have settled (mock rejects promptly) and removed itself
+    // from the in-flight map, so await it only if still present, then flush.
+    const warm = ps.capabilityWarmInFlight.get(account.id)
+    if (warm) await warm
+    await new Promise((r) => setTimeout(r, 0))
+
     // An empty-set cache entry was recorded for this account.
     const cached = ps.accountModelCapabilityCache.get(account.id)
     expect(cached).toBeTruthy()
@@ -132,10 +149,10 @@ describe('ProxyServer capability examples — criterion 1.6 (fetch failure → n
     expect(mockFetchKiroModels).toHaveBeenCalled()
   })
 
-  it('returns false + empty cache + warning when fetch still throws after a successful token refresh', async () => {
-    // Mirrors accountSupportsModel refresh-then-retry: first fetch returns [],
-    // which (with a refreshToken) triggers refreshToken; on success it re-fetches
-    // and that retry throws -> catch -> empty cache + warn + false.
+  it('background warm caches empty set + warns when fetch still throws after a successful token refresh', async () => {
+    // Mirrors the warm's refresh-then-retry: first fetch returns [], which (with
+    // a refreshToken) triggers refreshToken; on success it re-fetches and that
+    // retry throws -> catch -> empty cache + warn.
     const onTokenRefresh = vi.fn().mockResolvedValue({
       success: true,
       accessToken: 'refreshed-token'
@@ -150,8 +167,12 @@ describe('ProxyServer capability examples — criterion 1.6 (fetch failure → n
     const warnSpy = vi.spyOn(proxyLogger, 'warn')
 
     const supports = await ps.accountSupportsModel(account, OPUS_MODEL)
+    expect(supports).toBe(true)
 
-    expect(supports).toBe(false)
+    const warm = ps.capabilityWarmInFlight.get(account.id)
+    if (warm) await warm
+    await new Promise((r) => setTimeout(r, 0))
+
     const cached = ps.accountModelCapabilityCache.get(account.id)
     expect(cached).toBeTruthy()
     expect(cached.modelIds.size).toBe(0)
@@ -161,7 +182,7 @@ describe('ProxyServer capability examples — criterion 1.6 (fetch failure → n
     expect(mockFetchKiroModels).toHaveBeenCalledTimes(2)
   })
 
-  it('does not match the requested model after a failed fetch (empty set has no opus id)', async () => {
+  it('after a failed warm the cached empty set has no opus id', async () => {
     const ps = createServer({ enableMultiAccount: true })
     const account = addAvailableAccount(ps, 'fetch-fail-3', { refreshToken: undefined })
 
@@ -169,6 +190,9 @@ describe('ProxyServer capability examples — criterion 1.6 (fetch failure → n
     vi.spyOn(proxyLogger, 'warn')
 
     await ps.accountSupportsModel(account, OPUS_MODEL)
+    const warm = ps.capabilityWarmInFlight.get(account.id)
+    if (warm) await warm
+    await new Promise((r) => setTimeout(r, 0))
 
     const cached = ps.accountModelCapabilityCache.get(account.id)
     expect(cached.modelIds.has(normalizeKiroModelIdForCompare(OPUS_MODEL))).toBe(false)

@@ -74,7 +74,7 @@ afterEach(async () => {
 })
 
 describe('ProxyRuntime persisted running state', () => {
-  it('auto-starts on backend boot when the web Start Service state was previously running', async () => {
+  it('auto-starts on backend boot when legacy dashboard state was previously running', async () => {
     const { store, userId } = await createStore()
     const port = await getFreePort()
 
@@ -97,7 +97,7 @@ describe('ProxyRuntime persisted running state', () => {
     expect(status.config.port).toBe(port)
   })
 
-  it('does not auto-start after the web Stop Service action persisted the stopped state', async () => {
+  it('always auto-starts on backend boot even if the old dashboard state was stopped', async () => {
     const { store, userId } = await createStore()
     const port = await getFreePort()
 
@@ -116,10 +116,11 @@ describe('ProxyRuntime persisted running state', () => {
     const status = await runtime.getStatus()
 
     expect(result.success).toBe(true)
-    expect(status.running).toBe(false)
+    expect(status.running).toBe(true)
+    expect(store.getUserSetting(userId, 'proxyRunning', false)).toBe(true)
   })
 
-  it('starts immediately when Auto Start is enabled from the web dashboard', async () => {
+  it('normalizes dashboard config updates to the always-on proxy service contract', async () => {
     const { store, userId } = await createStore()
     const port = await getFreePort()
     const runtime = createRuntime(store, userId)
@@ -127,14 +128,15 @@ describe('ProxyRuntime persisted running state', () => {
     const result = await runtime.updateConfig({
       host: '127.0.0.1',
       port,
-      autoStart: true,
-      enabled: true
+      autoStart: false,
+      enabled: false
     })
     const status = await runtime.getStatus()
 
     expect(result.success).toBe(true)
     expect(status.running).toBe(true)
     expect(store.getUserSetting(userId, 'proxyRunning', false)).toBe(true)
+    expect(store.getUserSetting<Record<string, unknown>>(userId, 'proxyConfig', {}).enabled).toBe(true)
     expect(store.getUserSetting<Record<string, unknown>>(userId, 'proxyConfig', {}).autoStart).toBe(true)
   })
 
@@ -168,5 +170,136 @@ describe('ProxyRuntime persisted running state', () => {
 
     expect(syncResult.accountCount).toBe(1)
     expect(synced?.proxyUrl).toBe(proxyUrl)
+  })
+
+  it('does not forward account traffic through a slow or unmeasured pool proxy', async () => {
+    const { store, userId } = await createStore()
+    const proxyUrl = 'socks5://127.0.0.1:1080'
+
+    await store.setAccountData(userId, {
+      accounts: {
+        acc_api_key: {
+          id: 'acc_api_key',
+          email: 'api-key@example.test',
+          status: 'active',
+          credentials: {
+            accessToken: 'ksk_test_account_key',
+            authMethod: 'api_key',
+            provider: 'KiroApiKey'
+          }
+        }
+      },
+      accountProxyBindings: { acc_api_key: 'slow-proxy' },
+      proxyPoolConfig: { maxUsableLatencyMs: 1000 },
+      proxyPool: {
+        'slow-proxy': {
+          url: proxyUrl,
+          enabled: true,
+          status: 'alive',
+          latencyMs: 1001
+        }
+      }
+    })
+
+    const runtime = createRuntime(store, userId)
+    runtime.syncAccountsFromStore()
+    const synced = runtime.getAccounts().accounts.find((account) => account.id === 'acc_api_key')
+
+    expect(synced?.proxyUrl).toBeUndefined()
+  })
+
+  it('does not sync blocked or quota-exhausted accounts into the API proxy pool', async () => {
+    const { store, userId } = await createStore()
+    const futureReset = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+
+    await store.setAccountData(userId, {
+      accounts: {
+        active: {
+          id: 'active',
+          email: 'active@example.test',
+          status: 'active',
+          credentials: { accessToken: 'ksk_active', authMethod: 'api_key', provider: 'KiroApiKey' }
+        },
+        blocked: {
+          id: 'blocked',
+          email: 'blocked@example.test',
+          status: 'blocked',
+          usage: { suspendedAt: Date.now(), suspendReason: 'TEMPORARILY_SUSPENDED' },
+          credentials: { accessToken: 'ksk_blocked', authMethod: 'api_key', provider: 'KiroApiKey' }
+        },
+        quota: {
+          id: 'quota',
+          email: 'quota@example.test',
+          status: 'quota_exhausted',
+          usage: { current: 50, limit: 50, quotaExhaustedAt: Date.now(), nextResetDate: futureReset },
+          credentials: { accessToken: 'ksk_quota', authMethod: 'api_key', provider: 'KiroApiKey' }
+        }
+      }
+    })
+
+    const runtime = createRuntime(store, userId)
+    const syncResult = runtime.syncAccountsFromStore()
+    const syncedIds = runtime.getAccounts().accounts.map((account) => account.id)
+
+    expect(syncResult.accountCount).toBe(1)
+    expect(syncedIds).toEqual(['active'])
+  })
+
+  it('persists legacy suspended-error accounts as blocked and excludes them from the API proxy pool', async () => {
+    const { store, userId } = await createStore()
+
+    await store.setAccountData(userId, {
+      accounts: {
+        active: {
+          id: 'active',
+          email: 'active@example.test',
+          status: 'active',
+          credentials: { accessToken: 'ksk_active', authMethod: 'api_key', provider: 'KiroApiKey' }
+        },
+        legacyBlocked: {
+          id: 'legacyBlocked',
+          email: 'legacy-blocked@example.test',
+          status: 'active',
+          lastError: 'Auth error 403: {"message":"Your User ID is temporarily suspended","reason":"TEMPORARILY_SUSPENDED"}',
+          credentials: { accessToken: 'ksk_blocked', authMethod: 'api_key', provider: 'KiroApiKey' }
+        }
+      }
+    })
+
+    const runtime = createRuntime(store, userId)
+    const syncResult = await runtime.syncAccountsFromStoreAsync()
+    const syncedIds = runtime.getAccounts().accounts.map((account) => account.id)
+    const data = store.getAccountData(userId) as { accounts?: Record<string, { status?: string; usage?: { suspendedAt?: number } }> }
+    const persisted = data.accounts?.legacyBlocked
+
+    expect(syncResult.accountCount).toBe(1)
+    expect(syncedIds).toEqual(['active'])
+    expect(persisted?.status).toBe('blocked')
+    expect(persisted?.usage?.suspendedAt).toBeTypeOf('number')
+  })
+
+  it('returns quota-exhausted accounts to the pool after the stored reset date passes', async () => {
+    const { store, userId } = await createStore()
+    const pastReset = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+
+    await store.setAccountData(userId, {
+      accounts: {
+        quota: {
+          id: 'quota',
+          email: 'quota@example.test',
+          status: 'quota_exhausted',
+          usage: { current: 50, limit: 50, quotaExhaustedAt: Date.now() - 1000, nextResetDate: pastReset },
+          credentials: { accessToken: 'ksk_quota', authMethod: 'api_key', provider: 'KiroApiKey' }
+        }
+      }
+    })
+
+    const runtime = createRuntime(store, userId)
+    const syncResult = runtime.syncAccountsFromStore()
+    const synced = runtime.getAccounts().accounts[0]
+
+    expect(syncResult.accountCount).toBe(1)
+    expect(synced?.id).toBe('quota')
+    expect(synced?.quotaExhaustedAt).toBeUndefined()
   })
 })

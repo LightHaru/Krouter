@@ -721,7 +721,7 @@ export function DiagnosePage(): React.ReactNode {
 
             {/* 模型选择（两种模式共用） */}
             <div className="space-y-1">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between flex-wrap gap-2">
                 <Label className="text-xs">{isEn ? 'Model' : '模型'}</Label>
                 <button
                   type="button"

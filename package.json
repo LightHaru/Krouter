@@ -1,6 +1,6 @@
 {
   "name": "@lightharu/krouter",
-  "version": "1.9.0",
+  "version": "1.9.4",
   "description": "Krouter - Web dashboard and CLI router for Kiro accounts, quota balancing, and API proxy",
   "main": "./out-server/server/index.js",
   "bin": {
@@ -74,7 +74,8 @@
     "test:e2e:only": "node test/e2e-fullsuite/run.mjs --only",
     "test:e2e:install": "playwright install chromium",
     "test:unit": "vitest run",
-    "test:unit:watch": "vitest"
+    "test:unit:watch": "vitest",
+    "test:bedrock": "node test/bedrock-e2e/run.mjs"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",

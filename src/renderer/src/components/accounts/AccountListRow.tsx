@@ -10,6 +10,7 @@ import {
   Edit,
   Info,
   AlertCircle,
+  AlertTriangle,
   Power,
   LogOut,
   RotateCcw,
@@ -82,7 +83,12 @@ function AccountListRowComponent({
   const [emailCopied, setEmailCopied] = useState(false)
 
   // 封禁判定
-  const isUnauthorized = isBannedError(account.lastError)
+  const isUnauthorized = account.status === 'blocked' || (typeof account.usage.suspendedAt === 'number' && account.usage.suspendedAt > 0) || isBannedError(account.lastError)
+  const isQuotaExhausted = account.status === 'quota_exhausted' || (
+    !isUnauthorized &&
+    account.usage.limit > 0 &&
+    account.usage.current >= account.usage.limit
+  )
 
   // 标签
   const accountTags = useMemo(
@@ -128,9 +134,16 @@ function AccountListRowComponent({
   const rowStyle = useMemo(() => {
     if (account.isActive) return {} // active-glow-border class 处理
     if (isUnauthorized) return unauthorizedRowStyle
+    if (isQuotaExhausted) {
+      return {
+        backgroundColor: 'rgba(245, 158, 11, 0.08)',
+        borderColor: 'rgba(245, 158, 11, 0.45)',
+        boxShadow: '0 0 0 1px rgba(245, 158, 11, 0.18)'
+      }
+    }
     if (tagColors.length > 0) return generateRowGlowStyle(tagColors)
     return {}
-  }, [account.isActive, isUnauthorized, tagColors])
+  }, [account.isActive, isUnauthorized, isQuotaExhausted, tagColors])
 
   // === Handlers ===
   const handleSwitch = useCallback(async (e: React.MouseEvent) => {
@@ -272,13 +285,13 @@ function AccountListRowComponent({
         'group relative flex items-center gap-3 pl-3 pr-3 py-2.5 rounded-xl border bg-solid-card transition-all duration-300 cursor-pointer overflow-hidden',
         'hover:shadow-md',
         account.isActive && 'active-glow-border border-transparent',
-        !account.isActive && !isUnauthorized && tagColors.length === 0 && !isSelected && 'border-border'
+        !account.isActive && !isUnauthorized && !isQuotaExhausted && tagColors.length === 0 && !isSelected && 'border-border'
       )}
       style={rowStyle}
       onClick={() => toggleSelection(account.id)}
     >
       {/* 选中态独立覆盖层 — 避免被多标签 rowStyle 的 backgroundImage 覆盖 */}
-      {isSelected && !account.isActive && !isUnauthorized && (
+      {isSelected && !account.isActive && !isUnauthorized && !isQuotaExhausted && (
         <div className="absolute inset-0 pointer-events-none rounded-[inherit] ring-2 ring-inset ring-primary/60 bg-primary/[0.08] z-10" />
       )}
 
@@ -350,7 +363,7 @@ function AccountListRowComponent({
           )}
 
           {/* 错误信息（非封禁，因为封禁已用红色徽章显示） */}
-          {account.lastError && !isUnauthorized && (
+          {account.lastError && !isUnauthorized && !isQuotaExhausted && (
             <span className="text-destructive truncate flex-1 min-w-0 italic" title={account.lastError}>
               {account.lastError}
             </span>
@@ -381,6 +394,7 @@ function AccountListRowComponent({
         >
           {account.status === 'refreshing' && <Loader2 className="h-3 w-3 animate-spin" />}
           {isUnauthorized && <AlertCircle className="h-3 w-3" />}
+          {isQuotaExhausted && !isUnauthorized && <AlertTriangle className="h-3 w-3" />}
           {isUnauthorized ? (
             <span
               className="cursor-pointer hover:underline"
@@ -388,6 +402,8 @@ function AccountListRowComponent({
             >
               {isEn ? 'Banned' : '已封禁'}
             </span>
+          ) : isQuotaExhausted ? (
+            isEn ? 'Quota exhausted' : 'Hết quota'
           ) : (
             (isEn ? StatusLabelsEn : StatusLabelsZh)[account.status] || account.status
           )}
@@ -547,7 +563,7 @@ function AccountListRowComponent({
           </>
         )}
 
-        {!account.isActive && !isUnauthorized && (
+        {!account.isActive && !isUnauthorized && !isQuotaExhausted && (
           <Button
             size="icon"
             variant="ghost"

@@ -565,7 +565,15 @@ async function stopServer() {
     return
   }
   process.kill(pid)
-  console.log(`${COLORS.green}Da gui lenh tat backend.${COLORS.reset}`)
+  const deadline = Date.now() + 10000
+  while (isPidRunning(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  if (isPidRunning(pid)) {
+    throw new Error(`Krouter backend pid ${pid} khong dung sau 10 giay.`)
+  }
+  try { fs.unlinkSync(PID_FILE) } catch {}
+  console.log(`${COLORS.green}Krouter backend da dung hoan toan.${COLORS.reset}`)
 }
 
 async function waitForEnter(rl) {

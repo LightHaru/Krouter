@@ -94,6 +94,8 @@ const getSubscriptionColor = (type: string, title?: string): string => {
 
 const StatusLabelsZh: Record<string, string> = {
   active: '正常',
+  blocked: 'Bị khóa',
+  quota_exhausted: 'Hết quota',
   expired: '已过期',
   error: '错误',
   refreshing: '刷新中',
@@ -102,6 +104,8 @@ const StatusLabelsZh: Record<string, string> = {
 
 const StatusLabelsEn: Record<string, string> = {
   active: 'Active',
+  blocked: 'Blocked',
+  quota_exhausted: 'Quota exhausted',
   expired: 'Expired',
   error: 'Error',
   refreshing: 'Refreshing',
@@ -360,7 +364,7 @@ export const AccountCard = memo(function AccountCard({
 
   // 检测账号是否被封禁/暂停（多种错误格式）
   const lowerError = account.lastError?.toLowerCase()
-  const isUnauthorized = !!lowerError && (
+  const isUnauthorized = account.status === 'blocked' || (typeof account.usage.suspendedAt === 'number' && account.usage.suspendedAt > 0) || (!!lowerError && (
     lowerError.includes('accountsuspendedexception') ||
     lowerError.includes('account suspended') ||
     lowerError.includes('temporarily_suspended') ||
@@ -377,6 +381,11 @@ export const AccountCard = memo(function AccountCard({
     lowerError.includes('账户已封禁') ||
     lowerError.includes('已封禁') ||
     /\b423\b/.test(lowerError)
+  ))
+  const isQuotaExhausted = account.status === 'quota_exhausted' || (
+    !isUnauthorized &&
+    account.usage.limit > 0 &&
+    account.usage.current >= account.usage.limit
   )
   
   // 封禁详情弹窗状态
@@ -501,6 +510,12 @@ export const AccountCard = memo(function AccountCard({
   } : {}
 
   // 当前使用的高级感样式 - 流光边框时仅保留外发光
+  const quotaExhaustedStyle: React.CSSProperties = isQuotaExhausted ? {
+    backgroundColor: 'rgba(245, 158, 11, 0.08)',
+    borderColor: 'rgba(245, 158, 11, 0.45)',
+    boxShadow: '0 0 0 1px rgba(245, 158, 11, 0.20), 0 4px 16px -4px rgba(245, 158, 11, 0.28)'
+  } : {}
+
   const activeGlowStyle: React.CSSProperties = account.isActive ? {
     boxShadow: '0 8px 24px -4px var(--card-active-shadow)'
   } : {}
@@ -514,6 +529,8 @@ export const AccountCard = memo(function AccountCard({
   } else if (isUnauthorized) {
     // 仅封禁状态：显示完整封禁样式
     finalStyle = unauthorizedStyle
+  } else if (isQuotaExhausted) {
+    finalStyle = quotaExhaustedStyle
   } else {
     // 普通状态：只显示标签光环
     finalStyle = glowStyle
@@ -524,13 +541,14 @@ export const AccountCard = memo(function AccountCard({
       className={cn(
         'relative cursor-pointer h-full flex flex-col overflow-hidden bg-solid-card',
         // 默认 hover 浮起 + 阴影增强（除 active/封禁状态外，状态自带样式）
-        !account.isActive && !isUnauthorized && 'hover-lift',
+        !account.isActive && !isUnauthorized && !isQuotaExhausted && 'hover-lift',
         // 当前使用：流光边框，去掉默认边框
         account.isActive && 'border-transparent active-glow-border',
         // 封禁：红色边框
         isUnauthorized && 'border-destructive/50',
+        isQuotaExhausted && !isUnauthorized && 'border-amber-500/50',
         // 有标签光环：透明边框给光环让位
-        accountTags.length > 0 && !account.isActive && !isUnauthorized && 'border-transparent'
+        accountTags.length > 0 && !account.isActive && !isUnauthorized && !isQuotaExhausted && 'border-transparent'
       )}
       style={finalStyle}
       onClick={() => toggleSelection(account.id)}
@@ -586,6 +604,7 @@ export const AccountCard = memo(function AccountCard({
                  <div className={cn(
                     "text-[10px] font-medium px-2 py-0.5 rounded-full flex items-center gap-1 flex-shrink-0",
                     isUnauthorized ? "text-destructive bg-destructive/10" :
+                    isQuotaExhausted ? "text-amber-600 bg-amber-500/10" :
                     account.status === 'active' ? "text-success bg-success/10" :
                     account.status === 'error' ? "text-destructive bg-destructive/10" :
                     account.status === 'expired' ? "text-warning bg-warning/10" :
@@ -594,6 +613,7 @@ export const AccountCard = memo(function AccountCard({
                  )}>
                     {account.status === 'refreshing' && <Loader2 className="h-3 w-3 animate-spin" />}
                     {isUnauthorized && <AlertCircle className="h-3 w-3" />}
+                    {isQuotaExhausted && !isUnauthorized && <AlertTriangle className="h-3 w-3" />}
                     {isUnauthorized ? (
                       <span 
                         className="cursor-pointer hover:underline" 
@@ -601,6 +621,8 @@ export const AccountCard = memo(function AccountCard({
                       >
                         {isEn ? 'Banned' : '已封禁'}
                       </span>
+                    ) : isQuotaExhausted ? (
+                      isEn ? 'Quota exhausted' : 'Hết quota'
                     ) : (isEn ? StatusLabelsEn : StatusLabelsZh)[account.status]}
                  </div>
               </div>
@@ -843,8 +865,9 @@ export const AccountCard = memo(function AccountCard({
                  <Button
                    size="icon"
                    variant="ghost"
-                   className="h-7 w-7 hover:bg-primary/10 hover:text-primary transition-colors"
+                   className="h-7 w-7 hover:bg-primary/10 hover:text-primary transition-colors disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted-foreground"
                    onClick={(e) => { e.stopPropagation(); handleSwitch() }}
+                   disabled={isUnauthorized || isQuotaExhausted}
                    title={isEn ? 'Switch to this account' : '切换到此账号'}
                  >
                    <Power className="h-3.5 w-3.5" />
@@ -877,7 +900,7 @@ export const AccountCard = memo(function AccountCard({
         </div>
 
         {/* Error Message (Non-banned) */}
-        {account.lastError && !isUnauthorized && (
+        {account.lastError && !isUnauthorized && !isQuotaExhausted && (
           <div className="bg-red-50 text-red-600 text-[10px] p-1.5 rounded flex items-center gap-1.5 truncate mt-1" title={account.lastError}>
              <AlertTriangle className="h-3 w-3 shrink-0" />
              <span className="truncate">{account.lastError}</span>

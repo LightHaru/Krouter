@@ -125,7 +125,7 @@ interface PoolHealthStats {
 }
 
 /** 把代理池实时聚合成几个关键指标，给"健康看板"用 */
-function computePoolHealth(proxies: ProxyEntry[]): PoolHealthStats {
+function computePoolHealth(proxies: ProxyEntry[], maxUsableLatencyMs: number): PoolHealthStats {
   const stats: PoolHealthStats = {
     total: proxies.length,
     enabled: 0, alive: 0, slow: 0, dead: 0, untested: 0, testing: 0,
@@ -138,8 +138,12 @@ function computePoolHealth(proxies: ProxyEntry[]): PoolHealthStats {
   let latencyCount = 0
   for (const p of proxies) {
     if (p.enabled) stats.enabled++
-    if (p.status === 'alive') stats.alive++
-    else if (p.status === 'slow') stats.slow++
+    const latencyIsUsable = typeof p.latencyMs === 'number' &&
+      Number.isFinite(p.latencyMs) &&
+      p.latencyMs >= 0 &&
+      p.latencyMs <= maxUsableLatencyMs
+    if (p.status === 'alive' && latencyIsUsable) stats.alive++
+    else if (p.status === 'alive' || p.status === 'slow') stats.slow++
     else if (p.status === 'dead') stats.dead++
     else if (p.status === 'untested') stats.untested++
     else if (p.status === 'testing') stats.testing++
@@ -197,7 +201,7 @@ function StatTile({
 
 function HealthDashboard({ stats, isEn }: { stats: PoolHealthStats; isEn: boolean }): React.ReactNode {
   if (stats.total === 0) return null
-  const availabilityRate = stats.total > 0 ? (stats.alive + stats.slow) / stats.total : 0
+  const availabilityRate = stats.total > 0 ? stats.alive / stats.total : 0
   const successPct = stats.successRate !== null ? Math.round(stats.successRate * 100) : null
   const successTone: 'green' | 'amber' | 'red' | 'default' = successPct === null ? 'default'
     : successPct >= 80 ? 'green' : successPct >= 50 ? 'amber' : 'red'
@@ -220,7 +224,7 @@ function HealthDashboard({ stats, isEn }: { stats: PoolHealthStats; isEn: boolea
           <StatTile
             label={isEn ? 'Availability' : '可用率'}
             value={`${Math.round(availabilityRate * 100)}%`}
-            sub={`${stats.alive + stats.slow} ${isEn ? 'alive' : '可用'}`}
+            sub={`${stats.alive} ${isEn ? 'fast and usable' : '快速可用'}`}
             tone={availTone}
           />
           <StatTile
@@ -390,7 +394,10 @@ export function ProxyPoolPage(): React.ReactNode {
   }, [proxyPool, proxyPoolConfig.upstreamProxy])
 
   const proxies = useMemo(() => Array.from(proxyPool.values()), [proxyPool])
-  const poolHealth = useMemo(() => computePoolHealth(proxies), [proxies])
+  const poolHealth = useMemo(
+    () => computePoolHealth(proxies, proxyPoolConfig.maxUsableLatencyMs),
+    [proxies, proxyPoolConfig.maxUsableLatencyMs]
+  )
 
   // 反代路由：当前账号-代理绑定关系
   const bindingStats = useMemo(() => {
@@ -399,7 +406,13 @@ export function ProxyPoolPage(): React.ReactNode {
     const boundCount = Object.keys(accountProxyBindings).filter(
       (aid) => accounts.has(aid)
     ).length
-    const aliveProxies = proxies.filter((p) => p.enabled && p.status !== 'dead')
+    const aliveProxies = proxies.filter((p) =>
+      p.enabled &&
+      p.status === 'alive' &&
+      typeof p.latencyMs === 'number' &&
+      Number.isFinite(p.latencyMs) &&
+      p.latencyMs <= proxyPoolConfig.maxUsableLatencyMs
+    )
     // 每代理承载的账号数
     const perProxy: Record<string, number> = {}
     for (const [aid, pid] of Object.entries(accountProxyBindings)) {
@@ -723,7 +736,7 @@ export function ProxyPoolPage(): React.ReactNode {
           </div>
 
           {/* 自动停用 + 失败阈值 + 测试 URL */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3 pt-2">
             <div className="flex items-center gap-2">
               <Switch
                 checked={proxyPoolConfig.autoDisableDead}
@@ -768,6 +781,20 @@ export function ProxyPoolPage(): React.ReactNode {
                   className="h-8 text-xs font-mono flex-1"
                 />
               </div>
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">
+                {isEn ? 'Maximum usable latency (ms)' : 'Độ trễ tối đa được dùng (ms)'}
+              </Label>
+              <Input
+                type="number" min={100} max={10000} step={100}
+                value={proxyPoolConfig.maxUsableLatencyMs}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value, 10)
+                  if (!isNaN(v) && v >= 100) setProxyPoolConfig({ maxUsableLatencyMs: v })
+                }}
+                className="h-8 text-xs"
+              />
             </div>
           </div>
 
@@ -845,10 +872,10 @@ export function ProxyPoolPage(): React.ReactNode {
               </label>
               <label className="flex items-center gap-2 text-xs">
                 <Switch
-                  checked={proxyPoolConfig.sourceRemoveDead}
-                  onCheckedChange={(v) => setProxyPoolConfig({ sourceRemoveDead: v })}
+                  checked
+                  disabled
                 />
-                <span>{isEn ? 'Remove dead source proxies' : 'Xóa proxy source die'}</span>
+                <span>{isEn ? 'Remove slow/dead source proxies' : 'Xóa proxy nguồn chậm/die'}</span>
               </label>
               <label className="flex items-center gap-2 text-xs">
                 <Switch
@@ -1050,7 +1077,7 @@ export function ProxyPoolPage(): React.ReactNode {
               value={filterText}
               onChange={(e) => setFilterText(e.target.value)}
               placeholder={isEn ? 'Search any field (host/port/protocol/user/email/label/url)...' : '搜索任意字段（host/端口/协议/user/邮箱/备注/URL）...'}
-              className="h-8 max-w-md text-xs"
+              className="h-8 w-full sm:w-auto sm:flex-1 sm:max-w-md text-xs"
             />
             <select
               value={filterStatus}

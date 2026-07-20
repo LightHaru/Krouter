@@ -144,7 +144,7 @@ function TaskCenterDrawer({ open, onClose }: TaskCenterDrawerProps): React.React
             animate={{ x: 0 }}
             exit={{ x: '100%' }}
             transition={{ type: 'spring', stiffness: 300, damping: 30 }}
-            className="fixed right-0 top-0 bottom-0 z-[9999] w-[420px] bg-background border-l shadow-2xl flex flex-col"
+            className="fixed right-0 top-0 bottom-0 z-[9999] w-full sm:w-[420px] max-w-[100vw] bg-background border-l shadow-2xl flex flex-col"
           >
             {/* 头部 */}
             <div className="flex items-center justify-between px-4 py-3 border-b">

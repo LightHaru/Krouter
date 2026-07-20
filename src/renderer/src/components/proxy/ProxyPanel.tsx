@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
-import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, FileText, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2, ExternalLink } from 'lucide-react'
+import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2, ExternalLink } from 'lucide-react'
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Switch, Badge, Select } from '../ui'
 import { ProxySecurityPanel } from './ProxySecurityPanel'
 import { useAccountsStore } from '../../store/accounts'
@@ -8,9 +8,9 @@ import { ProxyLogsDialog } from './ProxyLogsDialog'
 import { ProxyDetailedLogsDialog } from './ProxyDetailedLogsDialog'
 import { ModelsDialog } from './ModelsDialog'
 import { ModelMappingDialog } from './ModelMappingDialog'
-import { AccountSelectDialog } from './AccountSelectDialog'
 import { ApiKeyManager } from './ApiKeyManager'
 import { ClientConfigDialog } from './ClientConfigDialog'
+import { RecentRequestsPanel } from './RecentRequestsPanel'
 import { createPortal } from 'react-dom'
 
 const PROXY_STATUS_REFRESH_MS = 5000
@@ -114,7 +114,7 @@ interface DashboardTunnelStatus {
 }
 
 // 反代请求日志：模块级持久化 + 单次订阅，避免切到其它页面 unmount 后日志清空、中间请求事件丢失
-type RecentLogEntry = { time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }
+type RecentLogEntry = { time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; accountId?: string; accountEmail?: string; error?: string }
 let _proxyRecentLogs: RecentLogEntry[] = []
 let _refSetProxyRecentLogs: ((v: RecentLogEntry[]) => void) | null = null
 let _proxyResponseListenerRegistered = false
@@ -144,6 +144,8 @@ function ensureProxyResponseListenerRegistered(): void {
       reasoningTokens: info.reasoningTokens,
       credits: info.credits,
       responseTime: info.responseTime,
+      accountId: info.accountId,
+      accountEmail: info.accountEmail,
       error: info.error
     }, ..._proxyRecentLogs.slice(0, 99)]
     _refSetProxyRecentLogs?.(_proxyRecentLogs)
@@ -155,14 +157,16 @@ export function ProxyPanel() {
   const isEn = t('common.unknown') === 'Unknown'
   const [isRunning, setIsRunning] = useState(false)
   const [config, setConfig] = useState<ProxyConfig>({
-    enabled: false,
+    enabled: true,
     port: 5580,
     host: '127.0.0.1',
     enableMultiAccount: true,
     logRequests: true,
     clientDrivenToolExecution: true,
-    accountSelectionStrategy: 'round-robin',
-    sessionAffinityEnabled: false
+    accountSelectionStrategy: 'smart',
+    multiAccountSelectionMode: 'all',
+    sessionAffinityEnabled: false,
+    autoStart: true
   })
   const [stats, setStats] = useState<ProxyStats | null>(null)
   const [sessionStats, setSessionStats] = useState<SessionStats | null>(null)
@@ -181,7 +185,6 @@ export function ProxyPanel() {
   const [showClientConfigDialog, setShowClientConfigDialog] = useState(false)
   const [showModelMappingDialog, setShowModelMappingDialog] = useState(false)
   const [availableModels, setAvailableModels] = useState<Array<{ id: string; name: string }>>([])
-  const [showAccountSelectDialog, setShowAccountSelectDialog] = useState(false)
   const [showApiKeyManager, setShowApiKeyManager] = useState(false)
   const [showApiKey, setShowApiKey] = useState(false)
   const [apiKeyFormat, setApiKeyFormat] = useState<'sk' | 'simple' | 'token'>('sk')
@@ -193,7 +196,6 @@ export function ProxyPanel() {
   const [tunnelCopied, setTunnelCopied] = useState(false)
 
   const accounts = useAccountsStore(state => state.accounts)
-  const groups = useAccountsStore(state => state.groups)
 
   // 生成随机 API Key
   const generateApiKey = useCallback(() => {
@@ -245,10 +247,31 @@ export function ProxyPanel() {
           cfg.selectedAccountId = cfg.selectedAccountIds[0]
         }
         const clientDrivenToolExecution = cfg.clientDrivenToolExecution !== false
+        // Krouter no longer exposes a rotation strategy or account scope: all
+        // active accounts form one pool with smart (quota/latency/tier-aware)
+        // failover. Force these invariants locally, and persist once if the
+        // stored config still carries a legacy strategy/scope value.
+        const needsPoolMigration = cfg.enableMultiAccount !== true
+          || cfg.accountSelectionStrategy !== 'smart'
+          || (cfg.multiAccountSelectionMode && cfg.multiAccountSelectionMode !== 'all')
         setConfig({
           ...cfg,
-          clientDrivenToolExecution
+          clientDrivenToolExecution,
+          enableMultiAccount: true,
+          accountSelectionStrategy: 'smart',
+          multiAccountSelectionMode: 'all',
+          sessionAffinityEnabled: false
         })
+        if (needsPoolMigration) {
+          void window.api.proxyUpdateConfig({
+            enabled: true,
+            autoStart: true,
+            enableMultiAccount: true,
+            accountSelectionStrategy: 'smart',
+            multiAccountSelectionMode: 'all',
+            sessionAffinityEnabled: false
+          })
+        }
       }
       if (result.stats) {
         setStats(result.stats as ProxyStats)
@@ -264,6 +287,17 @@ export function ProxyPanel() {
       console.error('Failed to fetch proxy status:', err)
     }
   }, [])
+
+  const saveProxyConfig = useCallback(async (patch: Partial<ProxyConfig>): Promise<void> => {
+    setError(null)
+    setConfig(prev => ({ ...prev, ...patch, enabled: true, autoStart: true }))
+    const result = await window.api.proxyUpdateConfig({ ...patch, enabled: true, autoStart: true })
+    if (!result.success) {
+      setError(result.error || (isEn ? 'Failed to save proxy settings' : 'Không lưu được cài đặt proxy'))
+      return
+    }
+    await fetchStatus()
+  }, [fetchStatus, isEn])
 
   const fetchTunnelStatus = useCallback(async () => {
     if (typeof window.api.dashboardTunnelGetStatus !== 'function') return
@@ -324,29 +358,16 @@ export function ProxyPanel() {
     }
   }, [])
 
-  // 同步账号到反代池
-  // override 用于「改了分组配置立即重同步」场景：setConfig 后闭包里的 config 可能是旧值，
-  // 调用方传入新模式 / 新分组 ids，强制覆盖。
-  const syncAccounts = useCallback(async (override?: {
-    mode?: 'all' | 'groups'
-    groupIds?: string[]
-  }) => {
+  // 同步账号到反代池：所有 active 账号 = 1 个大池（不再按分组过滤）。
+  const syncAccounts = useCallback(async () => {
     setIsSyncing(true)
     setSyncSuccess(false)
     try {
-      const selMode = override?.mode ?? config.multiAccountSelectionMode ?? 'all'
-      const selGroupIds = override?.groupIds ?? config.multiAccountGroupIds ?? []
-      let candidates = Array.from(accounts.values())
+      // Single big pool: every active account is a candidate. The Strategy/Scope
+      // selectors were removed (all accounts always form one pool with smart
+      // tier-aware failover), so no group filtering happens here anymore.
+      const candidates = Array.from(accounts.values())
         .filter(acc => acc.status === 'active' && acc.credentials?.accessToken)
-
-      // 多账号轮询 + 'groups' 范围：按选中分组过滤（'__ungrouped__' 表示未分组账号）
-      if (config.enableMultiAccount && selMode === 'groups') {
-        const gids = new Set(selGroupIds)
-        candidates = candidates.filter(acc => {
-          if (!acc.groupId) return gids.has('__ungrouped__')
-          return gids.has(acc.groupId)
-        })
-      }
 
       const proxyAccounts = candidates.map(acc => ({
           id: acc.id,
@@ -363,6 +384,11 @@ export function ProxyPanel() {
           region: acc.credentials?.apiRegion || acc.credentials?.region || 'us-east-1',
           authMethod: acc.credentials?.authMethod,
           provider: acc.credentials?.provider || acc.idp,
+          // Subscription tier tag drives smart tier routing (premium models -> paid
+          // accounts only). Without this the pool treats every account as unknown-tier,
+          // so a paid/Enterprise account is never recognized and premium models
+          // (Opus, etc.) get wrongly routed to Bedrock instead of the paid account.
+          subscriptionType: acc.subscription?.type,
           // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险），即便前端忘了重同步也安全
           groupId: acc.groupId
         }))
@@ -379,59 +405,7 @@ export function ProxyPanel() {
     } finally {
       setIsSyncing(false)
     }
-  }, [accounts, fetchStatus, config.enableMultiAccount, config.multiAccountSelectionMode, config.multiAccountGroupIds])
-
-  // 启动服务器
-  const handleStart = async () => {
-    setError(null)
-    try {
-      // 先同步账号
-      await syncAccounts()
-
-      const result = await window.api.proxyStart({
-        port: config.port,
-        host: config.host,
-        apiKey: config.apiKey,
-        enableMultiAccount: config.enableMultiAccount,
-        enabled: true,
-        autoStart: config.autoStart,
-        accountSelectionStrategy: config.enableMultiAccount ? (config.accountSelectionStrategy || 'round-robin') : config.accountSelectionStrategy,
-        sessionAffinityEnabled: config.enableMultiAccount && (config.accountSelectionStrategy || 'round-robin') !== 'sticky'
-          ? false
-          : config.sessionAffinityEnabled,
-        logRequests: config.logRequests,
-        clientDrivenToolExecution: config.clientDrivenToolExecution !== false,
-        disableTools: config.disableTools
-      })
-
-      if (result.success) {
-        setIsRunning(true)
-        setConfig(prev => ({ ...prev, enabled: true }))
-        await fetchStatus()
-      } else {
-        setError(result.error || (isEn ? 'Failed to start' : 'Khởi động thất bại'))
-      }
-    } catch (err) {
-      setError((err as Error).message)
-    }
-  }
-
-  // 停止服务器
-  const handleStop = async () => {
-    setError(null)
-    try {
-      const result = await window.api.proxyStop()
-      if (result.success) {
-        setIsRunning(false)
-        setConfig(prev => ({ ...prev, enabled: false }))
-        setStats(null)
-      } else {
-        setError(result.error || (isEn ? 'Failed to stop' : 'Dừng thất bại'))
-      }
-    } catch (err) {
-      setError((err as Error).message)
-    }
-  }
+  }, [accounts, fetchStatus])
 
   // 复制地址（0.0.0.0 对人不可读，复制为 localhost）
   const copyAddress = () => {
@@ -622,33 +596,22 @@ export function ProxyPanel() {
                   ? 'relative inline-flex rounded-full h-2 w-2 bg-white' 
                   : 'relative inline-flex rounded-full h-2 w-2 bg-muted-foreground'}></span>
               </span>
-              {isRunning ? (isEn ? 'Running' : 'Đang chạy') : (isEn ? 'Stopped' : 'Đã dừng')}
+              {isRunning ? (isEn ? 'Running' : 'Đang chạy') : (isEn ? 'Starting' : 'Đang khởi động')}
             </Badge>
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
-          {/* 控制按钮 */}
+          {/* Backend-managed actions */}
           <div className="flex flex-wrap items-center gap-2">
-            {!isRunning ? (
-              <Button onClick={handleStart} className="gap-2">
-                <Play className="h-4 w-4" />
-                {isEn ? 'Start Service' : 'Bật dịch vụ'}
-              </Button>
-            ) : (
-              <Button onClick={handleStop} variant="destructive" className="gap-2">
-                <Square className="h-4 w-4" />
-                {isEn ? 'Stop Service' : 'Tắt dịch vụ'}
-              </Button>
-            )}
-            <Button onClick={() => void syncAccounts()} variant="outline" className="gap-2" disabled={!isRunning || isSyncing}>
+            <Button onClick={() => void syncAccounts()} variant="outline" className="gap-2" disabled={isSyncing}>
               {isSyncing ? <Loader2 className="h-4 w-4 animate-spin" /> : syncSuccess ? <Check className="h-4 w-4 text-success" /> : <RefreshCw className="h-4 w-4" />}
               {isSyncing ? (isEn ? 'Syncing...' : 'Đang đồng bộ...') : syncSuccess ? (isEn ? 'Synced!' : 'Đã đồng bộ') : (isEn ? 'Sync Accounts' : 'Đồng bộ tài khoản')}
             </Button>
-            <Button onClick={handleRefreshModels} variant="outline" className="gap-2" disabled={!isRunning || isRefreshingModels}>
+            <Button onClick={handleRefreshModels} variant="outline" className="gap-2" disabled={isRefreshingModels}>
               {isRefreshingModels ? <Loader2 className="h-4 w-4 animate-spin" /> : refreshSuccess ? <Check className="h-4 w-4 text-success" /> : <RefreshCw className="h-4 w-4" />}
               {isRefreshingModels ? (isEn ? 'Refreshing...' : 'Đang làm mới...') : refreshSuccess ? (isEn ? 'Refreshed!' : 'Đã làm mới') : (isEn ? 'Refresh Models' : 'Làm mới model')}
             </Button>
-            <Button onClick={() => setShowModelsDialog(true)} variant="outline" className="gap-2" disabled={!isRunning}>
+            <Button onClick={() => setShowModelsDialog(true)} variant="outline" className="gap-2">
               <Cpu className="h-4 w-4" />
               {isEn ? 'View Models' : 'Xem model'}
             </Button>
@@ -767,9 +730,8 @@ export function ProxyPanel() {
                 onChange={(e) => {
                   const newPort = parseInt(e.target.value) || 5580
                   setConfig(prev => ({ ...prev, port: newPort }))
-                  window.api.proxyUpdateConfig({ port: newPort })
+                  void saveProxyConfig({ port: newPort })
                 }}
-                disabled={isRunning}
                 className="h-9"
               />
             </div>
@@ -782,18 +744,7 @@ export function ProxyPanel() {
                     checked={config.host === '0.0.0.0'}
                     onCheckedChange={async (checked) => {
                       const newHost = checked ? '0.0.0.0' : '127.0.0.1'
-                      setConfig(prev => ({ ...prev, host: newHost }))
-                      await window.api.proxyUpdateConfig({ host: newHost })
-                      if (isRunning) {
-                        try {
-                          await window.api.proxyStop()
-                          await new Promise(r => setTimeout(r, 200))
-                          await window.api.proxyStart()
-                        } catch (err) {
-                          console.error('[Proxy] Failed to restart after host change:', err)
-                          setError(err instanceof Error ? err.message : String(err))
-                        }
-                      }
+                      await saveProxyConfig({ host: newHost })
                     }}
                     className="scale-75"
                   />
@@ -806,9 +757,8 @@ export function ProxyPanel() {
                 onChange={(e) => {
                   const newHost = e.target.value
                   setConfig(prev => ({ ...prev, host: newHost }))
-                  window.api.proxyUpdateConfig({ host: newHost })
+                  void saveProxyConfig({ host: newHost })
                 }}
-                disabled={isRunning}
                 className={`h-9 ${config.host === '0.0.0.0' ? 'border-warning/50' : ''}`}
               />
             </div>
@@ -827,7 +777,7 @@ export function ProxyPanel() {
                     onChange={(v) => setApiKeyFormat(v as 'sk' | 'simple' | 'token')}
                     className="w-[120px] h-7 text-xs [&>button]:h-7 [&>button]:py-0 [&>button]:px-2.5"
                   />
-                  <Button variant="ghost" size="icon" className="h-7 w-7" onClick={generateApiKey} disabled={isRunning} title={isEn ? 'Generate' : 'Tạo ngẫu nhiên'}>
+                  <Button variant="ghost" size="icon" className="h-7 w-7" onClick={generateApiKey} title={isEn ? 'Generate' : 'Tạo ngẫu nhiên'}>
                     {apiKeyGenerated ? <Check className="h-3.5 w-3.5 text-success" /> : <Dices className="h-3.5 w-3.5" />}
                   </Button>
                   {config.apiKey && (
@@ -849,9 +799,8 @@ export function ProxyPanel() {
                   onChange={(e) => {
                     const newApiKey = e.target.value || undefined
                     setConfig(prev => ({ ...prev, apiKey: newApiKey }))
-                    window.api.proxyUpdateConfig({ apiKey: newApiKey })
+                    void saveProxyConfig({ apiKey: newApiKey })
                   }}
-                  disabled={isRunning}
                   className="pr-9 h-9"
                 />
                 <Button
@@ -869,241 +818,39 @@ export function ProxyPanel() {
           </div>
 
 
-          {/* 运行模式开关区 — 网格化对齐，避免 flex-wrap 造成的凌乱布局 */}
-          <div className="grid grid-cols-1 items-center gap-x-4 gap-y-3 sm:grid-cols-3">
-            <div className="flex items-center gap-2">
-              <Switch
-                id="autoStart"
-                checked={config.autoStart || false}
-                onCheckedChange={async (checked) => {
-                  const patch: Partial<ProxyConfig> = checked
-                    ? { autoStart: true, enabled: true }
-                    : { autoStart: false, enabled: isRunning }
-                  setConfig(prev => ({ ...prev, ...patch }))
-                  const result = await window.api.proxyUpdateConfig(patch)
-                  if (!result.success) {
-                    setError(result.error || (isEn ? 'Failed to update auto start' : 'Không lưu được tự khởi động'))
-                  }
-                  await fetchStatus()
-                }}
-              />
-              <Label htmlFor="autoStart" className="text-sm cursor-pointer">{isEn ? 'Auto Start' : 'Tự khởi động'}</Label>
-            </div>
-            <div className="flex items-center gap-2">
-              <Switch
-                id="multiAccount"
-                checked={config.enableMultiAccount}
-                onCheckedChange={(checked) => {
-                  const patch: Partial<ProxyConfig> = checked
-                    ? { enableMultiAccount: true, accountSelectionStrategy: 'round-robin', sessionAffinityEnabled: false }
-                    : { enableMultiAccount: false }
-                  setConfig(prev => ({ ...prev, ...patch }))
-                  window.api.proxyUpdateConfig(patch)
-                }}
-                disabled={isRunning}
-              />
-              <Label htmlFor="multiAccount" className="text-sm cursor-pointer">{isEn ? 'Multi-Account' : 'Nhiều tài khoản'}</Label>
-            </div>
-            {/* 开启多账号轮询时显示策略选择 */}
-            {config.enableMultiAccount && (
-              <div className="flex min-w-0 flex-col gap-2 sm:col-span-2 lg:flex-row lg:items-center">
-                <Label className="text-sm shrink-0">
-                  {isEn ? 'Strategy' : 'Chiến lược'}:
-                </Label>
-                <div className="flex max-w-full flex-wrap gap-1 rounded-lg bg-muted/30 p-0.5">
-                  {(['smart', 'round-robin', 'least-used', 'sticky'] as const).map(strategy => {
-                    const active = (config.accountSelectionStrategy || 'round-robin') === strategy
-                    const labelEn = strategy === 'smart' ? 'Smart' : strategy === 'round-robin' ? 'Round-Robin' : strategy === 'least-used' ? 'Least-Used' : 'Sticky'
-                    const labelZh = strategy === 'smart' ? 'Thông minh' : strategy === 'round-robin' ? 'Xoay vòng' : strategy === 'least-used' ? 'Ít dùng nhất' : 'Bám phiên'
-                    return (
-                      <button
-                        key={strategy}
-                        type="button"
-                        disabled={isRunning}
-                        className={`rounded-md px-2 py-1 text-xs font-medium transition-all sm:px-3 ${
-                          active
-                            ? 'bg-primary text-primary-foreground shadow-sm'
-                            : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
-                        } disabled:opacity-50 disabled:cursor-not-allowed`}
-                        onClick={() => {
-                          const patch: Partial<ProxyConfig> = strategy !== 'sticky'
-                            ? { accountSelectionStrategy: strategy, sessionAffinityEnabled: false }
-                            : { accountSelectionStrategy: strategy }
-                          setConfig(prev => ({ ...prev, ...patch }))
-                          window.api.proxyUpdateConfig(patch)
-                        }}
-                      >
-                        {isEn ? labelEn : labelZh}
-                      </button>
-                    )
-                  })}
-                </div>
-                <span className="min-w-0 text-xs text-muted-foreground">
-                  {(() => {
-                    const strategy = config.accountSelectionStrategy || 'round-robin'
-                    if (strategy === 'smart') return isEn ? 'Score quota, errors, latency and token freshness before each request' : 'Chấm điểm quota, lỗi, độ trễ và token trước mỗi request'
-                    if (strategy === 'least-used') return isEn ? 'Pick the account with the fewest successful requests' : 'Chọn tài khoản có số request thành công thấp nhất'
-                    if (strategy === 'sticky') return isEn ? 'Stay on success account until failure (preserves prompt cache)' : 'Giữ tài khoản đang thành công cho tới khi lỗi'
-                    return isEn ? 'Each request rotates to next account (load balanced)' : 'Mỗi request chuyển sang tài khoản kế tiếp để cân bằng tải'
-                  })()}
-                </span>
+          {/* Account pool — tất cả tài khoản active gộp thành 1 pool duy nhất,
+              tự động xoay & failover, vẫn ưu tiên tài khoản Pro cho model cao cấp.
+              Không còn selector Strategy/Scope: pool luôn bật, phạm vi = tất cả. */}
+          <div className="rounded-xl border bg-muted/20 p-3">
+            <div className="flex items-start gap-2.5">
+              <div className="mt-0.5 shrink-0 rounded-lg bg-primary/10 p-1.5">
+                <Users className="h-4 w-4 text-primary" />
               </div>
-            )}
-            {/* 多账号轮询范围：全部账号 / 指定分组 */}
-            {config.enableMultiAccount && (() => {
-              const selMode = config.multiAccountSelectionMode || 'all'
-              const selectedGids = new Set(config.multiAccountGroupIds || [])
-              const sortedGroups = Array.from(groups.values()).sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-              const accountList = Array.from(accounts.values()).filter(a => a.status === 'active' && a.credentials?.accessToken)
-              const ungroupedCount = accountList.filter(a => !a.groupId).length
-              const countByGroup = new Map<string, number>()
-              for (const a of accountList) if (a.groupId) countByGroup.set(a.groupId, (countByGroup.get(a.groupId) || 0) + 1)
-              const selectedAccountTotal = selMode === 'all'
-                ? accountList.length
-                : accountList.filter(a => !a.groupId ? selectedGids.has('__ungrouped__') : selectedGids.has(a.groupId)).length
-              const toggleGid = (gid: string) => {
-                const next = new Set(selectedGids)
-                if (next.has(gid)) next.delete(gid); else next.add(gid)
-                const ids = Array.from(next)
-                setConfig(prev => ({ ...prev, multiAccountGroupIds: ids }))
-                window.api.proxyUpdateConfig({ multiAccountGroupIds: ids })
-                // 关键：立即用新分组 ids 重新同步账号池，避免「改了分组但反代仍用旧账号」的体感 bug
-                void syncAccounts({ mode: 'groups', groupIds: ids })
-              }
-              return (
-                <div className="col-span-2 flex flex-col gap-2">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <Label className="text-sm shrink-0">{isEn ? 'Scope' : 'Phạm vi'}:</Label>
-                    <div className="flex gap-1 bg-muted/30 rounded-lg p-0.5">
-                      {(['all', 'groups'] as const).map(mode => {
-                        const active = selMode === mode
-                        const label = mode === 'all'
-                          ? (isEn ? 'All Accounts' : 'Tất cả tài khoản')
-                          : (isEn ? 'Specific Groups' : 'Nhóm đã chọn')
-                        return (
-                          <button
-                            key={mode}
-                            type="button"
-                            disabled={isRunning}
-                            className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
-                              active ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
-                            } disabled:opacity-50 disabled:cursor-not-allowed`}
-                            onClick={() => {
-                              setConfig(prev => ({ ...prev, multiAccountSelectionMode: mode }))
-                              window.api.proxyUpdateConfig({ multiAccountSelectionMode: mode })
-                              // 关键：切换 all/groups 立即重新同步账号池
-                              void syncAccounts({ mode, groupIds: Array.from(selectedGids) })
-                            }}
-                          >
-                            {label}
-                          </button>
-                        )
-                      })}
-                    </div>
-                    <span className="text-xs text-muted-foreground">
-                      {selMode === 'all'
-                        ? (isEn ? `${selectedAccountTotal} active accounts` : `${selectedAccountTotal} tài khoản hoạt động`)
-                        : (isEn ? `${selectedAccountTotal} accounts in selected groups` : `${selectedAccountTotal} tài khoản trong nhóm đã chọn`)}
-                    </span>
-                  </div>
-
-                  {/* 分组多选 chip：仅 groups 模式 */}
-                  {selMode === 'groups' && (
-                    <div className="flex flex-wrap items-center gap-1.5 pl-[60px]">
-                      {/* 未分组特殊 chip */}
-                      <button
-                        type="button"
-                        disabled={isRunning}
-                        onClick={() => toggleGid('__ungrouped__')}
-                        className={`flex items-center gap-1 px-2 h-7 rounded-md text-xs font-medium border transition-all ${
-                          selectedGids.has('__ungrouped__')
-                            ? 'bg-muted text-foreground border-muted-foreground/30'
-                            : 'bg-background text-muted-foreground border-border hover:text-foreground hover:border-primary/40'
-                        } disabled:opacity-50 disabled:cursor-not-allowed`}
-                      >
-                        {selectedGids.has('__ungrouped__') && <Check className="h-3 w-3" />}
-                        <span>{isEn ? 'Ungrouped' : 'Chưa nhóm'}</span>
-                        <span className="text-[10px] opacity-70">({ungroupedCount})</span>
-                      </button>
-                      {/* 用户分组 chips */}
-                      {sortedGroups.map(group => {
-                        const isSel = selectedGids.has(group.id)
-                        const count = countByGroup.get(group.id) || 0
-                        return (
-                          <button
-                            key={group.id}
-                            type="button"
-                            disabled={isRunning}
-                            onClick={() => toggleGid(group.id)}
-                            className={`flex items-center gap-1 px-2 h-7 rounded-md text-xs font-medium border transition-all ${
-                              isSel ? 'text-foreground' : 'bg-background text-muted-foreground border-border hover:text-foreground hover:border-primary/40'
-                            } disabled:opacity-50 disabled:cursor-not-allowed`}
-                            style={isSel ? {
-                              backgroundColor: (group.color || '#888') + '22',
-                              borderColor: (group.color || '#888') + '66'
-                            } : undefined}
-                          >
-                            {isSel && <Check className="h-3 w-3" style={{ color: group.color || undefined }} />}
-                            <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: group.color || '#888' }} />
-                            <span>{group.name}</span>
-                            <span className="text-[10px] opacity-70">({count})</span>
-                          </button>
-                        )
-                      })}
-                      {sortedGroups.length === 0 && (
-                        <span className="text-xs text-muted-foreground italic">
-                          {isEn ? 'No groups defined yet. Create groups in Account Manager first.' : 'Chưa có nhóm nào. Hãy tạo nhóm trong trang Tài khoản trước.'}
-                        </span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )
-            })()}
-            {/* 关闭多账号轮询时显示账号选择按钮和自动切换开关 */}
-            {!config.enableMultiAccount && (
-              <>
-                <div className="col-span-2">
-                  <Button
-                    variant="outline"
-                    className="w-full justify-start"
-                    onClick={() => setShowAccountSelectDialog(true)}
-                    disabled={isRunning}
-                  >
-                    <UserCheck className="h-4 w-4 mr-2" />
-                    {config.selectedAccountId ? (
-                      (() => {
-                        const acc = accounts.get(config.selectedAccountId)
-                        return acc ? (acc.email || acc.id.substring(0, 12) + '...') : (isEn ? 'First Available' : 'Tài khoản khả dụng đầu tiên')
-                      })()
-                    ) : (
-                      isEn ? 'First Available' : 'Tài khoản khả dụng đầu tiên'
-                    )}
-                  </Button>
-                </div>
+              <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
-                  <Switch
-                    id="autoSwitchOnQuotaExhausted"
-                    checked={config.autoSwitchOnQuotaExhausted || false}
-                    onCheckedChange={(checked) => {
-                      setConfig(prev => ({ ...prev, autoSwitchOnQuotaExhausted: checked }))
-                      window.api.proxyUpdateConfig({ autoSwitchOnQuotaExhausted: checked })
-                    }}
-                    disabled={isRunning}
-                  />
-                  <Label htmlFor="autoSwitchOnQuotaExhausted" className="text-sm cursor-pointer truncate" title={isEn ? 'Auto-switch on quota exhausted' : 'Tự chuyển khi tài khoản hết hạn mức'}>
-                    {isEn ? 'Auto-switch' : 'Tự chuyển'}
-                  </Label>
+                  <span className="text-sm font-medium">{isEn ? 'Account Pool' : 'Pool tài khoản'}</span>
+                  <Badge variant="secondary" className="text-xs">
+                    {Array.from(accounts.values()).filter(a => a.status === 'active' && a.credentials?.accessToken).length}
+                  </Badge>
                 </div>
-              </>
-            )}
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  {isEn
+                    ? 'All active accounts form one big pool — requests rotate and fail over automatically. Premium models (e.g. Opus) still prefer Pro accounts.'
+                    : 'Tất cả tài khoản gộp thành 1 pool — request tự động xoay & failover. Model cao cấp (vd Opus) vẫn ưu tiên tài khoản Pro.'}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Log toggles */}
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
             <div className="flex items-center gap-2">
               <Switch
                 id="logRequests"
                 checked={config.logRequests}
                 onCheckedChange={(checked) => {
                   setConfig(prev => ({ ...prev, logRequests: checked }))
-                  window.api.proxyUpdateConfig({ logRequests: checked })
+                  void saveProxyConfig({ logRequests: checked })
                 }}
               />
               <Label htmlFor="logRequests" className="text-sm cursor-pointer">{isEn ? 'Log Requests' : 'Ghi log request'}</Label>
@@ -1114,7 +861,7 @@ export function ProxyPanel() {
                 checked={config.logStreamEvents || false}
                 onCheckedChange={(checked) => {
                   setConfig(prev => ({ ...prev, logStreamEvents: checked }))
-                  window.api.proxyUpdateConfig({ logStreamEvents: checked })
+                  void saveProxyConfig({ logStreamEvents: checked })
                 }}
               />
               <Label htmlFor="logStreamEvents" className="text-sm cursor-pointer">{isEn ? 'Stream Events' : 'Sự kiện stream'}</Label>
@@ -1141,7 +888,7 @@ export function ProxyPanel() {
                   onChange={(value) => {
                     const endpoint = (value || undefined) as 'codewhisperer' | 'amazonq' | 'amazonq-cli' | undefined
                     setConfig(prev => ({ ...prev, preferredEndpoint: endpoint }))
-                    window.api.proxyUpdateConfig({ preferredEndpoint: endpoint })
+                    void saveProxyConfig({ preferredEndpoint: endpoint })
                   }}
                   placeholder={isEn ? 'Select endpoint' : 'Chọn endpoint'}
                 />
@@ -1157,9 +904,8 @@ export function ProxyPanel() {
                   onChange={(e) => {
                     const retries = parseInt(e.target.value) || 3
                     setConfig(prev => ({ ...prev, maxRetries: retries }))
-                    window.api.proxyUpdateConfig({ maxRetries: retries })
+                    void saveProxyConfig({ maxRetries: retries })
                   }}
-                  disabled={isRunning}
                   className="h-9"
                 />
               </div>
@@ -1175,9 +921,8 @@ export function ProxyPanel() {
                   onChange={(e) => {
                     const kb = parseInt(e.target.value) || 1536
                     setConfig(prev => ({ ...prev, payloadSizeLimitKB: kb }))
-                    window.api.proxyUpdateConfig({ payloadSizeLimitKB: kb })
+                    void saveProxyConfig({ payloadSizeLimitKB: kb })
                   }}
-                  disabled={isRunning}
                   className="h-9"
                 />
               </div>
@@ -1190,9 +935,8 @@ export function ProxyPanel() {
                     checked={config.clientDrivenToolExecution !== false}
                     onCheckedChange={(checked) => {
                       setConfig(prev => ({ ...prev, clientDrivenToolExecution: checked }))
-                      window.api.proxyUpdateConfig({ clientDrivenToolExecution: checked })
+                      void saveProxyConfig({ clientDrivenToolExecution: checked })
                     }}
-                    disabled={isRunning}
                     className="scale-90"
                   />
                 </div>
@@ -1206,9 +950,8 @@ export function ProxyPanel() {
                     checked={config.disableTools || false}
                     onCheckedChange={(checked) => {
                       setConfig(prev => ({ ...prev, disableTools: checked }))
-                      window.api.proxyUpdateConfig({ disableTools: checked })
+                      void saveProxyConfig({ disableTools: checked })
                     }}
-                    disabled={isRunning}
                     className="scale-90"
                   />
                 </div>
@@ -1224,9 +967,8 @@ export function ProxyPanel() {
                       checked={config.enableTokenBufferReserve || false}
                       onCheckedChange={(checked) => {
                         setConfig(prev => ({ ...prev, enableTokenBufferReserve: checked }))
-                        window.api.proxyUpdateConfig({ enableTokenBufferReserve: checked })
+                        void saveProxyConfig({ enableTokenBufferReserve: checked })
                       }}
-                      disabled={isRunning}
                       className="scale-90"
                     />
                   </div>
@@ -1240,9 +982,9 @@ export function ProxyPanel() {
                     onChange={(e) => {
                       const tokens = parseInt(e.target.value) || 20000
                       setConfig(prev => ({ ...prev, tokenBufferReserve: tokens }))
-                      window.api.proxyUpdateConfig({ tokenBufferReserve: tokens })
+                      void saveProxyConfig({ tokenBufferReserve: tokens })
                     }}
-                    disabled={isRunning || !config.enableTokenBufferReserve}
+                    disabled={!config.enableTokenBufferReserve}
                     placeholder={isEn ? 'Reserve tokens (default 20000)' : 'Số token dự phòng (mặc định 20000)'}
                     className="h-9 flex-1"
                   />
@@ -1380,11 +1122,17 @@ export function ProxyPanel() {
                 <Cpu className="h-3 w-3" />
                 <span>{isEn ? 'Cache Hit' : 'Cache hit'}</span>
                 {(() => {
+                  // Hit rate THẬT = phần prompt được phục vụ từ cache / tổng prompt.
+                  // inputTokens là phần uncached (tính giá đầy đủ), cacheRead là phần hit.
                   const read = stats.cacheReadTokens || 0
-                  const total = read + (stats.cacheWriteTokens || 0)
-                  const rate = total > 0 ? (read / total * 100) : 0
+                  const promptTotal = (stats.inputTokens || 0) + read
+                  const rate = promptTotal > 0 ? (read / promptTotal * 100) : 0
                   return rate > 0 ? (
-                    <Badge variant="secondary" className="ml-1 text-[10px] px-1 py-0">{rate.toFixed(0)}%</Badge>
+                    <Badge
+                      variant="secondary"
+                      className="ml-1 text-[10px] px-1 py-0"
+                      title={isEn ? '% of prompt served from cache' : '% prompt được phục vụ từ cache'}
+                    >{rate.toFixed(0)}%</Badge>
                   ) : null
                 })()}
               </div>
@@ -1393,6 +1141,11 @@ export function ProxyPanel() {
                 <span className="text-muted-foreground mx-1">/</span>
                 <span className="text-amber-500" title={`${isEn ? 'Cache Write' : 'Ghi cache'}: ${(stats.cacheWriteTokens || 0).toLocaleString()}`}>{compactNumber(stats.cacheWriteTokens || 0)}</span>
               </div>
+              {(stats.cacheReadTokens || 0) > 0 && (
+                <div className="text-[10px] text-emerald-600/80 dark:text-emerald-400/80 mt-0.5" title={`${(stats.cacheReadTokens || 0).toLocaleString()} ${isEn ? 'tokens served from cache' : 'token phục vụ từ cache'}`}>
+                  {isEn ? 'Saved ' : 'Tiết kiệm '}~{compactNumber(stats.cacheReadTokens || 0)}
+                </div>
+              )}
             </CardContent>
           </Card>
           <Card className="hover-lift bg-gradient-to-br from-violet-500/5 to-transparent">
@@ -1505,49 +1258,12 @@ export function ProxyPanel() {
       </Card>
 
       {/* 最近请求日志 */}
-      {recentLogs.length > 0 && (
-        <Card className="hover-lift">
-          <CardHeader className="pb-2">
-            <div className="flex items-center justify-between">
-              <CardTitle className="text-base flex items-center gap-2">
-                <div className="p-1.5 rounded-lg bg-primary/10">
-                  <Activity className="h-4 w-4 text-primary" />
-                </div>
-                {isEn ? 'Recent Requests' : 'Request gần đây'}
-              </CardTitle>
-              <div className="flex items-center gap-2">
-                <Badge variant="secondary" className="text-xs">{recentLogs.length}</Badge>
-                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowLogsDialog(true)}>
-                  <FileText className="h-3 w-3 mr-1" />
-                  {isEn ? 'View All' : 'Xem tất cả'}
-                </Button>
-                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowDetailedLogsDialog(true)}>
-                  <Activity className="h-3 w-3 mr-1" />
-                  {isEn ? 'Detailed Logs' : 'Log chi tiết'}
-                </Button>
-              </div>
-            </div>
-          </CardHeader>
-          <CardContent className="pt-2">
-            <div className="max-h-[150px] overflow-y-auto text-xs font-mono space-y-0.5">
-              {recentLogs.slice(0, 5).map((log, idx) => (
-                <div key={idx} className="grid gap-2 py-1 px-2 rounded hover:bg-muted/50 items-center" style={{ gridTemplateColumns: '2fr 1fr 1.2fr 0.5fr 0.8fr 0.8fr 0.9fr 0.8fr 0.8fr 0.6fr' }}>
-                  <span className="text-muted-foreground whitespace-nowrap text-left">{log.time}</span>
-                  <span className="truncate text-left" title={log.path}>{log.path}</span>
-                  <span className="truncate text-left text-muted-foreground" title={log.model}>{log.model ? log.model.replace('anthropic.', '').replace('-v1:0', '') : '-'}</span>
-                  <span className={`text-center ${log.status >= 400 ? 'text-destructive' : 'text-success'}`}>{log.status}</span>
-                  <span className="text-muted-foreground text-right">{log.inputTokens ? log.inputTokens.toLocaleString() : '-'}</span>
-                  <span className="text-muted-foreground text-right">{log.outputTokens ? log.outputTokens.toLocaleString() : '-'}</span>
-                  <span className="text-success text-right" title={`${isEn ? 'Cache Read/Write' : 'Cache đọc/ghi'}`}>{log.cacheReadTokens || log.cacheWriteTokens ? `${(log.cacheReadTokens || 0).toLocaleString()}/${(log.cacheWriteTokens || 0).toLocaleString()}` : '-'}</span>
-                  <span className="text-violet-500 text-right">{log.reasoningTokens ? log.reasoningTokens.toLocaleString() : '-'}</span>
-                  <span className="text-muted-foreground text-right">{log.credits ? log.credits.toFixed(4) : '-'}</span>
-                  <span className="text-muted-foreground text-right">{log.responseTime ? `${(log.responseTime / 1000).toFixed(1)}s` : '-'}</span>
-                </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      )}
+      <RecentRequestsPanel
+        logs={recentLogs}
+        isEn={isEn}
+        onViewAll={() => setShowLogsDialog(true)}
+        onViewDetailed={() => setShowDetailedLogsDialog(true)}
+      />
 
       {/* 功能说明 */}
       <Card className="hover-lift">
@@ -1660,30 +1376,17 @@ export function ProxyPanel() {
         mappings={config.modelMappings || []}
         onMappingsChange={(mappings) => {
           setConfig(prev => ({ ...prev, modelMappings: mappings }))
-          window.api.proxyUpdateConfig({ modelMappings: mappings })
+          void saveProxyConfig({ modelMappings: mappings })
         }}
         apiKeys={(config.apiKeys || []).map(k => ({ id: k.id, name: k.name }))}
         availableModels={availableModels}
       />
 
-      {/* 账号选择弹窗 */}
-      <AccountSelectDialog
-        open={showAccountSelectDialog}
-        onOpenChange={setShowAccountSelectDialog}
-        accounts={accounts}
-        selectedAccountId={config.selectedAccountId}
-        onSelect={(accountId) => {
-          setConfig(prev => ({ ...prev, selectedAccountId: accountId }))
-          window.api.proxyUpdateConfig({ selectedAccountIds: accountId ? [accountId] : [] })
-        }}
-        isEn={isEn}
-      />
-
       {/* API Key 管理弹窗 */}
       {showApiKeyManager && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4">
           <div className="absolute inset-0 bg-black/50" onClick={() => setShowApiKeyManager(false)} />
-          <div className="relative bg-background rounded-lg shadow-lg w-[800px] max-w-[95vw] max-h-[80vh] overflow-y-auto p-4">
+          <div className="relative bg-background rounded-lg shadow-lg w-full sm:w-[800px] max-w-[95vw] max-h-[90vh] sm:max-h-[80vh] overflow-y-auto p-4">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold">{isEn ? 'API Key Management' : 'Quản lý API Key'}</h2>
               <Button variant="ghost" size="icon" onClick={() => setShowApiKeyManager(false)}>✕</Button>

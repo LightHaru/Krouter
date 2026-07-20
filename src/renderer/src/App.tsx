@@ -8,6 +8,7 @@ import { UpdateDialog } from './components/UpdateDialog'
 import { CloseConfirmDialog } from './components/CloseConfirmDialog'
 import { useAccountsStore } from './store/accounts'
 import { pageFromPath } from './lib/docsRoute'
+import { useIsMobile } from './hooks/useIsMobile'
 
 // 托盘信息防抖延迟：后台刷新风暴时合并多次跨进程 IPC 为单次
 const TRAY_UPDATE_DEBOUNCE_MS = 400
@@ -19,6 +20,23 @@ const BACKEND_ACCOUNT_SYNC_DEBOUNCE_MS = 800
 function App(): React.JSX.Element {
   const [currentPage, setCurrentPage] = useState<PageType>('home')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true)
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const isMobile = useIsMobile()
+
+  // Đóng drawer khi thoát chế độ mobile (tránh kẹt overlay khi phóng to cửa sổ).
+  useEffect(() => {
+    if (!isMobile) setMobileNavOpen(false)
+  }, [isMobile])
+
+  // Escape đóng drawer.
+  useEffect(() => {
+    if (!mobileNavOpen) return
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setMobileNavOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [mobileNavOpen])
 
   const {
     loadFromStorage,
@@ -163,7 +181,8 @@ function App(): React.JSX.Element {
         // 映射反代事件名 → Webhook 事件类型
         const webhookEventMap: Record<string, 'risk-warning' | 'account-banned'> = {
           'proxy-account-suspended': 'account-banned',
-          'proxy-all-exhausted': 'risk-warning'
+          'proxy-all-exhausted': 'risk-warning',
+          'proxy-pool-low': 'risk-warning'
         }
         const targetEvent = webhookEventMap[event] || 'risk-warning'
         // 规范化 level（main 用 'error'/'info' 等字符串字面量，需要映射到 store 接受的类型）
@@ -332,7 +351,7 @@ function App(): React.JSX.Element {
   useEffect(() => {
     const unsubscribe = window.api.onProxyAccountSuspended((info) => {
       console.warn(`[App] Account suspended via proxy: ${info.email || info.id} (${info.reason})`)
-      updateAccountStatus(info.id, 'error', `[${info.reason}] ${info.message}`)
+      updateAccountStatus(info.id, 'blocked', `[${info.reason}] ${info.message}`)
     })
     return () => {
       unsubscribe()
@@ -380,14 +399,17 @@ function App(): React.JSX.Element {
 
   return (
     <div className="app-shell ambient-bg">
-      <TitleBar />
+      <TitleBar showMenuButton={isMobile} onMenuClick={() => setMobileNavOpen(true)} />
       <div className="app-workspace">
-        <Sidebar
-          currentPage={currentPage}
-          onPageChange={setCurrentPage}
-          collapsed={sidebarCollapsed}
-          onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
-        />
+        {/* Desktop: sidebar tĩnh. Mobile: ẩn, thay bằng drawer bên dưới. */}
+        {!isMobile && (
+          <Sidebar
+            currentPage={currentPage}
+            onPageChange={setCurrentPage}
+            collapsed={sidebarCollapsed}
+            onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
+          />
+        )}
         <main className="app-main page-surface">
           <AnimatePresence mode="wait">
             <motion.div
@@ -403,6 +425,39 @@ function App(): React.JSX.Element {
           </AnimatePresence>
         </main>
       </div>
+
+      {/* Mobile sidebar drawer */}
+      <AnimatePresence>
+        {isMobile && mobileNavOpen && (
+          <div className="fixed inset-0 z-[9997]" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+              onClick={() => setMobileNavOpen(false)}
+            />
+            <motion.div
+              initial={{ x: '-100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '-100%' }}
+              transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+              className="absolute left-0 top-0 bottom-0 p-2"
+            >
+              <Sidebar
+                variant="drawer"
+                currentPage={currentPage}
+                onPageChange={setCurrentPage}
+                collapsed={false}
+                onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
+                onNavigate={() => setMobileNavOpen(false)}
+              />
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       <UpdateDialog />
       <CloseConfirmDialog />
     </div>

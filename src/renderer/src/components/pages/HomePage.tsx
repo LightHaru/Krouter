@@ -74,10 +74,17 @@ export function HomePage() {
     },
     { 
       label: isEn ? 'Banned' : '已封禁', 
-      value: stats.byStatus?.error || 0, 
+      value: stats.bannedCount || 0,
       icon: AlertTriangle, 
       color: 'text-red-500',
       bgColor: 'bg-red-500/10'
+    },
+    {
+      label: isEn ? 'Quota exhausted' : 'Hết quota',
+      value: stats.quotaExhaustedCount || 0,
+      icon: Zap,
+      color: 'text-amber-500',
+      bgColor: 'bg-amber-500/10'
     },
     { 
       label: isEn ? 'Expiring Soon' : '即将过期', 
@@ -114,7 +121,7 @@ export function HomePage() {
       </div>
 
       {/* Stats Grid */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
         {statCards.map((stat) => {
           const Icon = stat.icon
           return (
@@ -355,15 +362,15 @@ export function HomePage() {
             {/* 订阅详情 */}
             <div className="pt-3 border-t space-y-2">
               <p className="text-xs font-medium text-muted-foreground">{isEn ? 'Subscription Details' : '订阅详情'}</p>
-              <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
-                <div className="flex items-center gap-2">
-                  <span className="text-muted-foreground">{isEn ? 'Type:' : '订阅类型:'}</span>
-                  <span className="font-medium">{activeAccount.subscription?.title || activeAccount.subscription?.type || 'Free'}</span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2 text-xs">
+                <div className="flex items-start gap-2 min-w-0">
+                  <span className="text-muted-foreground shrink-0">{isEn ? 'Type:' : '订阅类型:'}</span>
+                  <span className="font-medium min-w-0 break-words">{activeAccount.subscription?.title || activeAccount.subscription?.type || 'Free'}</span>
                 </div>
                 {activeAccount.subscription?.rawType && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-muted-foreground">{isEn ? 'Raw Type:' : '原始类型:'}</span>
-                    <span className="font-mono text-[10px]">{activeAccount.subscription.rawType}</span>
+                  <div className="flex items-start gap-2 min-w-0">
+                    <span className="text-muted-foreground shrink-0">{isEn ? 'Raw Type:' : '原始类型:'}</span>
+                    <span className="font-mono text-[10px] min-w-0 break-all">{activeAccount.subscription.rawType}</span>
                   </div>
                 )}
                 {activeAccount.subscription?.expiresAt && (
@@ -373,15 +380,15 @@ export function HomePage() {
                   </div>
                 )}
                 {activeAccount.subscription?.upgradeCapability && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-muted-foreground">{isEn ? 'Upgradeable:' : '可升级:'}</span>
-                    <span className="font-medium">{activeAccount.subscription.upgradeCapability}</span>
+                  <div className="flex items-start gap-2 min-w-0">
+                    <span className="text-muted-foreground shrink-0">{isEn ? 'Upgradeable:' : '可升级:'}</span>
+                    <span className="font-medium min-w-0 break-words">{activeAccount.subscription.upgradeCapability}</span>
                   </div>
                 )}
                 {activeAccount.subscription?.overageCapability && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-muted-foreground">{isEn ? 'Overage:' : '超额能力:'}</span>
-                    <span className="font-medium">{activeAccount.subscription.overageCapability}</span>
+                  <div className="flex items-start gap-2 min-w-0">
+                    <span className="text-muted-foreground shrink-0">{isEn ? 'Overage:' : '超额能力:'}</span>
+                    <span className="font-medium min-w-0 break-words">{activeAccount.subscription.overageCapability}</span>
                   </div>
                 )}
               </div>
@@ -444,9 +451,9 @@ export function HomePage() {
             <div className="pt-3 border-t space-y-2">
               <p className="text-xs font-medium text-muted-foreground">{isEn ? 'Account Info' : '账户信息'}</p>
               <div className="space-y-1.5 text-xs">
-                <div className="flex items-start gap-2">
+                <div className="flex items-start gap-2 min-w-0">
                   <span className="text-muted-foreground shrink-0">User ID:</span>
-                  <span className="font-mono text-[10px] break-all select-all">{activeAccount.userId}</span>
+                  <span className="font-mono text-[10px] break-all select-all min-w-0">{activeAccount.userId}</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-muted-foreground">IDP:</span>

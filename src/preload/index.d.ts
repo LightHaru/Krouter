@@ -729,7 +729,14 @@ interface KiroApi {
   proxyRefreshModels: () => Promise<{ success: boolean; error?: string }>
 
   // 获取可用模型列表
-  proxyGetModels: () => Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }>; fromCache?: boolean }>
+  proxyGetModels: () => Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string; tier?: 'premium' | 'standard'; servableTiers?: string[]; availableInPool?: boolean; availableForPool?: boolean; probedOk?: boolean; probeResults?: Array<{ modelId: string; tier: string; ok: boolean; error?: string; latencyMs?: number; checkedAt: number }> }>; fromCache?: boolean }>
+  // "Test thật": live-probe từng model theo tier tài khoản
+  proxyProbeModels: (input?: { modelIds?: string[]; concurrency?: number }) => Promise<{ success: boolean; error?: string; results?: Array<{ modelId: string; tier: string; ok: boolean; error?: string; latencyMs?: number; accountId?: string; checkedAt: number }> }>
+  proxyGetModelProbeResults: () => Promise<{ success: boolean; results: Array<{ modelId: string; tier: string; ok: boolean; error?: string; latencyMs?: number; accountId?: string; checkedAt: number }> }>
+  onModelProbeProgress: (callback: (data: { done: number; total: number; last?: { modelId: string; tier: string; ok: boolean; error?: string } }) => void) => () => void
+  onModelProbeComplete: (callback: (data: { total: number }) => void) => () => void
+  proxyTestBedrock: (input: { accessKeyId?: string; secretAccessKey?: string; sessionToken?: string; region?: string }) => Promise<{ success: boolean; region?: string; error?: string; models?: Array<{ id: string; name?: string; provider?: string; kind: 'foundation' | 'profile' }> }>
+  proxyTestXpixi: (input: { apiKey?: string; baseUrl?: string }) => Promise<{ success: boolean; error?: string; models?: Array<{ id: string }> }>
 
   proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null }> }) => Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; apiKey?: { id?: string; name?: string; key: string }; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }>
 
@@ -758,7 +765,7 @@ interface KiroApi {
   onProxyRequest: (callback: (info: { path: string; method: string; accountId?: string }) => void) => () => void
 
   // 监听反代响应事件
-  onProxyResponse: (callback: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }) => void) => () => void
+  onProxyResponse: (callback: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; accountId?: string; accountEmail?: string; error?: string }) => void) => () => void
 
   // 监听反代错误事件
   onProxyError: (callback: (error: string) => void) => () => void
@@ -1027,6 +1034,7 @@ interface KiroApi {
     testUrl?: string
     timeoutMs?: number
     upstreamProxy?: string
+    requireAwsSigninRoute?: boolean
   }) => Promise<{ success: boolean; latencyMs?: number; externalIp?: string; error?: string }>
 
   networkRouteValidate: (params?: {

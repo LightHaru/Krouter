@@ -154,14 +154,16 @@ export class AccountPool {
       return null
     }
 
-    // 单账号特殊处理：绕过断路器，直接返回（让用户看到真实 API 错误）
+    const now = Date.now()
+
+    // 单账号也必须遵守配额、封禁和冷却状态。直接绕过可用性检查会在 429 后
+    // 立即把下一次请求再次发给同一账号，抵消 cooldown 并加重上游限流。
     if (accountList.length === 1) {
       const account = accountList[0]
       if (excludeIds?.has(account.id)) return null
-      return account
+      return this.isAccountAvailable(account, now) ? account : null
     }
 
-    const now = Date.now()
     if (this.strategy === 'smart') {
       return this.getSmartBalancedAccount(accountList, now, excludeIds)
     }
@@ -201,6 +203,44 @@ export class AccountPool {
   // 获取特定账号
   getAccount(accountId: string): ProxyAccount | null {
     return this.accounts.get(accountId) || null
+  }
+
+  /**
+   * 从候选子集中按配置策略选一个可用账号（供 tier 分组路由使用）。
+   *
+   * 与 getNextAccount 不同：调用方（proxyServer）已经把 pool 预过滤成"某个 tier 组"的
+   * candidateIds，本方法只在该子集内选，并且只有真正选中时才前进 round-robin 指针
+   * （selected+1），因此不会像旧的分组循环那样因反复调用而打乱全局指针（bug #5）。
+   * candidateIds 为空 => 返回 null。excludeIds 为本请求已试过的账号。
+   */
+  getNextAccountFromCandidates(candidateIds: Set<string>, excludeIds?: Set<string>): ProxyAccount | null {
+    if (candidateIds.size === 0) return null
+    const now = Date.now()
+    const fullList = Array.from(this.accounts.values())
+    const candidateList = fullList.filter(
+      (account) => candidateIds.has(account.id) && !excludeIds?.has(account.id)
+    )
+    if (candidateList.length === 0) return null
+
+    if (this.strategy === 'smart') {
+      return this.getSmartBalancedAccount(candidateList, now)
+    }
+    if (this.strategy === 'least-used') {
+      return this.getLeastUsedAccount(candidateList, now)
+    }
+
+    // round-robin / sticky: 扫描完整 pool 顺序（保持全局公平），但只选候选子集内、可用的账号。
+    const startIndex = this.currentIndex
+    for (let i = 0; i < fullList.length; i++) {
+      const idx = (startIndex + i) % fullList.length
+      const account = fullList[idx]
+      if (!candidateIds.has(account.id)) continue
+      if (excludeIds?.has(account.id)) continue
+      if (!this.isAccountAvailable(account, now)) continue
+      this.reserveSelection(idx, fullList.length)
+      return account
+    }
+    return null
   }
 
   // 获取下一个可用账号（排除指定账号；支持单 ID 或 ID 集合）
@@ -599,7 +639,7 @@ export class AccountPool {
     })
 
     if (!wasExhausted && used >= limit) {
-      console.log(`[AccountPool] Account ${account.email || accountId} quota reached: ${used}/${limit}`)
+      console.warn(`[AccountPool] Account ${account.email || accountId} QUOTA EXHAUSTED: ${used}/${limit} - Account will be skipped until reset`)
     } else if (wasExhausted && used < limit) {
       console.log(`[AccountPool] Account ${account.email || accountId} quota recovered: ${used}/${limit}`)
     }

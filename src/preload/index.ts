@@ -777,6 +777,39 @@ const api = {
     return ipcRenderer.invoke('proxy-get-models')
   },
 
+  // "Test thật": live-probe từng model theo tier
+  proxyProbeModels: (input?: { modelIds?: string[]; concurrency?: number }): Promise<{ success: boolean; error?: string; results?: Array<{ modelId: string; tier: string; ok: boolean; error?: string; latencyMs?: number; accountId?: string; checkedAt: number }> }> => {
+    return ipcRenderer.invoke('proxy-probe-models', input)
+  },
+
+  proxyGetModelProbeResults: (): Promise<{ success: boolean; results: Array<{ modelId: string; tier: string; ok: boolean; error?: string; latencyMs?: number; accountId?: string; checkedAt: number }> }> => {
+    return ipcRenderer.invoke('proxy-get-model-probe-results')
+  },
+
+  onModelProbeProgress: (callback: (data: { done: number; total: number; last?: { modelId: string; tier: string; ok: boolean; error?: string } }) => void): (() => void) => {
+    const handler = (_event: unknown, data: { done: number; total: number; last?: { modelId: string; tier: string; ok: boolean; error?: string } }): void => callback(data)
+    ipcRenderer.on('model-probe-progress', handler)
+    return () => {
+      ipcRenderer.removeListener('model-probe-progress', handler)
+    }
+  },
+
+  onModelProbeComplete: (callback: (data: { total: number }) => void): (() => void) => {
+    const handler = (_event: unknown, data: { total: number }): void => callback(data)
+    ipcRenderer.on('model-probe-complete', handler)
+    return () => {
+      ipcRenderer.removeListener('model-probe-complete', handler)
+    }
+  },
+
+  proxyTestBedrock: (input: { accessKeyId?: string; secretAccessKey?: string; sessionToken?: string; region?: string }): Promise<{ success: boolean; region?: string; error?: string; models?: Array<{ id: string; name?: string; provider?: string; kind: 'foundation' | 'profile' }> }> => {
+    return ipcRenderer.invoke('proxy-test-bedrock', input)
+  },
+
+  proxyTestXpixi: (input: { apiKey?: string; baseUrl?: string }): Promise<{ success: boolean; error?: string; models?: Array<{ id: string }> }> => {
+    return ipcRenderer.invoke('proxy-test-xpixi', input)
+  },
+
   proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null }> }): Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; apiKey?: { id?: string; name?: string; key: string }; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }> => {
     return ipcRenderer.invoke('proxy-configure-clients', input)
   },
@@ -828,8 +861,8 @@ const api = {
   },
 
   // 监听反代响应事件
-  onProxyResponse: (callback: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }): void => {
+  onProxyResponse: (callback: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; accountId?: string; accountEmail?: string; error?: string }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; accountId?: string; accountEmail?: string; error?: string }): void => {
       callback(info)
     }
     ipcRenderer.on('proxy-response', handler)
@@ -1244,6 +1277,7 @@ const api = {
     testUrl?: string
     timeoutMs?: number
     upstreamProxy?: string
+    requireAwsSigninRoute?: boolean
   }): Promise<{ success: boolean; latencyMs?: number; externalIp?: string; error?: string }> => {
     return ipcRenderer.invoke('proxy-pool:validate', params)
   },

@@ -8,6 +8,7 @@ import { encode, decode } from 'cbor-x'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import icon from '../../resources/icon.png?asset'
 import { ProxyServer, configureProxyClients, type ProxyAccount, type ProxyConfig, type ProxyClientTarget, type ProxyClientModel, type ProxyUsageStatsUpdate } from './proxy'
+import { testBedrockCredentials, type BedrockConfig } from './proxy/bedrock'
 import { 
   initKProxyService, 
   getKProxyService, 
@@ -16,7 +17,7 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, isPlaceholderProfileArn, resolveProfileArn } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setStreamTimeouts, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, isPlaceholderProfileArn, resolveProfileArn } from './proxy/kiroApi'
 import { KIRO_PROXY_MODEL_PRESETS } from './proxy/modelCatalog'
 import {
   writeKiroAuthTokenFile,
@@ -2130,6 +2131,11 @@ function createWindow(): void {
               region: acc.credentials?.region || 'us-east-1',
               authMethod: acc.credentials?.authMethod,
               provider: acc.credentials?.provider || acc.idp,
+              // Subscription tier tag drives smart tier routing (premium models ->
+              // paid accounts only). Without it every pool account is unknown-tier,
+              // so paid/Enterprise accounts are never recognized and Opus etc. get
+              // wrongly routed to Bedrock instead of the paid Kiro account.
+              subscriptionType: acc.subscription?.type,
               proxyUrl: buildProxyUrl(acc.id)
             }))
           if (proxyAccounts.length > 0) {
@@ -6047,6 +6053,10 @@ app.whenReady().then(async () => {
       if (config.logStreamEvents !== undefined) {
         setLogStreamEvents(config.logStreamEvents)
       }
+      // 同步流式读取超时
+      if (config.streamFirstByteTimeoutMs !== undefined || config.streamIdleTimeoutMs !== undefined) {
+        setStreamTimeouts({ firstByteMs: config.streamFirstByteTimeoutMs, idleMs: config.streamIdleTimeoutMs })
+      }
       // 同步 payload 大小限制
       if (config.payloadSizeLimitKB !== undefined) {
         setPayloadSizeLimitKB(config.payloadSizeLimitKB)
@@ -6350,6 +6360,60 @@ app.whenReady().then(async () => {
       return { success: true, ...result }
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to get models', models: [] }
+    }
+  })
+
+  // IPC: "Test thật" — live-probe từng model trên account đại diện mỗi tier
+  ipcMain.handle('proxy-probe-models', async (_event, input?: { modelIds?: string[]; concurrency?: number }) => {
+    if (!proxyServer) {
+      return { success: false, error: 'Proxy server not initialized' }
+    }
+    try {
+      const results = await proxyServer.probeModels({
+        modelIds: input?.modelIds,
+        concurrency: input?.concurrency,
+        onProgress: (done, total, last) => mainWindow?.webContents.send('model-probe-progress', { done, total, last })
+      })
+      mainWindow?.webContents.send('model-probe-complete', { total: results.length })
+      return { success: true, results }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to probe models' }
+    }
+  })
+
+  // IPC: đọc kết quả live-probe đã cache
+  ipcMain.handle('proxy-get-model-probe-results', () => {
+    if (!proxyServer) return { success: false, results: [] }
+    return { success: true, results: proxyServer.getModelProbeResults() }
+  })
+
+  // IPC: verify Bedrock (AWS IAM) credentials and list invokable models
+  ipcMain.handle('proxy-test-bedrock', async (_event, input: { accessKeyId?: string; secretAccessKey?: string; sessionToken?: string; region?: string }) => {
+    const cfg: BedrockConfig = {
+      enabled: true,
+      accessKeyId: (input?.accessKeyId || '').trim(),
+      secretAccessKey: (input?.secretAccessKey || '').trim(),
+      sessionToken: input?.sessionToken?.trim() || undefined,
+      region: (input?.region || 'us-east-1').trim()
+    }
+    const result = await testBedrockCredentials(cfg)
+    if (!result.ok) return { success: false, region: result.region, error: result.error }
+    return { success: true, region: result.region, models: result.models }
+  })
+
+  ipcMain.handle('proxy-test-xpixi', async (_event, input: { apiKey?: string; baseUrl?: string }) => {
+    try {
+      const { testXpixiCredentials } = await import('./proxy/xpixi')
+      const result = await testXpixiCredentials({
+        apiKey: input?.apiKey?.trim(),
+        baseUrl: input?.baseUrl?.trim()
+      })
+      return result
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      }
     }
   })
 

@@ -103,6 +103,8 @@ export function getSubscriptionColor(type: string, title?: string): string {
 
 export const StatusLabelsZh: Record<string, string> = {
   active: '正常',
+  blocked: 'Bị khóa',
+  quota_exhausted: 'Hết quota',
   expired: '已过期',
   error: '错误',
   refreshing: '刷新中',
@@ -111,6 +113,8 @@ export const StatusLabelsZh: Record<string, string> = {
 
 export const StatusLabelsEn: Record<string, string> = {
   active: 'Active',
+  blocked: 'Blocked',
+  quota_exhausted: 'Quota exhausted',
   expired: 'Expired',
   error: 'Error',
   refreshing: 'Refreshing',
@@ -122,6 +126,8 @@ export function getStatusBadgeClass(status: string, isUnauthorized: boolean): st
   if (isUnauthorized) return 'text-destructive bg-destructive/10'
   switch (status) {
     case 'active': return 'text-success bg-success/10'
+    case 'blocked': return 'text-destructive bg-destructive/10'
+    case 'quota_exhausted': return 'text-amber-600 bg-amber-500/10'
     case 'error': return 'text-destructive bg-destructive/10'
     case 'expired': return 'text-warning bg-warning/10'
     case 'refreshing': return 'text-primary bg-primary/10'

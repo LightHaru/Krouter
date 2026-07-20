@@ -34,7 +34,11 @@ function addPowerAccount(ps: any, id: string, cooldownUntil: number): void {
     email: `${id}@test`,
     accessToken: 'tok',
     errorCount: 0,
-    cooldownUntil
+    cooldownUntil,
+    // Tier routing is always on: Paid tag so the tag pre-filter admits these
+    // power accounts for the premium OPUS model, leaving the cooldown-wait path
+    // (capability cache + availability) to govern selection.
+    subscriptionType: 'Pro'
   })
   // Seed power-tier capability cache (normalized ids) so accountSupportsModel
   // is cache-only and never calls fetchKiroModels.

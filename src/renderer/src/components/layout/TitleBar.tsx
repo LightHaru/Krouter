@@ -1,10 +1,16 @@
 import { useEffect, useState } from 'react'
-import { Minus, Square, X, Copy as RestoreIcon } from 'lucide-react'
+import { Minus, Square, X, Copy as RestoreIcon, Menu } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
 import { TaskCenterButton } from './TaskCenter'
 import krouterMark from '@/assets/krouter-mark.svg'
 import { APP_NAME } from '@/brand'
+
+interface TitleBarProps {
+  /** Hiện nút hamburger (mobile) mở sidebar drawer. */
+  showMenuButton?: boolean
+  onMenuClick?: () => void
+}
 
 /**
  * 跨平台自定义 titlebar
@@ -14,7 +20,13 @@ import { APP_NAME } from '@/brand'
  * 拖动：整条 titlebar 用 -webkit-app-region: drag
  * 按钮区：使用 no-drag 让点击生效
  */
-export function TitleBar(): React.ReactNode {
+// Bản web (trình duyệt) KHÔNG phải Electron: không có window controls, và tuyệt đối
+// không bật -webkit-app-region: drag vì trên trình duyệt nó nuốt hết click (hamburger
+// sẽ không bấm được).
+const IS_ELECTRON =
+  typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('electron')
+
+export function TitleBar({ showMenuButton = false, onMenuClick }: TitleBarProps = {}): React.ReactNode {
   useTranslation()
   const [platform, setPlatform] = useState<NodeJS.Platform>('win32')
   const [isMaximized, setIsMaximized] = useState(false)
@@ -45,7 +57,8 @@ export function TitleBar(): React.ReactNode {
     return () => cleanup?.()
   }, [])
 
-  const isMac = platform === 'darwin'
+  // Chỉ coi là macOS khi THỰC SỰ chạy Electron trên mac (web shim trả 'darwin' giả).
+  const isMac = IS_ELECTRON && platform === 'darwin'
 
   return (
     <div
@@ -55,13 +68,28 @@ export function TitleBar(): React.ReactNode {
         'border-b border-foreground/5'
       )}
       style={{
-        // 整条 titlebar 可拖动
-        WebkitAppRegion: 'drag',
+        // Chỉ Electron mới kéo được cửa sổ; web bật drag sẽ chặn click.
+        WebkitAppRegion: IS_ELECTRON ? 'drag' : 'no-drag',
         // mac 留 80px 给 traffic lights
         paddingLeft: isMac ? 80 : 12,
         paddingRight: isMac ? 12 : 0
       } as React.CSSProperties}
     >
+      {/* Hamburger (mobile) mở sidebar drawer */}
+      {showMenuButton && (
+        <div className="flex items-center pr-1" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          <button
+            type="button"
+            onClick={onMenuClick}
+            title="Menu"
+            aria-label="Open navigation"
+            className="flex h-6 w-6 items-center justify-center rounded-md text-foreground/70 transition-colors hover:bg-foreground/10 hover:text-foreground"
+          >
+            <Menu className="h-4 w-4" strokeWidth={2} />
+          </button>
+        </div>
+      )}
+
       {/* 应用图标 + 标题 */}
       <div
         className={cn(
@@ -82,8 +110,8 @@ export function TitleBar(): React.ReactNode {
         <TaskCenterButton />
       </div>
 
-      {/* Windows/Linux 按钮组 */}
-      {!isMac && (
+      {/* Windows/Linux 按钮组 — chỉ hiển thị trong Electron (web không có window controls) */}
+      {IS_ELECTRON && !isMac && (
         <div
           className="flex items-stretch h-full"
           style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
