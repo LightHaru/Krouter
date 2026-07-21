@@ -577,7 +577,7 @@ function mergeAccountData(currentRaw: unknown, incomingRaw: unknown): Record<str
 function unsupported(method: string): { success: false; error: string } {
   return {
     success: false,
-    error: `Web backend handler '${method}' has not been ported from Electron yet.`
+    error: `Web backend handler '${method}' is not implemented.`
   }
 }
 
@@ -1542,21 +1542,6 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
     case 'setUseKProxyForApi':
       await store.setUserSetting(user.id, 'useKProxyForApi', Boolean(args[0]))
       return { success: true, enabled: Boolean(args[0]) }
-    case 'getShowWindowShortcut':
-      return store.getUserSetting(user.id, 'showWindowShortcut', 'Ctrl+Shift+K')
-    case 'setShowWindowShortcut':
-      await store.setUserSetting(user.id, 'showWindowShortcut', args[0])
-      return { success: true }
-    case 'getTraySettings':
-      return store.getUserSetting(user.id, 'traySettings', {
-        enabled: false,
-        closeAction: 'quit',
-        showNotifications: false,
-        minimizeOnStart: false
-      })
-    case 'saveTraySettings':
-      await store.setUserSetting(user.id, 'traySettings', { ...(settings.traySettings as Record<string, unknown> || {}), ...(args[0] as Record<string, unknown> || {}) })
-      return { success: true }
     case 'checkForUpdates':
       return checkForUpdatesManual()
     case 'checkForUpdatesManual':

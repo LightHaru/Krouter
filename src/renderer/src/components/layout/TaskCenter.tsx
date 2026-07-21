@@ -64,7 +64,7 @@ export function TaskCenterButton(): React.ReactNode {
           'hover:bg-foreground/10',
           activeCount > 0 ? 'text-primary' : (hasFailure ? 'text-red-500' : 'text-muted-foreground')
         )}
-        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+       
       >
         {activeCount > 0
           ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -128,7 +128,7 @@ function TaskCenterDrawer({ open, onClose }: TaskCenterDrawerProps): React.React
     <AnimatePresence>
       {open && (
         // no-drag 确保抽屉内所有按钮在 Windows 下可点击
-        <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+        <div>
           {/* 遮罩 */}
           <motion.div
             initial={{ opacity: 0 }}

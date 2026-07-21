@@ -15,8 +15,10 @@
   "include": [
     "src/server/**/*.ts",
     "src/main/runtimePaths.ts",
+    "src/main/kiroAuthSync.ts",
     "src/main/proxy/**/*.ts",
     "src/main/kproxy/**/*.ts",
+    "src/main/registration/**/*.ts",
     "src/main/utils/**/*.ts"
   ]
 }

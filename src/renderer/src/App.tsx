@@ -5,13 +5,10 @@ import { Sidebar, TitleBar, type PageType } from './components/layout'
 import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, ProxyPage, KProxyPage, ProxyPoolPage, WebhooksPage, DiagnosePage, ConfigSyncPage, SkillsPage, MITMPage, RegisterPage, SubscriptionPage, LogsPage, DocsPage } from './components/pages'
 import { useWebhookStore } from './store/webhooks'
 import { UpdateDialog } from './components/UpdateDialog'
-import { CloseConfirmDialog } from './components/CloseConfirmDialog'
 import { useAccountsStore } from './store/accounts'
 import { pageFromPath } from './lib/docsRoute'
 import { useIsMobile } from './hooks/useIsMobile'
 
-// 托盘信息防抖延迟：后台刷新风暴时合并多次跨进程 IPC 为单次
-const TRAY_UPDATE_DEBOUNCE_MS = 400
 // 后台刷新结果批量化间隔：N 条结果合并到一次 set，避免 N 次 Map 全量复制 + 渲染抖动
 const BACKGROUND_RESULT_FLUSH_MS = 120
 const BACKEND_ACCOUNT_SYNC_INTERVAL_MS = 10000
@@ -46,69 +43,11 @@ function App(): React.JSX.Element {
     applyBackgroundCheckResults,
     applyProxyAccountUpdate,
     flushSaveImmediately,
-    accounts,
-    activeAccountId,
-    setActiveAccount,
-    checkAndRefreshExpiringTokens,
     updateAccountStatus
   } = useAccountsStore()
 
-  // 切换到下一个可用账户
-  const switchToNextAccount = useCallback(() => {
-    const activeAccounts = Array.from(accounts.values()).filter(acc => acc.status === 'active')
-    if (activeAccounts.length <= 1) return
-
-    const currentIndex = activeAccounts.findIndex(acc => acc.id === activeAccountId)
-    const nextIndex = (currentIndex + 1) % activeAccounts.length
-    setActiveAccount(activeAccounts[nextIndex].id)
-  }, [accounts, activeAccountId, setActiveAccount])
-
-  // 托盘信息防抖：账号 Map 频繁变更（后台刷新风暴）时合并 N 次 IPC 为 1 次
-  const trayDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const backendAccountSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const backendAccountSyncInFlightRef = useRef(false)
-  const updateTrayInfo = useCallback(() => {
-    if (trayDebounceRef.current) clearTimeout(trayDebounceRef.current)
-    trayDebounceRef.current = setTimeout(() => {
-      trayDebounceRef.current = null
-      const currentState = useAccountsStore.getState()
-      const currentAccounts = currentState.accounts
-      const currentActiveId = currentState.activeAccountId
-
-      const accountList = Array.from(currentAccounts.values()).map(acc => ({
-        id: acc.id,
-        email: acc.email || 'Unknown',
-        idp: acc.idp || 'Unknown',
-        status: acc.status
-      }))
-      window.api.updateTrayAccountList(accountList)
-
-      if (currentActiveId) {
-        const activeAccount = currentAccounts.get(currentActiveId)
-        if (activeAccount) {
-          window.api.updateTrayAccount({
-            id: activeAccount.id,
-            email: activeAccount.email || 'Unknown',
-            idp: activeAccount.idp || 'Unknown',
-            status: activeAccount.status,
-            subscription: activeAccount.subscription?.title || undefined,
-            usage: activeAccount.usage ? {
-              usedCredits: activeAccount.usage.current || 0,
-              totalCredits: activeAccount.usage.limit || 0,
-              totalRequests: 0,
-              successRequests: 0,
-              failedRequests: 0
-            } : undefined
-          })
-        } else {
-          window.api.updateTrayAccount(null)
-        }
-      } else {
-        window.api.updateTrayAccount(null)
-      }
-    }, TRAY_UPDATE_DEBOUNCE_MS)
-  }, [])
-
   const syncAccountsFromBackend = useCallback((delayMs = 0): void => {
     if (backendAccountSyncTimerRef.current) clearTimeout(backendAccountSyncTimerRef.current)
     backendAccountSyncTimerRef.current = setTimeout(() => {
@@ -129,7 +68,6 @@ function App(): React.JSX.Element {
     loadFromStorage().then(() => {
       startAutoTokenRefresh()
     })
-    // 同步主动续期开关（持久化在 main 进程的 electron-store）
     useAccountsStore.getState().loadProactiveRenewalEnabled()
     // 加载 Webhook 配置
     useWebhookStore.getState().loadFromStorage()
@@ -249,35 +187,11 @@ function App(): React.JSX.Element {
     window.addEventListener('beforeunload', handleBeforeUnload)
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload)
-      if (trayDebounceRef.current) clearTimeout(trayDebounceRef.current)
     }
   }, [flushSaveImmediately])
 
-  // 账户/激活变化时触发托盘更新（内部防抖 + 直接从 store 读取最新数据，避免 stale closure）
-  useEffect(() => {
-    updateTrayInfo()
-  }, [accounts, activeAccountId, updateTrayInfo])
 
-  // 监听托盘刷新账户事件
-  useEffect(() => {
-    const unsubscribe = window.api.onTrayRefreshAccount(() => {
-      checkAndRefreshExpiringTokens()
-      updateTrayInfo()
-    })
-    return () => {
-      unsubscribe()
-    }
-  }, [checkAndRefreshExpiringTokens, updateTrayInfo])
 
-  // 监听托盘切换账户事件
-  useEffect(() => {
-    const unsubscribe = window.api.onTraySwitchAccount(() => {
-      switchToNextAccount()
-    })
-    return () => {
-      unsubscribe()
-    }
-  }, [switchToNextAccount])
 
   // 监听后台刷新结果：缓冲 + 批量化 flush，N 条结果合并为一次 set，消除 Map 复制风暴
   useEffect(() => {
@@ -433,7 +347,7 @@ function App(): React.JSX.Element {
       {/* Mobile sidebar drawer */}
       <AnimatePresence>
         {isMobile && mobileNavOpen && (
-          <div className="fixed inset-0 z-[9997]" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          <div className="fixed inset-0 z-[9997]">
             <motion.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
@@ -463,7 +377,6 @@ function App(): React.JSX.Element {
       </AnimatePresence>
 
       <UpdateDialog />
-      <CloseConfirmDialog />
     </div>
   )
 }

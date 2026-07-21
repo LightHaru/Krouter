@@ -1,5 +1,3 @@
-import { ElectronAPI } from '@electron-toolkit/preload'
-
 interface AccountData {
   accounts: Record<string, unknown>
   /** Web multi-session tombstones for explicitly deleted accounts. */
@@ -553,7 +551,7 @@ interface KiroApi {
 
   // ============ 自动更新 API ============
 
-  // 检查更新 (electron-updater)
+  // 检查更新 (npm package)
   checkForUpdates: () => Promise<{
     hasUpdate: boolean
     version?: string
@@ -874,78 +872,6 @@ interface KiroApi {
   // 监听 K-Proxy MITM 拦截事件
   onKproxyMitm: (callback: (info: { host: string; modified: boolean }) => void) => () => void
 
-  // ============ 自定义 titlebar API ============
-  window: {
-    minimize: () => void
-    maximizeToggle: () => void
-    close: () => void
-    isMaximized: () => Promise<boolean>
-    getPlatform: () => Promise<NodeJS.Platform>
-    onMaximizeChange: (callback: (isMaximized: boolean) => void) => () => void
-  }
-
-  // ============ 托盘相关 API ============
-
-  // 获取托盘设置
-  getShowWindowShortcut: () => Promise<string>
-  setShowWindowShortcut: (shortcut: string) => Promise<{ success: boolean; error?: string }>
-  getTraySettings: () => Promise<{
-    enabled: boolean
-    closeAction: 'ask' | 'minimize' | 'quit'
-    showNotifications: boolean
-    minimizeOnStart: boolean
-  }>
-
-  // 保存托盘设置
-  saveTraySettings: (settings: {
-    enabled?: boolean
-    closeAction?: 'ask' | 'minimize' | 'quit'
-    showNotifications?: boolean
-    minimizeOnStart?: boolean
-  }) => Promise<{ success: boolean; error?: string }>
-
-  // 更新托盘当前账户信息
-  updateTrayAccount: (account: {
-    id: string
-    email: string
-    idp: string
-    status: string
-    subscription?: string
-    usage?: {
-      usedCredits: number
-      totalCredits: number
-      totalRequests: number
-      successRequests: number
-      failedRequests: number
-    }
-  } | null) => void
-
-  // 更新托盘账户列表
-  updateTrayAccountList: (accounts: {
-    id: string
-    email: string
-    idp: string
-    status: string
-  }[]) => void
-
-  // 刷新托盘菜单
-  refreshTrayMenu: () => void
-
-  // 更新托盘语言
-  updateTrayLanguage: (language: 'en' | 'zh') => void
-
-  // 监听托盘刷新账户事件
-  onTrayRefreshAccount: (callback: () => void) => () => void
-
-  // 监听托盘切换账户事件
-  onTraySwitchAccount: (callback: () => void) => () => void
-
-  // 监听显示关闭确认对话框事件
-  onShowCloseConfirmDialog: (callback: () => void) => () => void
-
-  // 发送关闭确认对话框响应
-  sendCloseConfirmResponse: (action: 'minimize' | 'quit' | 'cancel', rememberChoice: boolean) => void
-
   // ============ 注册功能 API ============
 
   registrationStartAuto: (config: {
@@ -1140,7 +1066,8 @@ interface KiroApi {
 
 declare global {
   interface Window {
-    electron: ElectronAPI
     api: KiroApi
   }
 }
+
+export {}

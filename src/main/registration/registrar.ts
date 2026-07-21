@@ -356,10 +356,10 @@ export class Registrar {
       return { existingPath: finalPath, downloadDir: tlsClientDir }
     }
 
-    // 2. 从打包资源复制（安装包自带）
+    // 2. 从 npm package resources 复制（若随包附带 native lib）
     const resourceCandidates = [
-      path.join(process.resourcesPath || '', filename),
-      path.join(__dirname, '..', '..', '..', 'resources', filename)
+      path.join(__dirname, '..', '..', '..', 'resources', filename),
+      path.join(process.cwd(), 'resources', filename)
     ]
     const resourcePath = resourceCandidates.find((candidate) => fs.existsSync(candidate))
     if (resourcePath) {

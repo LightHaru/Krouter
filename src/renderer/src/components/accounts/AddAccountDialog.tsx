@@ -420,7 +420,7 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
     }
   }
 
-  // 启动 IAM SSO 登录。Web 后端返回 device flow，Electron 旧版仍可能返回 authorizeUrl。
+  // 启动 IAM SSO 登录。Web 后端返回 device flow (authorizeUrl optional).
   const handleStartIamSsoLogin = async () => {
     if (!ssoStartUrl.trim()) {
       setError(isEn ? 'Please enter SSO Start URL' : '请输入 SSO Start URL')
@@ -447,7 +447,7 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
         // 打开浏览器（支持隐私模式）
         window.api.openExternal(verificationUri, usePrivateMode)
 
-        // 开始轮询（device flow 轮询 AWS；旧 Electron 流程轮询本地回调结果）
+        // 开始轮询 device flow / callback result
         startIamSsoPolling(result.interval || 3)
       } else {
         setError(result.error || (isEn ? 'Failed to start login' : '启动登录失败'))

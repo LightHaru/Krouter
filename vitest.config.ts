@@ -1,9 +1,8 @@
 import { defineConfig } from 'vitest/config'
 import { resolve } from 'node:path'
 
-// Standalone test configuration kept separate from the web/electron Vite
-// configs (vite.web.config.ts / electron.vite.config.ts) so unit and
-// property-based tests for the proxy do not interfere with app builds.
+// Standalone test configuration kept separate from vite.web.config.ts
+// so unit/property tests for the proxy do not interfere with web builds.
 export default defineConfig({
   resolve: {
     alias: {

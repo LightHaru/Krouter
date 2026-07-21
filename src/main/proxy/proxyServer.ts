@@ -3122,8 +3122,8 @@ export class ProxyServer {
         return
       }
 
-      // API Key 验证（健康检查端点除外）
-      if (path !== '/health' && path !== '/') {
+      // API Key 验证（健康检查端点 + ChatGPT OAuth 管理端点除外）
+      if (path !== '/health' && path !== '/' && !path.startsWith('/auth/chatgpt/')) {
         const authResult = this.validateApiKey(req)
         if (!authResult.valid) {
           const errorMsg = authResult.reason || 'Invalid or missing API key'
@@ -5919,7 +5919,7 @@ export class ProxyServer {
 
   /** Phase 15: Pick best account with valid ChatGPT token for image generation */
   private pickChatGPTImageAccount(): ProxyAccount | null {
-    const accounts = this.accountPool.getAccounts().filter(acc =>
+    const accounts = this.accountPool.getAllAccounts().filter((acc: ProxyAccount) =>
       acc.chatgpt &&
       acc.chatgpt.accessToken &&
       acc.chatgpt.consecutiveFailures < 5 &&
@@ -5929,7 +5929,7 @@ export class ProxyServer {
     if (accounts.length === 0) return null
 
     // Prefer account with lowest quota usage
-    accounts.sort((a, b) => {
+    accounts.sort((a: ProxyAccount, b: ProxyAccount) => {
       const aUsed = a.chatgpt?.imageQuota?.used ?? 0
       const bUsed = b.chatgpt?.imageQuota?.used ?? 0
       return aUsed - bUsed
@@ -5981,8 +5981,8 @@ export class ProxyServer {
         // Store pending flow — will resolve when user completes OAuth
         this.pendingOAuthFlow = waitForCallback.then(async ({ tokens }) => {
           // Find first account without chatgpt tokens, or the primary account
-          const accounts = this.accountPool.getAccounts()
-          const targetAccount = accounts.find(a => !a.chatgpt) || accounts[0]
+          const accounts = this.accountPool.getAllAccounts()
+          const targetAccount = accounts.find((a: ProxyAccount) => !a.chatgpt) || accounts[0]
           if (targetAccount) {
             this.accountPool.updateAccount(targetAccount.id, {
               chatgpt: {
@@ -6016,9 +6016,9 @@ export class ProxyServer {
       res.end('<html><body><h2>OAuth callback received</h2><p>You can close this window.</p></body></html>')
     } else if (path === '/auth/chatgpt/status' && method === 'GET') {
       // Return status of all ChatGPT-linked accounts
-      const accounts = this.accountPool.getAccounts()
-        .filter(a => a.chatgpt)
-        .map(a => ({
+      const accounts = this.accountPool.getAllAccounts()
+        .filter((a: ProxyAccount) => a.chatgpt)
+        .map((a: ProxyAccount) => ({
           accountId: a.id,
           email: a.chatgpt!.email,
           plan: a.chatgpt!.plan,
@@ -6032,7 +6032,7 @@ export class ProxyServer {
       res.end(JSON.stringify({
         accounts,
         totalAccounts: accounts.length,
-        availableForImageGen: accounts.filter(a => a.tokenValid && a.failures < 5).length,
+        availableForImageGen: accounts.filter((a: any) => a.tokenValid && a.failures < 5).length,
         oauthFlowPending: !!this.pendingOAuthFlow,
       }))
     } else if (path === '/auth/chatgpt/logout' && method === 'POST') {
@@ -6041,9 +6041,9 @@ export class ProxyServer {
       let body: { accountId?: string } = {}
       try { body = JSON.parse(bodyStr) } catch { /* empty */ }
 
-      const accounts = this.accountPool.getAccounts().filter(a => a.chatgpt)
+      const accounts = this.accountPool.getAllAccounts().filter((a: ProxyAccount) => a.chatgpt)
       const target = body.accountId
-        ? accounts.find(a => a.id === body.accountId)
+        ? accounts.find((a: ProxyAccount) => a.id === body.accountId)
         : accounts[0]
 
       if (target) {
@@ -6069,8 +6069,8 @@ export class ProxyServer {
         return
       }
 
-      const accounts = this.accountPool.getAccounts()
-      const targetAccount = accounts.find(a => !a.chatgpt) || accounts[0]
+      const accounts = this.accountPool.getAllAccounts()
+      const targetAccount = accounts.find((a: ProxyAccount) => !a.chatgpt) || accounts[0]
 
       if (!targetAccount) {
         this.sendError(res, 503, 'No accounts in pool to attach ChatGPT tokens')
