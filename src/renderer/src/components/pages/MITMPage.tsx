@@ -89,9 +89,17 @@ export function MITMPage() {
   }
 
   async function toggleDns() {
+    // Check if handler exists (Electron mode only)
+    if (!(window as any).api?.kproxyToggleHosts) {
+      alert(isEn 
+        ? 'DNS redirect is only available in desktop app. This feature requires system-level access.'
+        : 'DNS redirect chỉ khả dụng trong ứng dụng desktop. Tính năng này yêu cầu quyền truy cập hệ thống.')
+      return
+    }
+    
     setLoading(true)
     try {
-      const res = await (window as any).api?.kproxyToggleHosts?.(!dnsEnabled)
+      const res = await (window as any).api.kproxyToggleHosts(!dnsEnabled)
       if (res?.success) {
         setDnsEnabled(!dnsEnabled)
         await loadHostsStatus()
@@ -124,9 +132,18 @@ export function MITMPage() {
   }
 
   async function saveModelMappings() {
+    // Check if handler exists (Electron mode only)
+    if (!(window as any).api?.kproxySaveModelMappings) {
+      alert(isEn
+        ? 'Model mappings save is only available in desktop app. This feature requires file system access.'
+        : 'Lưu model mappings chỉ khả dụng trong ứng dụng desktop. Tính năng này yêu cầu quyền truy cập file.')
+      return
+    }
+    
     setLoading(true)
     try {
-      await (window as any).api?.kproxySaveModelMappings?.(modelMappings)
+      await (window as any).api.kproxySaveModelMappings(modelMappings)
+      alert(isEn ? 'Saved successfully' : 'Đã lưu thành công')
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Save failed')
     } finally {
