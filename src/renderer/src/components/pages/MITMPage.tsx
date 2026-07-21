@@ -69,8 +69,15 @@ export function MITMPage() {
 
   async function loadMitmStatus() {
     try {
-      const res = await (window as any).api?.mitmGetStatus?.()
-      if (res) setMitmStatus(res)
+      const res = await (window as any).api?.kproxyGetStatus?.()
+      if (res) {
+        setMitmStatus({
+          running: res.running,
+          port: res.config?.port || 443,
+          connections: res.stats?.activeConnections || 0,
+          interceptedRequests: res.stats?.totalRequests || 0
+        })
+      }
     } catch { /* ignore */ }
   }
 
@@ -102,10 +109,10 @@ export function MITMPage() {
     setLoading(true)
     try {
       if (mitmStatus.running) {
-        const res = await (window as any).api?.mitmStop?.()
+        const res = await (window as any).api?.kproxyStop?.()
         if (!res?.success) alert(res?.error || 'Failed to stop')
       } else {
-        const res = await (window as any).api?.mitmStart?.()
+        const res = await (window as any).api?.kproxyStart?.()
         if (!res?.success) alert(res?.error || 'Failed to start')
       }
       await loadMitmStatus()
