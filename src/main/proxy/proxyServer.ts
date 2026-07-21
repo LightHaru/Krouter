@@ -6054,6 +6054,47 @@ export class ProxyServer {
       } else {
         this.sendError(res, 404, 'No ChatGPT account found to logout')
       }
+    } else if (path === '/auth/chatgpt/token' && method === 'POST') {
+      // Manual token injection — for headless/VPS environments without browser
+      // User can paste access_token + refresh_token directly
+      const bodyStr = await this.readBody(req)
+      let body: { access_token?: string; refresh_token?: string; email?: string } = {}
+      try { body = JSON.parse(bodyStr) } catch {
+        this.sendError(res, 400, 'Invalid JSON body')
+        return
+      }
+
+      if (!body.access_token || !body.refresh_token) {
+        this.sendError(res, 400, 'Required fields: access_token, refresh_token')
+        return
+      }
+
+      const accounts = this.accountPool.getAccounts()
+      const targetAccount = accounts.find(a => !a.chatgpt) || accounts[0]
+
+      if (!targetAccount) {
+        this.sendError(res, 503, 'No accounts in pool to attach ChatGPT tokens')
+        return
+      }
+
+      this.accountPool.updateAccount(targetAccount.id, {
+        chatgpt: {
+          accessToken: body.access_token,
+          refreshToken: body.refresh_token,
+          expiresAt: Date.now() + 14 * 24 * 3600_000, // ~2 weeks default
+          email: body.email,
+          consecutiveFailures: 0,
+        }
+      })
+
+      proxyLogger.info('ChatGPTAuth', `Manual token injected for ${body.email || 'unknown'} on account ${targetAccount.id}`)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        success: true,
+        accountId: targetAccount.id,
+        email: body.email,
+        message: 'Token stored. You can now use /v1/images/generations'
+      }))
     } else {
       this.sendError(res, 404, 'Unknown auth endpoint')
     }
