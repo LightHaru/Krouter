@@ -11,6 +11,8 @@ export interface KProxyConfig {
   mitmDomains: string[]
   // 当前使用的设备 ID
   deviceId?: string
+  // Phase 14: Per-account device ID mappings
+  deviceIdMappings?: DeviceIdMapping[]
   // 是否自动启动
   autoStart: boolean
   // 日志记录
@@ -19,6 +21,10 @@ export interface KProxyConfig {
   caPath?: string
   // CA 私钥路径
   caKeyPath?: string
+  // Phase 14: Enable response body interception
+  interceptResponses?: boolean
+  // Phase 14: Model mapping for response modification
+  modelMappings?: Record<string, string>
 }
 
 /**

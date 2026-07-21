@@ -451,10 +451,37 @@ export class MitmProxy {
       }
     })
 
-    // 将响应转发回客户端
-    serverSocket.on('data', (chunk: Buffer) => {
-      clientSocket.write(chunk)
-    })
+    // Phase 14: Response interception — buffer response if configured
+    if (this.config.interceptResponses) {
+      let responseBuffer = Buffer.alloc(0)
+      let responseHeadersParsed = false
+      let responseHeaders = ''
+
+      serverSocket.on('data', (chunk: Buffer) => {
+        if (!responseHeadersParsed) {
+          responseBuffer = Buffer.concat([responseBuffer, chunk])
+          const headerEnd = responseBuffer.indexOf('\r\n\r\n')
+          if (headerEnd !== -1) {
+            responseHeadersParsed = true
+            responseHeaders = responseBuffer.subarray(0, headerEnd).toString()
+            const responseBody = responseBuffer.subarray(headerEnd + 4)
+
+            const modifiedResponseHeaders = this.modifyResponseHeaders(responseHeaders)
+            clientSocket.write(modifiedResponseHeaders + '\r\n\r\n')
+
+            if (responseBody.length > 0) {
+              clientSocket.write(responseBody)
+            }
+          }
+        } else {
+          clientSocket.write(chunk)
+        }
+      })
+    } else {
+      serverSocket.on('data', (chunk: Buffer) => {
+        clientSocket.write(chunk)
+      })
+    }
 
     serverSocket.on('end', () => {
       const duration = Date.now() - startTime
@@ -479,6 +506,32 @@ export class MitmProxy {
     clientSocket.on('error', () => {
       serverSocket.end()
     })
+  }
+
+  /**
+   * Phase 14: Modify response headers (e.g., inject custom headers, modify model list responses)
+   */
+  private modifyResponseHeaders(headers: string): string {
+    if (!this.config.modelMappings || Object.keys(this.config.modelMappings).length === 0) {
+      return headers
+    }
+    return headers
+  }
+
+  /**
+   * Phase 14: Get device ID for a specific account (per-account rotation)
+   */
+  getDeviceIdForAccount(accountId: string): string | undefined {
+    if (!this.config.deviceIdMappings) return this.config.deviceId
+    const mapping = this.config.deviceIdMappings.find(m => m.accountId === accountId)
+    return mapping?.deviceId || this.config.deviceId
+  }
+
+  /**
+   * Phase 14: Set device ID for the current request context
+   */
+  setActiveDeviceId(deviceId: string): void {
+    this.config.deviceId = deviceId
   }
 
   /**

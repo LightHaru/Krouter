@@ -1,7 +1,9 @@
 import crypto from 'crypto'
+import path from 'path'
 import { ProxyServer, type ProxyUsageStatsUpdate } from '../../main/proxy/proxyServer'
 import { configureProxyClients, type ProxyClientModel, type ProxyClientTarget } from '../../main/proxy/clientConfig'
-import { interceptConsole, proxyLogStore } from '../../main/proxy/logger'
+import { interceptConsole, proxyLogStore, endpointMetrics } from '../../main/proxy/logger'
+import { SkillsManager } from '../../main/proxy/skills'
 import { getRuntimeUserDataPath } from '../../main/runtimePaths'
 import { resolveProfileArn } from '../../main/proxy/kiroApi'
 import { testBedrockCredentials, type BedrockConfig, type BedrockAvailableModel } from '../../main/proxy/bedrock'
@@ -724,6 +726,17 @@ export class ProxyRuntime {
    * Verify Bedrock (AWS IAM) credentials and return the models the identity can
    * actually invoke. Does NOT persist anything; the UI decides whether to save.
    */
+  getBedrockStatus(): { configured: boolean; error?: string; lastChecked?: number } {
+    const server = this.getOrCreateServer()
+    const cfg = (server as any).config?.bedrock
+    if (!cfg?.enabled) return { configured: false }
+    const lastError = (server as any).bedrockLastError as { message: string; timestamp: number } | null | undefined
+    if (lastError) {
+      return { configured: true, error: lastError.message, lastChecked: lastError.timestamp }
+    }
+    return { configured: true }
+  }
+
   async testBedrock(input: { accessKeyId?: string; secretAccessKey?: string; sessionToken?: string; region?: string }): Promise<{ success: boolean; region?: string; models?: BedrockAvailableModel[]; error?: string }> {
     const cfg: BedrockConfig = {
       enabled: true,
@@ -900,6 +913,67 @@ export class ProxyRuntime {
         key: apiKey.key
       }
     }
+  }
+
+  // Phase 13: Skills
+  fetchSkillsList(): { skills: unknown[] } {
+    const builtinDir = path.join(__dirname, '../../../docs/skills')
+    const customDir = path.join(getRuntimeUserDataPath(), 'skills')
+    const mgr = new SkillsManager(builtinDir, customDir)
+    const server = this.getOrCreateServer()
+    const config = server.getConfig()
+    const protocol = config.tls?.enabled ? 'https' : 'http'
+    const baseUrl = `${protocol}://${config.host || '127.0.0.1'}:${config.port}`
+    return { skills: mgr.listSkills(baseUrl) }
+  }
+
+  fetchSkillContent(id: string): { id: string; content: string | null } {
+    const builtinDir = path.join(__dirname, '../../../docs/skills')
+    const customDir = path.join(getRuntimeUserDataPath(), 'skills')
+    const mgr = new SkillsManager(builtinDir, customDir)
+    return { id, content: mgr.getSkillContent(id) }
+  }
+
+  // Phase 8: Account health
+  getAccountHealth(): { accounts: unknown[] } {
+    const server = this.getOrCreateServer()
+    const pool = (server as any).accountPool
+    if (!pool) return { accounts: [] }
+    const accounts = pool.getAllAccounts()
+    return {
+      accounts: accounts.map((a: any) => ({
+        id: a.id,
+        email: a.email,
+        tier: a.subscriptionType,
+        isAvailable: a.isAvailable !== false,
+        health: pool.getAccountHealth(a.id),
+        lastUsed: a.lastUsed,
+        requestCount: a.requestCount || 0,
+        quotaUsed: a.quotaUsed || 0,
+        quotaLimit: a.quotaLimit
+      }))
+    }
+  }
+
+  // Phase 9: Quota predictions
+  getQuotaPredictions(): { predictions: unknown[]; status: unknown } {
+    const server = this.getOrCreateServer()
+    const pool = (server as any).accountPool
+    if (!pool) return { predictions: [], status: { total: 0, available: 0, exhausted: 0, cooldown: 0 } }
+    return {
+      predictions: pool.getQuotaPredictions(),
+      status: pool.getQuotaStatus()
+    }
+  }
+
+  // Phase 7/10: Endpoint metrics
+  getEndpointMetrics(): { endpoints: unknown[] } {
+    return { endpoints: endpointMetrics.getAll() }
+  }
+
+  resetEndpointMetrics(): { success: boolean } {
+    endpointMetrics.reset()
+    return { success: true }
   }
 }
 

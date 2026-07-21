@@ -637,6 +637,12 @@ export function KProxyPanel() {
         </Card>
       )}
 
+      {/* Phase 12: Hosts File Toggle */}
+      <HostsToggleCard isEn={isEn} />
+
+      {/* Phase 12: Model Mappings */}
+      <ModelMappingsCard isEn={isEn} />
+
       {/* 使用说明 */}
       <Card>
         <CardHeader className="pb-3">
@@ -650,5 +656,201 @@ export function KProxyPanel() {
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+function HostsToggleCard({ isEn }: { isEn: boolean }) {
+  const [enabled, setEnabled] = useState(false)
+  const [entries, setEntries] = useState<{ ip: string; hostname: string }[]>([])
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    loadStatus()
+  }, [])
+
+  async function loadStatus() {
+    try {
+      const res = await (window as any).api?.kproxyGetHostsStatus?.()
+      if (res) {
+        setEnabled(res.enabled)
+        setEntries(res.entries || [])
+      }
+    } catch { /* ignore */ }
+  }
+
+  async function toggle() {
+    setLoading(true)
+    try {
+      const res = await (window as any).api?.kproxyToggleHosts?.(!enabled)
+      if (res?.success) {
+        setEnabled(!enabled)
+        await loadStatus()
+      } else if (res?.error) {
+        alert(res.error)
+      }
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Failed')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Globe className="h-5 w-5 text-primary" />
+            <CardTitle className="text-lg">{isEn ? 'DNS Redirect (Hosts)' : 'DNS Redirect (Hosts)'}</CardTitle>
+          </div>
+          <Switch checked={enabled} onCheckedChange={toggle} disabled={loading} />
+        </div>
+        <CardDescription>
+          {isEn
+            ? 'Redirect IDE domains to localhost via /etc/hosts for MITM interception'
+            : 'Chuyển hướng domain IDE về localhost qua /etc/hosts để MITM chặn bắt'}
+        </CardDescription>
+      </CardHeader>
+      {entries.length > 0 && (
+        <CardContent>
+          <div className="space-y-1">
+            {entries.map((e, i) => (
+              <div key={i} className="flex items-center gap-2 text-xs font-mono">
+                <span className="text-muted-foreground">{e.ip}</span>
+                <span>{e.hostname}</span>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      )}
+    </Card>
+  )
+}
+
+interface ModelMapping {
+  ideModel: string
+  krouterModel: string
+  ide: string
+}
+
+function ModelMappingsCard({ isEn }: { isEn: boolean }) {
+  const [mappings, setMappings] = useState<ModelMapping[]>([])
+  const [editing, setEditing] = useState(false)
+
+  useEffect(() => {
+    loadMappings()
+  }, [])
+
+  async function loadMappings() {
+    try {
+      const res = await (window as any).api?.kproxyGetModelMappings?.()
+      if (res?.mappings) setMappings(res.mappings)
+    } catch { /* ignore */ }
+  }
+
+  async function saveMappings() {
+    try {
+      await (window as any).api?.kproxySaveModelMappings?.(mappings)
+      setEditing(false)
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Save failed')
+    }
+  }
+
+  function updateMapping(idx: number, field: keyof ModelMapping, value: string) {
+    const updated = [...mappings]
+    updated[idx] = { ...updated[idx], [field]: value }
+    setMappings(updated)
+  }
+
+  function addMapping() {
+    setMappings([...mappings, { ideModel: '', krouterModel: '', ide: 'kiro' }])
+  }
+
+  function removeMapping(idx: number) {
+    setMappings(mappings.filter((_, i) => i !== idx))
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Activity className="h-5 w-5 text-primary" />
+            <CardTitle className="text-lg">{isEn ? 'Model Mappings' : 'Model Mappings'}</CardTitle>
+          </div>
+          {!editing ? (
+            <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+              {isEn ? 'Edit' : 'Sửa'}
+            </Button>
+          ) : (
+            <div className="flex gap-2">
+              <Button variant="default" size="sm" onClick={saveMappings}>
+                {isEn ? 'Save' : 'Lưu'}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => { setEditing(false); loadMappings() }}>
+                {isEn ? 'Cancel' : 'Hủy'}
+              </Button>
+            </div>
+          )}
+        </div>
+        <CardDescription>
+          {isEn
+            ? 'Map IDE model names to Krouter models for MITM interception'
+            : 'Ánh xạ tên model IDE sang model Krouter cho MITM'}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-2">
+          {mappings.length === 0 && (
+            <p className="text-xs text-muted-foreground text-center py-3">
+              {isEn ? 'No mappings configured' : 'Chưa có ánh xạ nào'}
+            </p>
+          )}
+          {mappings.map((m, idx) => (
+            <div key={idx} className="flex items-center gap-2 text-xs">
+              {editing ? (
+                <>
+                  <Input
+                    className="h-7 text-xs flex-1"
+                    placeholder="IDE model"
+                    value={m.ideModel}
+                    onChange={(e) => updateMapping(idx, 'ideModel', e.target.value)}
+                  />
+                  <span className="text-muted-foreground">→</span>
+                  <Input
+                    className="h-7 text-xs flex-1"
+                    placeholder="Krouter model"
+                    value={m.krouterModel}
+                    onChange={(e) => updateMapping(idx, 'krouterModel', e.target.value)}
+                  />
+                  <Input
+                    className="h-7 text-xs w-20"
+                    placeholder="IDE"
+                    value={m.ide}
+                    onChange={(e) => updateMapping(idx, 'ide', e.target.value)}
+                  />
+                  <Button variant="ghost" size="sm" className="h-7 px-1" onClick={() => removeMapping(idx)}>
+                    ✕
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Badge variant="secondary" className="text-[10px]">{m.ide}</Badge>
+                  <span className="font-mono">{m.ideModel}</span>
+                  <span className="text-muted-foreground">→</span>
+                  <span className="font-mono text-primary">{m.krouterModel}</span>
+                </>
+              )}
+            </div>
+          ))}
+          {editing && (
+            <Button variant="outline" size="sm" className="w-full mt-2" onClick={addMapping}>
+              + {isEn ? 'Add Mapping' : 'Thêm ánh xạ'}
+            </Button>
+          )}
+        </div>
+      </CardContent>
+    </Card>
   )
 }

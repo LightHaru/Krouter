@@ -1,12 +1,12 @@
 import { useEffect, useState } from 'react'
-import { Home, Users, Settings, Info, ChevronRight, Fingerprint, Sparkles, Server, Shield, UserPlus, CreditCard, ScrollText, Network, Bell, Stethoscope, Archive, BookOpen } from 'lucide-react'
+import { Home, Users, Settings, Info, ChevronRight, Fingerprint, Sparkles, Server, Shield, Zap, UserPlus, CreditCard, ScrollText, Network, Bell, Stethoscope, BookOpen, Wand2 } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import krouterLogoSmall from '@/assets/krouter-mark.svg'
 import { APP_NAME } from '@/brand'
 import { useTranslation } from '@/hooks/useTranslation'
 
-export type PageType = 'home' | 'accounts' | 'machineId' | 'kiroSettings' | 'proxy' | 'kproxy' | 'proxyPool' | 'register' | 'subscription' | 'webhooks' | 'diagnose' | 'configSync' | 'logs' | 'docs' | 'settings' | 'about'
+export type PageType = 'home' | 'accounts' | 'machineId' | 'kiroSettings' | 'proxy' | 'kproxy' | 'mitm' | 'proxyPool' | 'register' | 'subscription' | 'webhooks' | 'diagnose' | 'configSync' | 'skills' | 'logs' | 'docs' | 'settings' | 'about'
 
 interface SidebarProps {
   currentPage: PageType
@@ -26,12 +26,13 @@ const menuItemsConfig: { id: PageType; labelKey: string; icon: React.ElementType
   { id: 'kiroSettings', labelKey: 'nav.kiroSettings', icon: Sparkles },
   { id: 'proxy', labelKey: 'nav.proxy', icon: Server },
   { id: 'kproxy', labelKey: 'nav.kproxy', icon: Shield },
+  { id: 'mitm', labelKey: 'nav.mitm', icon: Zap },
   { id: 'proxyPool', labelKey: 'nav.proxyPool', icon: Network },
   { id: 'register', labelKey: 'nav.register', icon: UserPlus },
   { id: 'subscription', labelKey: 'nav.subscription', icon: CreditCard },
   { id: 'webhooks', labelKey: 'nav.webhooks', icon: Bell },
   { id: 'diagnose', labelKey: 'nav.diagnose', icon: Stethoscope },
-  { id: 'configSync', labelKey: 'nav.configSync', icon: Archive },
+  { id: 'skills', labelKey: 'nav.skills', icon: Wand2 },
   { id: 'logs', labelKey: 'nav.logs', icon: ScrollText },
   { id: 'docs', labelKey: 'nav.docs', icon: BookOpen },
   { id: 'settings', labelKey: 'nav.settings', icon: Settings },

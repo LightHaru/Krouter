@@ -61,6 +61,7 @@ export type RegStepName =
   | 'signup' | 'send-otp' | 'waiting-otp' | 'otp-received'
   | 'create-identity' | 'set-password' | 'sso-workflow' | 'sso-token'
   | 'verify-alive' | 'done'
+  | 'risk-control'
 
 export interface RegStepEvent {
   name: RegStepName
@@ -107,6 +108,11 @@ export class Registrar {
   private chainTargetProxy = ''
   private exitIP = ''
   private readonly tlsSessionId = newUUID() // 固定：整个 Registrar 生命周期内 DLL 中只注册一个 session
+
+  // Phase 14: Adaptive rate limiting — backs off when AWS risk-control triggers
+  private riskControlHits = 0
+  private lastRiskControlAt = 0
+  private adaptiveDelayMs = 0 // Extra delay added between steps when risk detected
 
   constructor(cfg: RegistrationConfig, log?: LogFn, onStep?: StepFn2) {
     this.cfg = cfg
@@ -213,6 +219,17 @@ export class Registrar {
 
   /** 判断当前代理是否支持 session 轮换（参数化格式 + 含 _session- 或含 _area-/_life- 等） */
   private canRefreshProxySession(): boolean {
+    const proxy = this.chainTargetProxy || this.cfg.proxy || ''
+    if (!proxy) return false
+    // Supports session rotation if proxy URL has parameterized format:
+    // - Contains _session- (BestProxy/BrightData style)
+    // - Contains session= or sid= query param
+    // - Contains rotating keyword
+    if (/_session-/i.test(proxy)) return true
+    if (/[?&](session|sid)=/i.test(proxy)) return true
+    if (/rotating|rotate/i.test(proxy)) return true
+    // BrightData format: username-session-xxx
+    if (/-session-[a-zA-Z0-9]+[@:]/i.test(proxy)) return true
     return false
   }
 
@@ -595,7 +612,40 @@ export class Registrar {
 
   /** 拟人随机延迟：步骤之间停顿，降低机械化节奏特征 */
   private async humanDelay(min = 280, max = 1200): Promise<void> {
-    await this.abortableSleep(min + Math.floor(Math.random() * Math.max(1, max - min)))
+    // Phase 14: Decay adaptive delay between successful steps
+    this.decayAdaptiveDelay()
+    // Phase 14: Add adaptive delay when risk-control has been detected
+    const totalMin = min + this.adaptiveDelayMs
+    const totalMax = max + this.adaptiveDelayMs
+    await this.abortableSleep(totalMin + Math.floor(Math.random() * Math.max(1, totalMax - totalMin)))
+  }
+
+  /**
+   * Phase 14: Adaptive rate limiting — called when AWS risk-control is detected.
+   * Exponentially increases delay between steps to avoid further blocks.
+   * Resets gradually after successful steps without risk triggers.
+   */
+  private onRiskControlDetected(): void {
+    this.riskControlHits++
+    this.lastRiskControlAt = Date.now()
+    // Exponential backoff: 5s, 15s, 30s, 60s, 120s max
+    this.adaptiveDelayMs = Math.min(120_000, 5000 * Math.pow(2, this.riskControlHits - 1))
+    this.log(`[RiskControl] AWS chặn lần ${this.riskControlHits}, tăng delay lên ${Math.round(this.adaptiveDelayMs / 1000)}s giữa các bước`)
+    this.emitStep('risk-control', { extra: { riskHits: this.riskControlHits, adaptiveDelayMs: this.adaptiveDelayMs } })
+  }
+
+  /** Phase 14: Decay adaptive delay after time without risk triggers */
+  private decayAdaptiveDelay(): void {
+    if (this.adaptiveDelayMs <= 0) return
+    const elapsed = Date.now() - this.lastRiskControlAt
+    // Decay after 2 minutes of no risk triggers
+    if (elapsed > 120_000) {
+      this.adaptiveDelayMs = Math.max(0, this.adaptiveDelayMs - 2000)
+      if (this.adaptiveDelayMs === 0) {
+        this.riskControlHits = 0
+        this.log('[RiskControl] Delay đã trở về bình thường')
+      }
+    }
   }
 
   /**
@@ -723,6 +773,7 @@ export class Registrar {
   private formatErrorBody(body: string, status: number): string {
     const risk = this.detectRiskControl(body, status)
     if (risk) {
+      this.onRiskControlDetected()
       return `${risk} (AWS đã chặn yêu cầu; đề xuất: 1) dừng tác vụ hàng loạt hiện tại; 2) bật giới hạn tốc độ và tự động tạm dừng; 3) tránh đăng ký hàng loạt cùng một tên miền email; 4) nếu tài khoản bị hạn chế, liên hệ Support theo hướng dẫn của AWS/Kiro)`
     }
     const compactBody = body.replace(/\s+/g, ' ').trim()

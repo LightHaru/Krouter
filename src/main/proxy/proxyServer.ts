@@ -2,6 +2,7 @@
 import http from 'http'
 import https from 'https'
 import fs from 'fs'
+import nodePath from 'path'
 import crypto from 'crypto'
 import { v4 as uuidv4 } from 'uuid'
 import type { Socket } from 'net'
@@ -32,7 +33,7 @@ import {
   resolveProfileArn,
   type KiroModel
 } from './kiroApi'
-import { proxyLogger } from './logger'
+import { proxyLogger, endpointMetrics, generateTraceId, categorizeError } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
   openaiToKiro,
@@ -84,6 +85,9 @@ import {
   isXpixiModel,
   callXpixi
 } from './xpixi'
+import { generateImage, ImageStorageManager } from './bedrockImage'
+import { SkillsManager } from './skills'
+import { McpServer } from './mcpServer'
 
 type ProxyAttemptError = Error & {
   proxyAccountId?: string
@@ -422,7 +426,8 @@ export class ProxyServer {
   // on an Enterprise account). Populated whenever any account's models are fetched.
   private poolModelCatalog: Map<string, { model: KiroModel; timestamp: number }> = new Map()
   private bedrockModelIdCache: { ids: string[]; timestamp: number } | null = null
-  private readonly BEDROCK_MODEL_ID_CACHE_TTL = 5 * 60 * 1000
+  // Phase 6: Extended TTL for Bedrock model list (6 hours — models rarely change)
+  private readonly BEDROCK_MODEL_ID_CACHE_TTL = 6 * 60 * 60 * 1000
   private bedrockLastError: { message: string; timestamp: number } | null = null
   private poolModelSupportCache: Map<string, { timestamp: number; supported: boolean }> = new Map()
   private readonly POOL_MODEL_SUPPORT_TTL = 5 * 60 * 1000
@@ -437,6 +442,12 @@ export class ProxyServer {
   private webhookTrigger?: (event: string, payload: Record<string, unknown>) => void
   /** 定期清理 timer */
   private cleanupTimer: NodeJS.Timeout | null = null
+  /** Phase 11: Image storage manager for Nova Canvas */
+  private imageStorage: ImageStorageManager = new ImageStorageManager()
+  /** Phase 13: Skills system manager */
+  private skillsManager: SkillsManager | null = null
+  /** Phase 14: MCP Server for agent tooling */
+  private mcpServer: McpServer
 
   /**
    * 从请求中提取 session hint，用于稳定 conversationId
@@ -525,6 +536,29 @@ export class ProxyServer {
       startTime: 0
     }
     this.events = events
+
+    // Phase 13: Initialize skills manager
+    try {
+      const skillsBuiltinDir = nodePath.join(__dirname, '../../../docs/skills')
+      const skillsCustomDir = nodePath.join(getRuntimeUserDataPath(), 'skills')
+      this.skillsManager = new SkillsManager(skillsBuiltinDir, skillsCustomDir)
+    } catch { /* skills optional */ }
+
+    // Phase 14: Initialize MCP server
+    this.mcpServer = new McpServer({
+      accountPool: this.accountPool,
+      getConfig: () => this.config,
+      getStats: () => ({
+        totalRequests: this.stats.totalRequests,
+        successRequests: this.stats.successRequests,
+        failedRequests: this.stats.failedRequests,
+        totalTokens: this.stats.totalTokens,
+        inputTokens: this.stats.inputTokens,
+        outputTokens: this.stats.outputTokens,
+        startTime: this.stats.startTime,
+        accountStats: this.stats.accountStats
+      })
+    })
   }
 
   /**
@@ -2516,6 +2550,9 @@ export class ProxyServer {
       accountId: account.id,
       accountEmail: account.email
     })
+    endpointMetrics.record({
+      path, status: 200, responseTime, inputTokens, outputTokens, cacheReadTokens
+    })
     this.recordRequest({
       path,
       model,
@@ -3125,6 +3162,12 @@ export class ProxyServer {
       } else if (pathWithoutQuery === '/v1beta/models') {
         // Gemini 模型列表
         await this.handleGeminiModels(res, controller.signal)
+      } else if (pathWithoutQuery.startsWith('/skills/') || pathWithoutQuery === '/api/skills/list' || pathWithoutQuery === '/api/skills/content') {
+        this.handleSkills(res, pathWithoutQuery, req.url || '/')
+      } else if (pathWithoutQuery === '/v1/images/generations' || pathWithoutQuery === '/images/generations') {
+        await this.handleImageGeneration(req, res, controller.signal)
+      } else if (pathWithoutQuery.startsWith('/v1/images/') && method === 'GET') {
+        this.handleServeImage(res, pathWithoutQuery)
       } else if (pathWithoutQuery === '/health' || pathWithoutQuery === '/') {
         this.handleHealth(res)
       } else if (pathWithoutQuery === '/metrics' && this.config.enableMetrics) {
@@ -3134,6 +3177,9 @@ export class ProxyServer {
       } else if (pathWithoutQuery.startsWith('/admin/')) {
         // 管理 API 端点
         await this.handleAdminApi(req, res, pathWithoutQuery, controller.signal)
+      } else if (pathWithoutQuery.startsWith('/mcp/') || pathWithoutQuery === '/mcp') {
+        // MCP Server endpoint
+        await this.handleMcpRequest(req, res, pathWithoutQuery)
       } else {
         // 记录未知路径以便调试
         console.log(`[ProxyServer] Unknown path: ${path} (method: ${method})`)
@@ -3212,9 +3258,43 @@ export class ProxyServer {
       const promptCacheCleared = promptCacheTracker.clear()
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ success: true, cleared: { ...cleared, promptCache: promptCacheCleared } }))
+    } else if (path === '/admin/endpoint-metrics' && method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ endpoints: endpointMetrics.getAll() }))
+    } else if (path === '/admin/endpoint-metrics/reset' && method === 'POST') {
+      endpointMetrics.reset()
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true }))
+    } else if (path === '/admin/account-health' && method === 'GET') {
+      // Phase 8: Account health dashboard data
+      const accounts = this.accountPool.getAllAccounts()
+      const healthData = accounts.map(a => ({
+        id: a.id,
+        email: a.email,
+        tier: a.subscriptionType,
+        isAvailable: a.isAvailable !== false,
+        health: this.accountPool.getAccountHealth(a.id),
+        lastUsed: a.lastUsed,
+        requestCount: a.requestCount || 0,
+        quotaUsed: a.quotaUsed || 0,
+        quotaLimit: a.quotaLimit
+      }))
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ accounts: healthData }))
+    } else if (path === '/admin/quota-predictions' && method === 'GET') {
+      // Phase 9: Quota prediction data
+      const predictions = this.accountPool.getQuotaPredictions()
+      const quotaStatus = this.accountPool.getQuotaStatus()
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ predictions, status: quotaStatus }))
     } else {
       this.sendError(res, 404, 'Admin endpoint not found')
     }
+  }
+
+  // Phase 14: MCP Server endpoint handler
+  private async handleMcpRequest(req: http.IncomingMessage, res: http.ServerResponse, path: string): Promise<void> {
+    await this.mcpServer.handleMcpHttpRequest(req, res)
   }
 
   // 管理 API - 详细统计
@@ -4752,6 +4832,9 @@ export class ProxyServer {
     else if (isThrottleError(error.message)) statusCode = 429
     if (isAuthError) statusCode = 401
 
+    const responseTime = startTime ? Date.now() - startTime : 0
+    const errorCategory = categorizeError(statusCode, error.message)
+
     if (res.headersSent) {
       if (!this.isResponseClosed(res)) {
         if (path === '/v1/responses' || path === '/responses') {
@@ -4760,13 +4843,15 @@ export class ProxyServer {
         res.end()
       }
       this.events.onResponse?.({ path, status: statusCode, error: error.message })
-      this.recordRequest({ path, model, accountId: failedAccount.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: error.message })
+      endpointMetrics.record({ path, status: statusCode, responseTime, errorCategory })
+      this.recordRequest({ path, model, accountId: failedAccount.id, responseTime, success: false, error: error.message })
       return
     }
 
     this.sendError(res, statusCode, error.message, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
     this.events.onResponse?.({ path, status: statusCode, error: error.message })
-    this.recordRequest({ path, model, accountId: failedAccount.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: error.message })
+    endpointMetrics.record({ path, status: statusCode, responseTime, errorCategory })
+    this.recordRequest({ path, model, accountId: failedAccount.id, responseTime, success: false, error: error.message })
   }
 
   // 读取请求体
@@ -4983,6 +5068,15 @@ export class ProxyServer {
       const account = this.accountPool.getAccount(entry.accountId)
       // 校验账号仍可用，避免 affinity 把请求送回耗尽/冷却/封禁账号。
       if (account && this.accountPool.isAccountAvailable(account)) {
+        // Phase 14: Quota-aware affinity — unstick when account is near exhaustion (>85%)
+        if (account.quotaLimit && account.quotaLimit > 0) {
+          const usageRatio = (account.quotaUsed || 0) / account.quotaLimit
+          if (usageRatio > 0.85) {
+            proxyLogger.debug('ProxyServer', `Affinity unstick (quota ${Math.round(usageRatio * 100)}%): ${sessionHint.slice(0, 16)} × ${account.email || account.id.slice(0, 8)}`)
+            this.sessionAffinity.delete(sessionHint)
+            return null
+          }
+        }
         entry.lastAt = Date.now()
         return account
       }
@@ -5096,6 +5190,42 @@ export class ProxyServer {
     lines.push('# HELP kiro_proxy_uptime_seconds Server uptime in seconds')
     lines.push('# TYPE kiro_proxy_uptime_seconds gauge')
     lines.push(`kiro_proxy_uptime_seconds ${Math.floor((Date.now() - s.startTime) / 1000)}`)
+
+    // Phase 10: Per-endpoint metrics
+    lines.push('# HELP kiro_proxy_endpoint_requests_total Requests per endpoint')
+    lines.push('# TYPE kiro_proxy_endpoint_requests_total counter')
+    lines.push('# HELP kiro_proxy_endpoint_latency_avg Average latency per endpoint')
+    lines.push('# TYPE kiro_proxy_endpoint_latency_avg gauge')
+    lines.push('# HELP kiro_proxy_endpoint_latency_p95 P95 latency per endpoint')
+    lines.push('# TYPE kiro_proxy_endpoint_latency_p95 gauge')
+    lines.push('# HELP kiro_proxy_endpoint_error_rate Error rate per endpoint')
+    lines.push('# TYPE kiro_proxy_endpoint_error_rate gauge')
+    for (const ep of endpointMetrics.getAll()) {
+      const label = ep.path.replace(/\//g, '_').replace(/^_/, '')
+      lines.push(`kiro_proxy_endpoint_requests_total{path="${ep.path}"} ${ep.totalRequests}`)
+      lines.push(`kiro_proxy_endpoint_latency_avg{path="${ep.path}"} ${Math.round(ep.avgResponseTime)}`)
+      lines.push(`kiro_proxy_endpoint_latency_p95{path="${ep.path}"} ${Math.round(ep.p95ResponseTime)}`)
+      const errRate = ep.totalRequests > 0 ? (ep.errorCount / ep.totalRequests) : 0
+      lines.push(`kiro_proxy_endpoint_error_rate{path="${ep.path}"} ${errRate.toFixed(4)}`)
+    }
+
+    // Phase 10: Account health scores
+    lines.push('# HELP kiro_proxy_account_health Account health score (0-1)')
+    lines.push('# TYPE kiro_proxy_account_health gauge')
+    for (const account of ap.getAllAccounts()) {
+      const health = ap.getAccountHealth(account.id)
+      if (health) {
+        const label = (account.email || account.id.slice(0, 8)).replace(/"/g, '')
+        lines.push(`kiro_proxy_account_health{account="${label}"} ${health.overallScore.toFixed(3)}`)
+      }
+    }
+
+    // Phase 10: Cache hit rate
+    lines.push('# HELP kiro_proxy_cache_hit_rate Prompt cache hit rate')
+    lines.push('# TYPE kiro_proxy_cache_hit_rate gauge')
+    const cacheRate = s.totalRequests > 0 ? (s.cacheReadTokens / Math.max(1, s.inputTokens + s.cacheReadTokens)) : 0
+    lines.push(`kiro_proxy_cache_hit_rate ${cacheRate.toFixed(4)}`)
+
     return lines.join('\n') + '\n'
   }
 
@@ -5639,5 +5769,125 @@ export class ProxyServer {
     return available
       .filter((m) => !configured || configured.length === 0 || configured.includes(m.id))
       .map((m) => ({ id: m.id, object: 'model' as const, created, owned_by: m.provider || 'bedrock' }))
+  }
+
+  // Phase 13: Skills system handler
+  private handleSkills(res: http.ServerResponse, urlPath: string, fullUrl: string): void {
+    if (!this.skillsManager) {
+      this.sendError(res, 503, 'Skills system not initialized')
+      return
+    }
+
+    const protocol = this.isHttps ? 'https' : 'http'
+    const baseUrl = `${protocol}://${this.config.host || '127.0.0.1'}:${this.config.port}`
+
+    if (urlPath === '/api/skills/list') {
+      const skills = this.skillsManager.listSkills(baseUrl)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ skills }))
+      return
+    }
+
+    if (urlPath === '/api/skills/content') {
+      const params = new URL(fullUrl, baseUrl).searchParams
+      const id = params.get('id')
+      if (!id) {
+        this.sendError(res, 400, 'Missing id parameter')
+        return
+      }
+      const content = this.skillsManager.getSkillContent(id)
+      if (!content) {
+        this.sendError(res, 404, `Skill not found: ${id}`)
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ id, content }))
+      return
+    }
+
+    // Direct skill access: /skills/:id/SKILL.md
+    const match = urlPath.match(/^\/skills\/([^/]+)\/SKILL\.md$/)
+    if (match) {
+      const content = this.skillsManager.getSkillContent(match[1])
+      if (!content) {
+        this.sendError(res, 404, `Skill not found: ${match[1]}`)
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'text/markdown; charset=utf-8' })
+      res.end(content)
+      return
+    }
+
+    this.sendError(res, 404, 'Skills endpoint not found')
+  }
+
+  // Phase 11: Image generation endpoint
+  private async handleImageGeneration(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (!this.config.bedrock?.enabled) {
+      this.sendError(res, 503, 'Image generation requires Bedrock to be enabled')
+      return
+    }
+
+    const bodyStr = await this.readBody(req, signal)
+    let request: { prompt: string; n?: number; size?: string; quality?: string; style?: string; response_format?: 'url' | 'b64_json'; negative_prompt?: string; cfg_scale?: number; seed?: number }
+    try {
+      request = JSON.parse(bodyStr)
+    } catch {
+      this.sendError(res, 400, 'Invalid JSON body')
+      return
+    }
+
+    if (!request.prompt) {
+      this.sendError(res, 400, 'Missing required field: prompt')
+      return
+    }
+
+    const protocol = this.isHttps ? 'https' : 'http'
+    const serverBaseUrl = `${protocol}://${this.config.host || '127.0.0.1'}:${this.config.port}`
+
+    try {
+      const startTime = Date.now()
+      const result = await generateImage(
+        this.config.bedrock,
+        request,
+        this.imageStorage,
+        serverBaseUrl,
+        signal
+      )
+      const elapsed = Date.now() - startTime
+      endpointMetrics.record({ path: '/v1/images/generations', status: 200, responseTime: elapsed })
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(result))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      proxyLogger.error('ProxyServer', `Image generation failed: ${message}`)
+      endpointMetrics.record({ path: '/v1/images/generations', status: 500, errorCategory: 'server_error' })
+      this.sendError(res, 500, message)
+    }
+  }
+
+  // Phase 11: Serve generated images
+  private handleServeImage(res: http.ServerResponse, urlPath: string): void {
+    const filename = urlPath.replace('/v1/images/', '')
+    if (!filename || filename.includes('..') || filename.includes('/')) {
+      this.sendError(res, 400, 'Invalid image filename')
+      return
+    }
+    const filePath = this.imageStorage.getImagePath(filename)
+    if (!filePath) {
+      this.sendError(res, 404, 'Image not found')
+      return
+    }
+    const data = fs.readFileSync(filePath)
+    res.writeHead(200, {
+      'Content-Type': 'image/png',
+      'Content-Length': data.length.toString(),
+      'Cache-Control': 'public, max-age=86400'
+    })
+    res.end(data)
   }
 }

@@ -16,6 +16,9 @@ import { DEFAULT_KPROXY_CONFIG } from './types'
 export * from './types'
 export { CertManager } from './certManager'
 export { MitmProxy } from './mitmProxy'
+export { HostsManager, hostsManager } from './hostsManager'
+export { ModelMapper, modelMapper } from './modelMapper'
+export { MitmHttpsServer, mitmHttpsServer } from './mitmHttpsServer'
 
 /**
  * K-Proxy 服务管理器

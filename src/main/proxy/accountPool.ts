@@ -52,6 +52,12 @@ export interface AccountPoolConfig {
   maxBackoffMultiplier: number // 最大退避倍数
   quotaResetMs: number        // 配额耗尽冷却时间
   probabilisticRetryChance: number // 概率重试几率（0-1）
+  // Phase 1: Enhanced smart rotation
+  smartTopN: number            // 从 top-N 候选中加权随机选择（默认 3）
+  slidingWindowSize: number    // 滑动窗口大小（记录最近 N 次请求结果）
+  // Phase 2: Throttling mitigation
+  tpmWindowMs: number          // TPM 滑动窗口（毫秒，默认 60s）
+  adaptiveRateFactor: number   // 自适应限流因子（0.5-1.0，从 throttling 中学习）
 }
 
 const DEFAULT_CONFIG: AccountPoolConfig = {
@@ -60,7 +66,28 @@ const DEFAULT_CONFIG: AccountPoolConfig = {
   maxThrottleCooldownMs: 10_000,
   maxBackoffMultiplier: 1440,   // 最大 1440 倍 = 24h
   quotaResetMs: 3600000,        // 1h 配额重置
-  probabilisticRetryChance: 0.1 // 10% 概率重试
+  probabilisticRetryChance: 0.1, // 10% 概率重试
+  smartTopN: 3,
+  slidingWindowSize: 100,
+  tpmWindowMs: 60_000,
+  adaptiveRateFactor: 0.8
+}
+
+// Phase 1: Sliding window entry for success rate tracking
+interface SlidingWindowEntry {
+  timestamp: number
+  success: boolean
+  latencyMs: number
+  model?: string
+}
+
+// Phase 2: Per-account rate limit budget
+interface RateLimitBudget {
+  windowStart: number
+  requestTimestamps: number[]
+  throttleCount: number
+  lastThrottleAt: number
+  adaptiveFactor: number
 }
 
 function getCooldownMs(config: AccountPoolConfig, statusCode: number | undefined, errorCount: number): number {
@@ -87,6 +114,10 @@ export class AccountPool {
   // 默认 round-robin: 选中账号时立即前进，避免并发请求集中到同一账号
   // sticky: 一个账号成功就粘住 (保留 prompt cache 命中)
   private strategy: AccountSelectionStrategy = 'round-robin'
+  // Phase 1: Sliding window per account for success rate / latency tracking
+  private slidingWindows: Map<string, SlidingWindowEntry[]> = new Map()
+  // Phase 2: Per-account rate limit budgets (keyed by accountId)
+  private rateLimitBudgets: Map<string, RateLimitBudget> = new Map()
 
   constructor(config: Partial<AccountPoolConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config }
@@ -170,6 +201,12 @@ export class AccountPool {
     if (this.strategy === 'least-used') {
       return this.getLeastUsedAccount(accountList, now, excludeIds)
     }
+
+    // Phase 14: Quota-aware sticky — auto-unstick before exhaustion
+    if (this.strategy === 'sticky' && this.shouldUnstick()) {
+      this.forceUnstick()
+    }
+
     // 从当前粘滞索引开始遍历所有账号
     const startIndex = this.currentIndex
 
@@ -419,68 +456,114 @@ export class AccountPool {
   }
 
   private getSmartBalancedAccount(accountList: ProxyAccount[], now: number, excludeIds?: Set<string>): ProxyAccount | null {
-    let best: { account: ProxyAccount; score: number } | null = null
+    // Phase 1: Score all available accounts, then weighted-random from top N
+    const candidates: { account: ProxyAccount; score: number }[] = []
 
     for (const account of accountList) {
       if (excludeIds?.has(account.id)) continue
       if (!this.isAccountAvailable(account, now)) continue
+      // Phase 2: Skip if rate limit budget exhausted
+      if (this.isRateLimitBudgetExhausted(account.id, now)) continue
 
       const score = this.scoreAccountForSmartBalance(account, now)
-      if (
-        !best ||
-        score > best.score ||
-        (score === best.score && (account.lastUsed || 0) < (best.account.lastUsed || 0))
-      ) {
-        best = { account, score }
+      candidates.push({ account, score })
+    }
+
+    if (candidates.length === 0) return null
+
+    // Sort by score descending
+    candidates.sort((a, b) => b.score - a.score)
+
+    // Pick from top N using weighted random (score as weight)
+    const topN = Math.min(this.config.smartTopN, candidates.length)
+    const topCandidates = candidates.slice(0, topN)
+    const totalScore = topCandidates.reduce((sum, c) => sum + Math.max(1, c.score), 0)
+    let rand = Math.random() * totalScore
+    let selected = topCandidates[0]
+
+    for (const candidate of topCandidates) {
+      rand -= Math.max(1, candidate.score)
+      if (rand <= 0) {
+        selected = candidate
+        break
       }
     }
 
-    if (best) {
-      this.accounts.set(best.account.id, { ...best.account, lastUsed: now })
-    }
-
-    return best?.account || null
+    this.accounts.set(selected.account.id, { ...selected.account, lastUsed: now })
+    return selected.account
   }
 
   private scoreAccountForSmartBalance(account: ProxyAccount, now: number): number {
     const stats = this.accountStats.get(account.id)
-    let score = 1000
+    const window = this.slidingWindows.get(account.id) || []
 
+    // Composite score: SuccessRate * 0.35 + (1 - Latency/10s) * 0.20 +
+    //                  QuotaRemaining * 0.15 + ErrorPenalty * 0.15 +
+    //                  LoadBalance * 0.10 + TokenFreshness * 0.05
+    let score = 0
+
+    // 1. Success Rate (last N requests in sliding window) — weight 0.35
+    const recentWindow = window.filter(e => e.timestamp > now - 5 * 60_000) // last 5 min
+    const successRate = recentWindow.length > 0
+      ? recentWindow.filter(e => e.success).length / recentWindow.length
+      : 1.0 // no history = assume good
+    score += successRate * 350
+
+    // 2. Latency score (1 - avgLatency/10s) — weight 0.20
+    const recentLatencies = recentWindow.filter(e => e.latencyMs > 0)
+    const avgLatency = recentLatencies.length > 0
+      ? recentLatencies.reduce((sum, e) => sum + e.latencyMs, 0) / recentLatencies.length
+      : 0
+    const latencyScore = Math.max(0, 1 - avgLatency / 10000)
+    score += latencyScore * 200
+
+    // 3. Quota remaining — weight 0.15
     const quotaLimit = account.quotaLimit || 0
     if (quotaLimit > 0) {
       const used = Math.max(0, account.quotaUsed || 0)
       const remainingRatio = Math.max(0, Math.min(1, (quotaLimit - used) / quotaLimit))
-      score += remainingRatio * 500
-      if (remainingRatio < 0.1) score -= 300
-      else if (remainingRatio < 0.2) score -= 150
+      score += remainingRatio * 150
     } else {
-      score += 100
+      score += 150 // no quota tracking = full score
     }
 
-    score -= Math.min(500, (account.errorCount || 0) * 140)
-    score -= Math.min(200, (stats?.errors || 0) * 25)
-    score -= Math.min(180, (account.requestCount || 0) * 3)
-    score -= Math.min(120, (stats?.requests || 0) * 2)
+    // 4. Error penalty — weight 0.15
+    const errorPenalty = Math.min(1, (account.errorCount || 0) / 5)
+    score += (1 - errorPenalty) * 150
 
-    if (stats?.avgResponseTime) {
-      score -= Math.min(120, stats.avgResponseTime / 100)
+    // 5. Load balance (prefer less-used accounts) — weight 0.10
+    const requestCount = account.requestCount || 0
+    const loadScore = Math.max(0, 1 - Math.min(requestCount, 1000) / 1000)
+    score += loadScore * 100
+
+    // 6. Token freshness (how recently token was refreshed) — weight 0.05
+    if (account.expiresAt) {
+      const minutesLeft = (account.expiresAt - now) / 60000
+      if (minutesLeft > 30) score += 50
+      else if (minutesLeft > 15) score += 30
+      else if (minutesLeft > 5) score += 10
+      // < 5 min: no bonus
+    } else {
+      score += 50 // no expiry = assume fresh
     }
 
+    // Bonus: idle time (prefer accounts rested longer)
     const lastUsed = account.lastUsed || stats?.lastUsed || 0
     if (lastUsed > 0) {
       const idleMs = now - lastUsed
-      score += Math.min(120, Math.max(0, idleMs) / 1000 / 2)
+      score += Math.min(50, idleMs / 1000)
     } else {
-      score += 120
+      score += 50
     }
 
-    if (account.expiresAt) {
-      const minutesLeft = (account.expiresAt - now) / 60000
-      if (minutesLeft < 5) score -= 250
-      else if (minutesLeft < 15) score -= 80
+    // Phase 2: Rate limit budget penalty
+    const budget = this.rateLimitBudgets.get(account.id)
+    if (budget && budget.throttleCount > 0) {
+      const throttlePenalty = Math.min(200, budget.throttleCount * 50)
+      score -= throttlePenalty
     }
 
-    // Tiny deterministic jitter prevents permanent ties without defeating balance.
+    // Tiny deterministic jitter prevents permanent ties without defeating balance
     score += this.stableAccountJitter(account.id)
     return score
   }
@@ -493,8 +576,190 @@ export class AccountPool {
     return Math.abs(hash % 17) / 10
   }
 
-  // 记录请求成功（重置断路器 + 粘滞到当前账号）
-  recordSuccess(accountId: string, tokens: number = 0, credits: number = 0): ProxyAccount | undefined {
+  // ============ Phase 1: Sliding Window ============
+
+  /** Record a request result in the sliding window for success rate tracking */
+  recordSlidingWindow(accountId: string, success: boolean, latencyMs: number, model?: string): void {
+    if (!this.slidingWindows.has(accountId)) {
+      this.slidingWindows.set(accountId, [])
+    }
+    const window = this.slidingWindows.get(accountId)!
+    window.push({ timestamp: Date.now(), success, latencyMs, model })
+    // Trim to max window size
+    while (window.length > this.config.slidingWindowSize) {
+      window.shift()
+    }
+  }
+
+  /** Get success rate for an account (0-1) from sliding window */
+  getSuccessRate(accountId: string): number {
+    const window = this.slidingWindows.get(accountId)
+    if (!window || window.length === 0) return 1.0
+    return window.filter(e => e.success).length / window.length
+  }
+
+  /** Get average latency for an account from sliding window */
+  getAvgLatency(accountId: string): number {
+    const window = this.slidingWindows.get(accountId)
+    if (!window || window.length === 0) return 0
+    const withLatency = window.filter(e => e.latencyMs > 0)
+    if (withLatency.length === 0) return 0
+    return withLatency.reduce((sum, e) => sum + e.latencyMs, 0) / withLatency.length
+  }
+
+  // ============ Phase 2: Rate Limit Budget ============
+
+  /** Record a throttle (429) event for an account */
+  recordThrottle(accountId: string): void {
+    const now = Date.now()
+    let budget = this.rateLimitBudgets.get(accountId)
+    if (!budget) {
+      budget = { windowStart: now, requestTimestamps: [], throttleCount: 0, lastThrottleAt: 0, adaptiveFactor: this.config.adaptiveRateFactor }
+      this.rateLimitBudgets.set(accountId, budget)
+    }
+    budget.throttleCount++
+    budget.lastThrottleAt = now
+    // Reduce adaptive factor on each throttle (learn to be more conservative)
+    budget.adaptiveFactor = Math.max(0.3, budget.adaptiveFactor * 0.85)
+  }
+
+  /** Record a successful request for rate limit budget tracking */
+  recordRateLimitSuccess(accountId: string): void {
+    const now = Date.now()
+    let budget = this.rateLimitBudgets.get(accountId)
+    if (!budget) {
+      budget = { windowStart: now, requestTimestamps: [], throttleCount: 0, lastThrottleAt: 0, adaptiveFactor: this.config.adaptiveRateFactor }
+      this.rateLimitBudgets.set(accountId, budget)
+    }
+    budget.requestTimestamps.push(now)
+    // Trim timestamps outside the window
+    const windowStart = now - this.config.tpmWindowMs
+    budget.requestTimestamps = budget.requestTimestamps.filter(t => t > windowStart)
+    // Gradually recover adaptive factor on success
+    if (budget.adaptiveFactor < this.config.adaptiveRateFactor) {
+      budget.adaptiveFactor = Math.min(this.config.adaptiveRateFactor, budget.adaptiveFactor + 0.02)
+    }
+    // Decay throttle count over time (reset after 5 min without throttle)
+    if (budget.throttleCount > 0 && (now - budget.lastThrottleAt) > 5 * 60_000) {
+      budget.throttleCount = 0
+    }
+  }
+
+  /** Check if an account's rate limit budget is exhausted */
+  private isRateLimitBudgetExhausted(accountId: string, now: number): boolean {
+    const budget = this.rateLimitBudgets.get(accountId)
+    if (!budget) return false
+    // If recently throttled (within last 30s), consider budget exhausted
+    if (budget.lastThrottleAt > 0 && (now - budget.lastThrottleAt) < 30_000) {
+      return true
+    }
+    return false
+  }
+
+  /** Get health metrics for an account (for dashboard display) */
+  getAccountHealth(accountId: string): {
+    successRate: number
+    avgLatency: number
+    requestsPerMinute: number
+    throttleCount: number
+    adaptiveFactor: number
+    overallScore: number
+    quotaUsagePercent: number
+    isHealthy: boolean
+  } {
+    const now = Date.now()
+    const window = this.slidingWindows.get(accountId) || []
+    const budget = this.rateLimitBudgets.get(accountId)
+    const recentWindow = window.filter(e => e.timestamp > now - 60_000)
+    const account = this.accounts.get(accountId)
+
+    const successRate = this.getSuccessRate(accountId)
+    const avgLatency = this.getAvgLatency(accountId)
+    const throttleCount = budget?.throttleCount || 0
+
+    // Phase 8+9: Compute overall health score (0-1)
+    const latencyScore = avgLatency > 0 ? Math.max(0, 1 - avgLatency / 30000) : 1
+    const throttleScore = Math.max(0, 1 - throttleCount / 10)
+    const overallScore = successRate * 0.5 + latencyScore * 0.3 + throttleScore * 0.2
+
+    // Phase 9: Quota usage prediction
+    let quotaUsagePercent = 0
+    if (account && typeof account.quotaLimit === 'number' && account.quotaLimit > 0) {
+      quotaUsagePercent = ((account.quotaUsed || 0) / account.quotaLimit) * 100
+    }
+
+    return {
+      successRate,
+      avgLatency,
+      requestsPerMinute: recentWindow.length,
+      throttleCount,
+      adaptiveFactor: budget?.adaptiveFactor || this.config.adaptiveRateFactor,
+      overallScore,
+      quotaUsagePercent,
+      isHealthy: overallScore > 0.5 && quotaUsagePercent < 80
+    }
+  }
+
+  // Phase 9: Get quota predictions for all accounts
+  getQuotaPredictions(): Array<{
+    accountId: string
+    email?: string
+    quotaUsed: number
+    quotaLimit: number
+    usagePercent: number
+    estimatedExhaustionHours: number | null
+    isLow: boolean
+  }> {
+    const now = Date.now()
+    const predictions: Array<{
+      accountId: string
+      email?: string
+      quotaUsed: number
+      quotaLimit: number
+      usagePercent: number
+      estimatedExhaustionHours: number | null
+      isLow: boolean
+    }> = []
+
+    for (const [id, account] of this.accounts) {
+      if (typeof account.quotaLimit !== 'number' || account.quotaLimit <= 0) continue
+      const used = account.quotaUsed || 0
+      const limit = account.quotaLimit
+      const usagePercent = (used / limit) * 100
+
+      // Estimate usage rate from sliding window
+      const window = this.slidingWindows.get(id) || []
+      const oneHourAgo = now - 3600_000
+      const recentEntries = window.filter(e => e.timestamp > oneHourAgo)
+      let estimatedExhaustionHours: number | null = null
+      if (recentEntries.length > 0) {
+        const hourlyRate = recentEntries.length
+        const remainingQuota = limit - used
+        if (hourlyRate > 0 && remainingQuota > 0) {
+          estimatedExhaustionHours = remainingQuota / hourlyRate
+        }
+      }
+
+      predictions.push({
+        accountId: id,
+        email: account.email,
+        quotaUsed: used,
+        quotaLimit: limit,
+        usagePercent,
+        estimatedExhaustionHours,
+        isLow: usagePercent >= 80
+      })
+    }
+
+    return predictions
+  }
+
+
+  // 记录请求成功（重置断路器 + 粘滞到当前账号 + sliding window + rate budget）
+  recordSuccess(accountId: string, tokens: number = 0, credits: number = 0, responseTimeMs: number = 0, model?: string): ProxyAccount | undefined {
+    // Phase 1 + 2: Record in sliding window and rate budget
+    this.recordSlidingWindow(accountId, true, responseTimeMs, model)
+    this.recordRateLimitSuccess(accountId)
     const account = this.accounts.get(accountId)
     let updatedAccount: ProxyAccount | undefined
     if (account) {
@@ -542,7 +807,7 @@ export class AccountPool {
   }
 
   // 记录请求失败（区分错误类型）
-  recordError(accountId: string, errorType: ErrorType = ErrorType.RECOVERABLE, statusCode?: number): void {
+  recordError(accountId: string, errorType: ErrorType = ErrorType.RECOVERABLE, statusCode?: number, responseTimeMs: number = 0): void {
     const account = this.accounts.get(accountId)
     if (!account) return
 
@@ -550,6 +815,13 @@ export class AccountPool {
     const stats = this.accountStats.get(accountId)
     if (stats) {
       this.accountStats.set(accountId, { ...stats, errors: stats.errors + 1, lastUsed: now })
+    }
+
+    // Phase 1: Record failure in sliding window
+    this.recordSlidingWindow(accountId, false, responseTimeMs)
+    // Phase 2: Record throttle event
+    if (statusCode === 429) {
+      this.recordThrottle(accountId)
     }
 
     // FATAL 错误不增加失败计数（是请求的问题，不是账号的问题）
@@ -664,6 +936,103 @@ export class AccountPool {
     }
 
     return { total: all.length, available, exhausted, cooldown }
+  }
+
+  // Phase 14: Conversation cache affinity — prefer same account for same conversation
+  private conversationAffinity: Map<string, { accountId: string; lastAt: number; hitCount: number }> = new Map()
+  private readonly CONVERSATION_AFFINITY_TTL = 10 * 60_000 // 10 minutes
+
+  /**
+   * Get preferred account for a conversation (prompt cache affinity).
+   * Returns the account ID if it's still available and not near quota exhaustion.
+   */
+  getConversationPreferred(conversationId: string): string | null {
+    const entry = this.conversationAffinity.get(conversationId)
+    if (!entry) return null
+
+    const now = Date.now()
+    if (now - entry.lastAt > this.CONVERSATION_AFFINITY_TTL) {
+      this.conversationAffinity.delete(conversationId)
+      return null
+    }
+
+    const account = this.accounts.get(entry.accountId)
+    if (!account) return null
+
+    // Quota-aware: unstick if account is near exhaustion (>85%)
+    if (account.quotaLimit && account.quotaLimit > 0) {
+      const used = account.quotaUsed || 0
+      if (used / account.quotaLimit > 0.85) return null
+    }
+
+    if (!this.isAccountAvailable(account, now)) return null
+
+    return entry.accountId
+  }
+
+  /** Record that a conversation used a specific account (builds affinity). */
+  recordConversationAffinity(conversationId: string, accountId: string): void {
+    const existing = this.conversationAffinity.get(conversationId)
+    this.conversationAffinity.set(conversationId, {
+      accountId,
+      lastAt: Date.now(),
+      hitCount: (existing?.accountId === accountId ? (existing.hitCount || 0) : 0) + 1
+    })
+  }
+
+  /** Cleanup expired conversation affinity entries (called periodically). */
+  cleanupConversationAffinity(): void {
+    const now = Date.now()
+    for (const [id, entry] of this.conversationAffinity) {
+      if (now - entry.lastAt > this.CONVERSATION_AFFINITY_TTL) {
+        this.conversationAffinity.delete(id)
+      }
+    }
+  }
+
+  // Phase 14: Quota-aware sticky — auto-unstick when quota nearing exhaustion
+  /**
+   * Check if sticky strategy should unstick from current account.
+   * Returns true if the sticky account should be released (quota > threshold).
+   */
+  shouldUnstick(quotaThreshold: number = 0.85): boolean {
+    if (this.strategy !== 'sticky') return false
+
+    const accountList = Array.from(this.accounts.values())
+    if (accountList.length <= 1) return false
+
+    const stickyAccount = accountList[this.currentIndex]
+    if (!stickyAccount) return false
+
+    // Check quota usage
+    if (stickyAccount.quotaLimit && stickyAccount.quotaLimit > 0) {
+      const used = stickyAccount.quotaUsed || 0
+      if (used / stickyAccount.quotaLimit > quotaThreshold) {
+        return true
+      }
+    }
+
+    // Check if too many recent errors
+    const window = this.slidingWindows.get(stickyAccount.id) || []
+    const recentWindow = window.filter(e => e.timestamp > Date.now() - 60_000)
+    if (recentWindow.length >= 3) {
+      const recentSuccess = recentWindow.filter(e => e.success).length / recentWindow.length
+      if (recentSuccess < 0.5) return true
+    }
+
+    return false
+  }
+
+  /**
+   * Force unstick: advance the round-robin pointer past the current sticky account.
+   * Call when shouldUnstick() returns true.
+   */
+  forceUnstick(): void {
+    const accountList = Array.from(this.accounts.values())
+    if (accountList.length > 1) {
+      this.currentIndex = (this.currentIndex + 1) % accountList.length
+      console.log(`[AccountPool] Quota-aware unstick: moved pointer to index ${this.currentIndex}`)
+    }
   }
 
   // 标记账号需要刷新 Token

@@ -41,8 +41,11 @@ export function setLogStreamEvents(enabled: boolean): void {
 
 // 流式读取超时（毫秒，0 = 关闭）。防止 AWS 长时间不吐字节导致客户端无限等待。
 // 首字节超时较长以容忍 reasoning 模型的思考延迟；空闲超时在每收到一块后重置。
-let streamFirstByteTimeoutMs = 30_000
-let streamIdleTimeoutMs = 60_000
+// Phase 3: Increased defaults to support long-running tasks (30-60 min)
+// - firstByte: 120s (reasoning models can take 60-90s before first token)
+// - idle: 300s (5 min inactivity before abort, allows thinking pauses)
+let streamFirstByteTimeoutMs = 120_000
+let streamIdleTimeoutMs = 300_000
 export function setStreamTimeouts(opts: { firstByteMs?: number; idleMs?: number }): void {
   if (typeof opts.firstByteMs === 'number' && opts.firstByteMs >= 0) {
     streamFirstByteTimeoutMs = opts.firstByteMs

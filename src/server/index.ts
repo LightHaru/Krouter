@@ -1623,6 +1623,8 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
       return proxyRuntime.getModelProbeResults()
     case 'proxyTestBedrock':
       return proxyRuntime.testBedrock(args[0] as Parameters<typeof proxyRuntime.testBedrock>[0])
+    case 'proxyGetBedrockStatus':
+      return proxyRuntime.getBedrockStatus()
     case 'proxyTestXpixi':
       return proxyRuntime.testXpixi(args[0] as Parameters<typeof proxyRuntime.testXpixi>[0])
     case 'getKiroAvailableModels':
@@ -1770,6 +1772,38 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
     case 'backgroundBatchRefresh':
     case 'backgroundBatchCheck':
       return handleBackgroundBatch(method, args)
+    // Phase 13: Skills system
+    case 'fetchSkillsList':
+      return proxyRuntime.fetchSkillsList()
+    case 'fetchSkillContent':
+      return proxyRuntime.fetchSkillContent(String(args[0] || ''))
+    // Phase 8: Account health dashboard
+    case 'proxyGetAccountHealth':
+      return proxyRuntime.getAccountHealth()
+    // Phase 9: Quota predictions
+    case 'proxyGetQuotaPredictions':
+      return proxyRuntime.getQuotaPredictions()
+    // Phase 7/10: Endpoint metrics
+    case 'proxyGetEndpointMetrics':
+      return proxyRuntime.getEndpointMetrics()
+    case 'proxyResetEndpointMetrics':
+      return proxyRuntime.resetEndpointMetrics()
+    // Phase 12: MITM model mappings
+    case 'kproxyGetModelMappings':
+      return kproxyRuntime.getModelMappings()
+    case 'kproxySaveModelMappings':
+      return kproxyRuntime.saveModelMappings(args[0] as unknown[])
+    case 'kproxyGetHostsStatus':
+      return kproxyRuntime.getHostsStatus()
+    case 'kproxyToggleHosts':
+      return kproxyRuntime.toggleHosts(Boolean(args[0]))
+    // Phase 12: MITM HTTPS server
+    case 'mitmGetStatus':
+      return kproxyRuntime.mitmGetStatus()
+    case 'mitmStart':
+      return kproxyRuntime.mitmStart(args[0] as { port?: number } | undefined)
+    case 'mitmStop':
+      return kproxyRuntime.mitmStop()
     default:
       return unsupported(method)
   }

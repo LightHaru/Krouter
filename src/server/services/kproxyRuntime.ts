@@ -249,6 +249,107 @@ export class KProxyRuntime {
     this.getOrCreateService().resetStats()
     return { success: true }
   }
+
+  // Phase 12: Model mappings
+  getModelMappings(): { mappings: unknown[] } {
+    try {
+      const { modelMapper } = require('../../main/kproxy/modelMapper')
+      return { mappings: modelMapper.getMappings() }
+    } catch {
+      return { mappings: [] }
+    }
+  }
+
+  saveModelMappings(mappings: unknown[]): { success: boolean } {
+    try {
+      const { modelMapper } = require('../../main/kproxy/modelMapper')
+      modelMapper.setMappings(mappings)
+      return { success: true }
+    } catch {
+      return { success: false }
+    }
+  }
+
+  private mitmServer: any = null
+
+  // Phase 12: MITM HTTPS Server
+  async mitmGetStatus(): Promise<{ running: boolean; port: number; connections: number; interceptedRequests: number }> {
+    try {
+      if (this.mitmServer) {
+        const stats = this.mitmServer.getStats()
+        return { running: stats.running, port: stats.port, connections: stats.connections, interceptedRequests: stats.interceptedRequests }
+      }
+      return { running: false, port: 443, connections: 0, interceptedRequests: 0 }
+    } catch {
+      return { running: false, port: 443, connections: 0, interceptedRequests: 0 }
+    }
+  }
+
+  async mitmStart(opts?: { port?: number }): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { MitmHttpsServer } = require('../../main/kproxy/mitmHttpsServer')
+      const service = this.getOrCreateService()
+      const caInfo = await service.initialize()
+      if (!caInfo) return { success: false, error: 'Failed to initialize certificates' }
+      const { createCertManager } = require('../../main/kproxy/certManager')
+      const certMgr = (service as any).certManager || createCertManager(getRuntimeUserDataPath() + '/kproxy')
+
+      if (!this.mitmServer) {
+        const config = opts?.port ? { port: opts.port } : undefined
+        this.mitmServer = new MitmHttpsServer(config)
+      }
+      this.mitmServer.setCertManager(certMgr)
+      this.mitmServer.setOnRequest((info: any) => this.emit('mitm-request', info))
+
+      // Set the router API key from proxy config so MITM can forward authenticated requests
+      const proxyConfig = this.store.getUserSetting<any>(this.userId, 'proxyConfig', {})
+      const apiKeys: any[] = proxyConfig?.apiKeys || []
+      const activeKey = apiKeys.find((k: any) => k.enabled)
+      if (activeKey?.key) {
+        this.mitmServer.setRouterApiKey(activeKey.key)
+      }
+
+      await this.mitmServer.start()
+      return { success: true }
+    } catch (e) {
+      return { success: false, error: (e as Error).message }
+    }
+  }
+
+  async mitmStop(): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (this.mitmServer) {
+        await this.mitmServer.stop()
+      }
+      return { success: true }
+    } catch (e) {
+      return { success: false, error: (e as Error).message }
+    }
+  }
+
+  // Phase 12: Hosts file management
+  async getHostsStatus(): Promise<{ enabled: boolean; entries: unknown[] }> {
+    try {
+      const { hostsManager } = require('../../main/kproxy/hostsManager')
+      return await hostsManager.getStatus()
+    } catch {
+      return { enabled: false, entries: [] }
+    }
+  }
+
+  async toggleHosts(enabled: boolean): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { hostsManager } = require('../../main/kproxy/hostsManager')
+      if (enabled) {
+        await hostsManager.addEntries(hostsManager.getDefaultEntries())
+      } else {
+        await hostsManager.removeEntries()
+      }
+      return { success: true }
+    } catch (e) {
+      return { success: false, error: (e as Error).message }
+    }
+  }
 }
 
 const runtimes = new Map<string, KProxyRuntime>()

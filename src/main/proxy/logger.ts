@@ -182,23 +182,32 @@ class ProxyLogger {
     })
   }
 
-  // 记录请求
+  // Phase 7: Enhanced request logging with trace IDs
   request(info: {
     path: string
     method: string
     model?: string
     accountId?: string
+    traceId?: string
   }): void {
     this.info('Request', `${info.method} ${info.path}`, info)
   }
 
-  // 记录响应
+  // Phase 7: Enhanced response logging with performance metrics
   response(info: {
     path: string
     status: number
     tokens?: number
+    inputTokens?: number
+    outputTokens?: number
+    cacheReadTokens?: number
     responseTime?: number
+    model?: string
+    accountId?: string
+    traceId?: string
     error?: string
+    errorCategory?: string
+    retryCount?: number
   }): void {
     if (info.error) {
       this.error('Response', `${info.path} -> ${info.status}`, info)
@@ -364,6 +373,120 @@ class ProxyLogStore {
 }
 
 export const proxyLogStore = new ProxyLogStore()
+
+// Phase 7: Per-endpoint metrics tracking
+export interface EndpointMetrics {
+  path: string
+  totalRequests: number
+  successCount: number
+  errorCount: number
+  avgResponseTime: number
+  p95ResponseTime: number
+  totalInputTokens: number
+  totalOutputTokens: number
+  totalCacheReadTokens: number
+  errorCategories: Record<string, number>
+  lastRequestTime: number
+}
+
+class MetricsStore {
+  private metrics: Map<string, EndpointMetrics> = new Map()
+  private responseTimes: Map<string, number[]> = new Map()
+
+  record(info: {
+    path: string
+    status: number
+    responseTime?: number
+    inputTokens?: number
+    outputTokens?: number
+    cacheReadTokens?: number
+    errorCategory?: string
+  }): void {
+    const key = info.path
+    let m = this.metrics.get(key)
+    if (!m) {
+      m = {
+        path: key,
+        totalRequests: 0,
+        successCount: 0,
+        errorCount: 0,
+        avgResponseTime: 0,
+        p95ResponseTime: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        totalCacheReadTokens: 0,
+        errorCategories: {},
+        lastRequestTime: Date.now()
+      }
+      this.metrics.set(key, m)
+    }
+
+    m.totalRequests++
+    m.lastRequestTime = Date.now()
+
+    if (info.status >= 200 && info.status < 400) {
+      m.successCount++
+    } else {
+      m.errorCount++
+      if (info.errorCategory) {
+        m.errorCategories[info.errorCategory] = (m.errorCategories[info.errorCategory] || 0) + 1
+      }
+    }
+
+    if (info.responseTime !== undefined) {
+      let times = this.responseTimes.get(key)
+      if (!times) {
+        times = []
+        this.responseTimes.set(key, times)
+      }
+      times.push(info.responseTime)
+      if (times.length > 1000) times.splice(0, times.length - 1000)
+      m.avgResponseTime = times.reduce((a, b) => a + b, 0) / times.length
+      const sorted = [...times].sort((a, b) => a - b)
+      m.p95ResponseTime = sorted[Math.floor(sorted.length * 0.95)] || 0
+    }
+
+    m.totalInputTokens += info.inputTokens || 0
+    m.totalOutputTokens += info.outputTokens || 0
+    m.totalCacheReadTokens += info.cacheReadTokens || 0
+  }
+
+  getAll(): EndpointMetrics[] {
+    return Array.from(this.metrics.values())
+  }
+
+  getByPath(path: string): EndpointMetrics | undefined {
+    return this.metrics.get(path)
+  }
+
+  reset(): void {
+    this.metrics.clear()
+    this.responseTimes.clear()
+  }
+}
+
+export const endpointMetrics = new MetricsStore()
+
+// Phase 7: Trace ID generator
+let traceCounter = 0
+export function generateTraceId(): string {
+  const ts = Date.now().toString(36)
+  const cnt = (traceCounter++).toString(36).padStart(4, '0')
+  const rand = Math.random().toString(36).slice(2, 6)
+  return `kr-${ts}-${cnt}-${rand}`
+}
+
+// Phase 7: Error categorization
+export function categorizeError(status: number, errorMessage?: string): string {
+  if (status === 429) return 'rate_limit'
+  if (status === 401 || status === 403) return 'auth'
+  if (status === 404) return 'not_found'
+  if (status === 408 || (errorMessage && /timeout/i.test(errorMessage))) return 'timeout'
+  if (status >= 500) return 'server_error'
+  if (errorMessage && /network|ECONNREFUSED|ECONNRESET/i.test(errorMessage)) return 'network'
+  if (status >= 400) return 'client_error'
+  return 'unknown'
+}
 
 // 单例导出
 export const proxyLogger = new ProxyLogger()

@@ -1,6 +1,6 @@
 {
   "name": "@lightharu/krouter",
-  "version": "1.9.4",
+  "version": "2.0.0",
   "description": "Krouter - Web dashboard and CLI router for Kiro accounts, quota balancing, and API proxy",
   "main": "./out-server/server/index.js",
   "bin": {

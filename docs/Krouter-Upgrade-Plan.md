@@ -7004,3 +7004,401 @@ POST /api/mitm/update-config → Save to store
       └── rootCA.key          # Private key
 ```
 
+
+---
+
+## Phase 14: MCP Server + Pool Intelligence + OpenClaw Deep Integration
+
+**Status:** IMPLEMENTED (2026-07-21)
+**Priority:** P0
+
+### 14.1 MCP Server (`src/main/proxy/mcpServer.ts`)
+
+Krouter now exposes admin tools via MCP protocol (Model Context Protocol) at `/mcp/` endpoint.
+
+**Tools exposed:**
+| Tool | Purpose |
+|------|---------|
+| `krouter_pool_status` | Pool health: active/suspended/cooling/exhausted counts, tier breakdown |
+| `krouter_account_health` | Per-account detail (by ID or email): score, cooldown, quota, token expiry |
+| `krouter_force_refresh` | Force token refresh for one/all accounts |
+| `krouter_usage_stats` | Usage stats: requests, tokens, success rate, uptime |
+| `krouter_register` | Trigger automated account registration |
+
+**OpenClaw integration:**
+```bash
+openclaw mcp add krouter --transport http --url http://127.0.0.1:5580/mcp
+```
+
+**Protocol:** MCP JSON-RPC 2.0 over HTTP (SSE + /message) or stdio.
+
+### 14.2 Conversation Cache Affinity (`accountPool.ts`)
+
+- `getConversationPreferred(conversationId)` — returns preferred account for a conversation
+- `recordConversationAffinity(conversationId, accountId)` — builds affinity
+- Quota-aware: auto-unstick when account quota > 85%
+- TTL: 10 minutes
+
+### 14.3 Quota-Aware Sticky Unstick (`accountPool.ts`)
+
+- `shouldUnstick(threshold)` — checks if sticky should release (quota > threshold OR recent success < 50%)
+- `forceUnstick()` — advances round-robin pointer
+- Auto-integrated into `getNextAccount()` for sticky strategy
+
+### 14.4 Session Affinity Quota Check (`proxyServer.ts`)
+
+- `pickAccountWithAffinity()` now checks quota usage ratio
+- Unsticks when account quota > 85% (prevents request failure)
+- Logs unstick events for debugging
+
+### 14.5 Registration Adaptive Rate Limiting (`registrar.ts`)
+
+- `canRefreshProxySession()` — NOW IMPLEMENTED (detects BestProxy/BrightData session params)
+- `onRiskControlDetected()` — exponential backoff: 5s → 15s → 30s → 60s → 120s max
+- `decayAdaptiveDelay()` — recovers after 2 minutes without risk triggers
+- Integrates with `humanDelay()` to automatically slow down when AWS blocks
+- Emits `risk-control` step event for UI tracking
+
+### 14.6 MITM Response Interception (`mitmProxy.ts`)
+
+- `interceptResponses` config flag enables response header parsing
+- `modifyResponseHeaders()` — hook for response modification
+- `getDeviceIdForAccount(accountId)` — per-account device ID rotation
+- `setActiveDeviceId(deviceId)` — set device ID for current request context
+- `deviceIdMappings` in config — maps account IDs to unique device IDs
+
+### 14.7 OpenClaw SKILL.md (`docs/skills/krouter-mcp/SKILL.md`)
+
+OpenClaw-compatible skill file with:
+- Proper frontmatter (name, description, metadata.openclaw.requires)
+- Decision workflow for agents
+- Tool documentation
+- MCP configuration instructions
+
+### Test Coverage
+
+| Test File | Tests | Status |
+|-----------|-------|--------|
+| `mcpServer.test.ts` | 13 | PASS |
+| `mcpIntegration.test.ts` | 6 | PASS |
+| `accountPool.affinity.test.ts` | 12 | PASS |
+| Existing tests (38 files) | 282 | PASS (1 pre-existing env-dependent failure) |
+
+### Files Modified/Created
+
+| File | Action | Description |
+|------|--------|-------------|
+| `src/main/proxy/mcpServer.ts` | NEW | MCP server implementation (tools, JSON-RPC, HTTP/stdio transport) |
+| `src/main/proxy/proxyServer.ts` | MODIFIED | Added MCP route, import, initialization, quota-aware affinity |
+| `src/main/proxy/accountPool.ts` | MODIFIED | Added conversation affinity, quota-aware unstick, cleanup |
+| `src/main/registration/registrar.ts` | MODIFIED | canRefreshProxySession impl, adaptive rate limiting, risk-control step |
+| `src/main/kproxy/mitmProxy.ts` | MODIFIED | Response interception, per-account device ID |
+| `src/main/kproxy/types.ts` | MODIFIED | Added deviceIdMappings, interceptResponses, modelMappings config |
+| `docs/skills/krouter-mcp/SKILL.md` | NEW | OpenClaw-compatible MCP skill |
+| `test/proxy/mcpServer.test.ts` | NEW | MCP server unit tests |
+| `test/proxy/mcpIntegration.test.ts` | NEW | MCP integration scenarios |
+| `test/proxy/accountPool.affinity.test.ts` | NEW | Affinity + unstick tests |
+
+---
+
+## 🎨 PHASE 15: FREE IMAGE GENERATION VIA CHATGPT OAUTH
+
+**Priority:** HIGH  
+**Timeline:** 1 tuần  
+**Goal:** Cho phép user tạo hình đẹp (GPT-Image-2 quality) hoàn toàn FREE thông qua ChatGPT OAuth, không cần API key
+
+---
+
+### 15.1 Tổng Quan Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     KROUTER IMAGE GENERATION                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  User → Krouter UI → "Đăng nhập ChatGPT" → OAuth PKCE Flow     │
+│                                                ↓                │
+│         auth.openai.com/oauth/authorize                         │
+│         client_id: app_EMoamEEZ73f0CkXaXp7hrann                │
+│         scope: openid profile email offline_access              │
+│         redirect: http://localhost:{PORT}/auth/chatgpt/callback │
+│                                                ↓                │
+│         Exchange code → access_token + refresh_token            │
+│         Lưu vào ProxyAccount.chatgpt field                      │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Agent/OpenClaw → POST /v1/images/generations                   │
+│                        ↓                                        │
+│  Krouter Backend:                                               │
+│    1. Pick account có chatgpt token (pool rotation)             │
+│    2. Check token expiry → auto refresh nếu cần                │
+│    3. POST chatgpt.com/backend-api/codex/responses              │
+│       Body: {model: "gpt-5.4", tools: [{type:image_generation}]}│
+│    4. Parse SSE stream → extract base64 image                   │
+│    5. Save image → return OpenAI-compatible response            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 15.2 ChatGPT OAuth Integration
+
+**File MỚI:** `src/main/proxy/chatgptOAuth.ts`
+
+```typescript
+interface ChatGPTOAuthConfig {
+  clientId: string           // 'app_EMoamEEZ73f0CkXaXp7hrann' (OpenClaw public client)
+  redirectPort: number       // Port cho localhost callback (default: 19836)
+  scopes: string[]           // ['openid', 'profile', 'email', 'offline_access']
+  tokenRefreshSkew: number   // Refresh trước khi hết hạn (default: 300s / 5 phút)
+}
+
+interface ChatGPTTokenSet {
+  accessToken: string
+  refreshToken: string
+  expiresAt: number          // Unix timestamp ms
+  profile?: {
+    email: string
+    name?: string
+    plan?: string            // 'free' | 'plus' | 'pro'
+  }
+}
+```
+
+**Functions:**
+- `startOAuthFlow(config)` — Mở browser, PKCE flow, nhận code qua localhost callback
+- `exchangeCode(code, codeVerifier)` — POST auth.openai.com/oauth/token → TokenSet
+- `refreshAccessToken(refreshToken)` — Refresh khi token hết hạn
+- `isTokenValid(tokenSet, skew)` — Check expiry
+- `revokeToken(token)` — Logout/cleanup
+
+**OAuth PKCE Flow:**
+1. Generate `code_verifier` (43-128 chars random)
+2. `code_challenge` = Base64URL(SHA256(code_verifier))
+3. Open browser: `https://auth.openai.com/oauth/authorize?client_id=...&redirect_uri=...&code_challenge=...&code_challenge_method=S256&scope=...&response_type=code`
+4. User đăng nhập ChatGPT (free account OK)
+5. Redirect về `http://localhost:{PORT}/auth/chatgpt/callback?code=...`
+6. Exchange code → tokens
+7. Lưu tokens vào account
+
+### 15.3 Extend ProxyAccount Type
+
+**File:** `src/main/proxy/types.ts`
+
+Thêm vào `ProxyAccount`:
+```typescript
+interface ProxyAccount {
+  // ... existing fields ...
+  
+  // Phase 15: ChatGPT OAuth for image generation
+  chatgpt?: {
+    accessToken: string
+    refreshToken: string
+    expiresAt: number
+    email?: string
+    plan?: string            // 'free' | 'plus' | 'pro'
+    imageQuota?: {
+      used: number
+      limit: number          // Estimated daily limit (free ≈ 2-3, plus ≈ 50+)
+      resetAt: number        // Next reset timestamp
+    }
+    lastImageGenAt?: number
+    consecutiveFailures: number
+  }
+}
+```
+
+### 15.4 Image Generation via ChatGPT Backend
+
+**File MỚI:** `src/main/proxy/chatgptImage.ts`
+
+```typescript
+interface ChatGPTImageRequest {
+  prompt: string
+  model?: string            // 'gpt-5.4' (default) hoặc 'gpt-image-2'
+  size?: string             // '1024x1024' | '1024x1536' | '1536x1024'
+  quality?: string          // 'low' | 'medium' | 'high'
+  n?: number                // Số lượng hình (qua prompt instruction)
+}
+
+interface ChatGPTImageResult {
+  images: Array<{
+    base64: string
+    revisedPrompt?: string
+    callId?: string
+  }>
+  model: string
+  requestId: string
+}
+```
+
+**Functions:**
+- `generateChatGPTImage(token, request, signal)` — Main generation function
+- `buildCodexPayload(request)` — Build request body cho `/codex/responses`
+- `parseImageSSE(stream)` — Parse SSE stream, extract base64 từ `response.output_item.done`
+- `pickChatGPTAccount(pool)` — Chọn account có token + chưa hết quota
+- `handleImageQuotaExhausted(account)` — Mark account khi hết quota → rotate sang account khác
+
+**API Call Format:**
+```
+POST https://chatgpt.com/backend-api/codex/responses
+Authorization: Bearer {access_token}
+Content-Type: application/json
+Accept: text/event-stream
+
+{
+  "model": "gpt-5.4",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "input_text", "text": "Generate an image: {prompt}"}
+      ]
+    }
+  ],
+  "tools": [{"type": "image_generation"}],
+  "stream": true,
+  "store": false
+}
+```
+
+**SSE Response Parsing:**
+```
+data: {"type": "response.output_item.done", "item": {"type": "image_generation_call", "result": "base64..."}}
+data: {"type": "response.completed"}
+data: [DONE]
+```
+
+### 15.5 Modified handleImageGeneration Flow
+
+**File:** `src/main/proxy/proxyServer.ts`
+
+```typescript
+private async handleImageGeneration(req, res, signal) {
+  const request = parseBody(req)
+  
+  // Route by model or availability:
+  if (isBedrockImageModel(request.model) && this.config.bedrock?.enabled) {
+    // Existing: AWS Bedrock Nova Canvas (paid)
+    return await generateImage(this.config.bedrock, request, ...)
+  }
+  
+  // Default: ChatGPT OAuth (free)
+  const account = pickChatGPTAccount(this.accountPool)
+  if (!account?.chatgpt) {
+    return this.sendError(res, 503, 'No ChatGPT accounts available. Please login via Krouter UI.')
+  }
+  
+  // Auto-refresh token if needed
+  if (!isTokenValid(account.chatgpt)) {
+    await refreshAccessToken(account.chatgpt.refreshToken)
+  }
+  
+  const result = await generateChatGPTImage(account.chatgpt.accessToken, request, signal)
+  
+  // Save images and return OpenAI-compatible response
+  const response = {
+    created: Math.floor(Date.now() / 1000),
+    data: result.images.map(img => ({
+      url: saveAndGetUrl(img.base64),
+      revised_prompt: img.revisedPrompt
+    }))
+  }
+  
+  res.writeHead(200, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify(response))
+}
+```
+
+### 15.6 UI: ChatGPT Login Button
+
+**File:** `src/renderer/src/components/proxy/ChatGPTLoginPanel.tsx` (NEW)
+
+- Button "Đăng nhập ChatGPT" trong Krouter UI
+- Hiển thị status: email, plan tier, image quota remaining
+- Support nhiều accounts (pool)
+- Disconnect/Logout option
+
+### 15.7 Account Pool Enhancement
+
+**File:** `src/main/proxy/accountPool.ts`
+
+Thêm methods:
+- `getAvailableChatGPTAccounts()` — Filter accounts có valid chatgpt token
+- `pickBestChatGPTAccount()` — Chọn account ít quota usage nhất
+- `recordImageGeneration(accountId)` — Track quota usage
+- `markImageQuotaExhausted(accountId)` — Khi free account hết limit → skip tới account khác
+
+### 15.8 Rate Limit & Quota Management
+
+**Free account strategy:**
+- Estimate: ~2-3 images/ngày/account (có thể OpenAI thay đổi)
+- Pool rotation: 5 free accounts = ~10-15 images/ngày
+- Track usage per account, auto-rotate khi gần hết
+- Cooldown: khi bị 429 → back off 1 giờ cho account đó
+- Reset tracking mỗi ngày (midnight UTC)
+
+**Token refresh strategy:**
+- Access token valid ~2 tuần
+- Refresh token valid rất lâu (months)
+- Auto refresh 5 phút trước khi hết hạn
+- Cross-account locking để tránh concurrent refresh conflicts
+
+### 15.9 Error Handling
+
+| Error | Action |
+|-------|--------|
+| 401 Unauthorized | Refresh token → retry 1 lần |
+| 403 Forbidden | Account bị ban → mark suspended |
+| 429 Rate Limited | Rotate sang account khác → mark cooldown |
+| Image quota exceeded | Track per-account → next account |
+| Network timeout (>120s) | Retry với exponential backoff |
+| Token refresh failed | Mark account needs re-login → notify UI |
+
+### 15.10 Files Summary
+
+| File | Action | Description |
+|------|--------|-------------|
+| `src/main/proxy/chatgptOAuth.ts` | NEW | OAuth PKCE flow, token management |
+| `src/main/proxy/chatgptImage.ts` | NEW | Image gen via chatgpt.com/backend-api |
+| `src/main/proxy/proxyServer.ts` | MODIFY | Route image gen to ChatGPT, add OAuth callback route |
+| `src/main/proxy/accountPool.ts` | MODIFY | ChatGPT account selection, quota tracking |
+| `src/main/proxy/types.ts` | MODIFY | ProxyAccount.chatgpt field |
+| `src/renderer/src/components/proxy/ChatGPTLoginPanel.tsx` | NEW | Login UI |
+| `src/server/services/proxyRuntime.ts` | MODIFY | Wire up OAuth callback endpoint |
+| `test/proxy/chatgptImage.test.ts` | NEW | Unit tests |
+| `test/proxy/chatgptOAuth.test.ts` | NEW | OAuth flow tests |
+| `docs/skills/krouter-imagegen/SKILL.md` | NEW | OpenClaw skill for agents |
+
+### 15.11 OpenClaw Integration
+
+**Skill file:** `docs/skills/krouter-imagegen/SKILL.md`
+- Agents dùng standard OpenAI image API format
+- Không cần biết backend là ChatGPT — transparent
+- Endpoint: `POST {krouter_url}/v1/images/generations`
+
+**Usage từ OpenClaw/Agent:**
+```bash
+curl -X POST http://localhost:4269/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a beautiful sunset over Vietnamese mountains, watercolor style",
+    "size": "1024x1024",
+    "quality": "high"
+  }'
+```
+
+### 15.12 Security Notes
+
+- Tokens encrypted at rest (AES-256-GCM, key từ machine-id)
+- Refresh tokens never exposed qua API
+- OAuth redirect chỉ accept localhost
+- PKCE prevents code interception attacks
+- No ChatGPT credentials stored — chỉ OAuth tokens
+
+### 15.13 Testing Plan
+
+1. **Unit tests:** OAuth flow mock, SSE parsing, quota tracking
+2. **Integration test:** Full flow mock (OAuth → generate → serve image)
+3. **Manual test trên local:** Anh đăng nhập ChatGPT free → gen hình → verify quality
+4. **Pool test:** Multiple accounts, rotation khi hết quota
