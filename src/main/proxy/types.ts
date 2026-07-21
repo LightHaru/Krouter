@@ -409,6 +409,21 @@ export interface ProxyAccount {
   suspendedAt?: number       // 封禁时间戳
   suspendReason?: string     // 封禁原因 (如 'TEMPORARILY_SUSPENDED')
   suspendMessage?: string    // 封禁完整错误消息 (含联系链接)
+  // Phase 15: ChatGPT OAuth for free image generation
+  chatgpt?: {
+    accessToken: string
+    refreshToken: string
+    expiresAt: number
+    email?: string
+    plan?: string
+    imageQuota?: {
+      used: number
+      limit: number
+      resetAt: number
+    }
+    lastImageGenAt?: number
+    consecutiveFailures: number
+  }
 }
 
 // ============ Tier-based routing ============
@@ -640,6 +655,8 @@ export interface ProxyConfig {
   bedrock?: import('./bedrock').BedrockConfig
   /** Xpixi third-party API provider. Routed in parallel to Kiro and Bedrock. */
   xpixi?: import('./xpixi').XpixiConfig
+  /** Phase 15: ChatGPT OAuth image generation config */
+  chatgptImage?: import('./chatgptImage').ChatGPTImageConfig
 }
 
 export interface TlsConfig {

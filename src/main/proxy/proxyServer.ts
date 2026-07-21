@@ -86,6 +86,18 @@ import {
   callXpixi
 } from './xpixi'
 import { generateImage, ImageStorageManager } from './bedrockImage'
+import {
+  generateChatGPTImage,
+  isChatGPTImageModel,
+  isBedrockImageModel,
+  DEFAULT_CHATGPT_IMAGE_CONFIG,
+  type ChatGPTImageConfig
+} from './chatgptImage'
+import {
+  initiateOAuthFlow,
+  DEFAULT_CHATGPT_OAUTH_CONFIG,
+  type ChatGPTOAuthConfig
+} from './chatgptOAuth'
 import { SkillsManager } from './skills'
 import { McpServer } from './mcpServer'
 
@@ -448,6 +460,10 @@ export class ProxyServer {
   private skillsManager: SkillsManager | null = null
   /** Phase 14: MCP Server for agent tooling */
   private mcpServer: McpServer
+  /** Phase 15: ChatGPT image generation config */
+  private chatgptImageConfig: ChatGPTImageConfig = DEFAULT_CHATGPT_IMAGE_CONFIG
+  /** Phase 15: Pending OAuth flow (null when no flow in progress) */
+  private pendingOAuthFlow: Promise<any> | null = null
 
   /**
    * 从请求中提取 session hint，用于稳定 conversationId
@@ -3174,6 +3190,9 @@ export class ProxyServer {
         // P2-16 Prometheus metrics
         res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' })
         res.end(this.renderPrometheusMetrics())
+      } else if (pathWithoutQuery.startsWith('/auth/chatgpt/')) {
+        // Phase 15: ChatGPT OAuth endpoints
+        await this.handleChatGPTAuth(req, res, pathWithoutQuery)
       } else if (pathWithoutQuery.startsWith('/admin/')) {
         // 管理 API 端点
         await this.handleAdminApi(req, res, pathWithoutQuery, controller.signal)
@@ -5821,19 +5840,14 @@ export class ProxyServer {
     this.sendError(res, 404, 'Skills endpoint not found')
   }
 
-  // Phase 11: Image generation endpoint
+  // Phase 11 + 15: Image generation endpoint (ChatGPT OAuth free + Bedrock paid)
   private async handleImageGeneration(
     req: http.IncomingMessage,
     res: http.ServerResponse,
     signal?: AbortSignal
   ): Promise<void> {
-    if (!this.config.bedrock?.enabled) {
-      this.sendError(res, 503, 'Image generation requires Bedrock to be enabled')
-      return
-    }
-
     const bodyStr = await this.readBody(req, signal)
-    let request: { prompt: string; n?: number; size?: string; quality?: string; style?: string; response_format?: 'url' | 'b64_json'; negative_prompt?: string; cfg_scale?: number; seed?: number }
+    let request: { prompt: string; model?: string; n?: number; size?: string; quality?: string; style?: string; response_format?: 'url' | 'b64_json'; negative_prompt?: string; cfg_scale?: number; seed?: number }
     try {
       request = JSON.parse(bodyStr)
     } catch {
@@ -5851,13 +5865,46 @@ export class ProxyServer {
 
     try {
       const startTime = Date.now()
-      const result = await generateImage(
-        this.config.bedrock,
-        request,
-        this.imageStorage,
-        serverBaseUrl,
-        signal
-      )
+      let result: { created: number; data: Array<{ url?: string; b64_json?: string; revised_prompt?: string }> }
+
+      // Route: Bedrock models → Bedrock, everything else → ChatGPT OAuth
+      if (isBedrockImageModel(request.model) && this.config.bedrock?.enabled) {
+        result = await generateImage(
+          this.config.bedrock,
+          request,
+          this.imageStorage,
+          serverBaseUrl,
+          signal
+        )
+      } else {
+        // ChatGPT OAuth path (free)
+        const account = this.pickChatGPTImageAccount()
+        if (!account?.chatgpt) {
+          // Fallback to Bedrock if available
+          if (this.config.bedrock?.enabled) {
+            result = await generateImage(
+              this.config.bedrock,
+              request,
+              this.imageStorage,
+              serverBaseUrl,
+              signal
+            )
+          } else {
+            this.sendError(res, 503, 'No ChatGPT accounts available for image generation. Please login via Krouter UI (Settings > ChatGPT Login).')
+            return
+          }
+        } else {
+          result = await generateChatGPTImage(
+            account.chatgpt,
+            request,
+            this.chatgptImageConfig,
+            this.imageStorage,
+            serverBaseUrl,
+            signal
+          )
+        }
+      }
+
       const elapsed = Date.now() - startTime
       endpointMetrics.record({ path: '/v1/images/generations', status: 200, responseTime: elapsed })
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -5868,6 +5915,27 @@ export class ProxyServer {
       endpointMetrics.record({ path: '/v1/images/generations', status: 500, errorCategory: 'server_error' })
       this.sendError(res, 500, message)
     }
+  }
+
+  /** Phase 15: Pick best account with valid ChatGPT token for image generation */
+  private pickChatGPTImageAccount(): ProxyAccount | null {
+    const accounts = this.accountPool.getAccounts().filter(acc =>
+      acc.chatgpt &&
+      acc.chatgpt.accessToken &&
+      acc.chatgpt.consecutiveFailures < 5 &&
+      (!acc.chatgpt.imageQuota || acc.chatgpt.imageQuota.used < acc.chatgpt.imageQuota.limit)
+    )
+
+    if (accounts.length === 0) return null
+
+    // Prefer account with lowest quota usage
+    accounts.sort((a, b) => {
+      const aUsed = a.chatgpt?.imageQuota?.used ?? 0
+      const bUsed = b.chatgpt?.imageQuota?.used ?? 0
+      return aUsed - bUsed
+    })
+
+    return accounts[0]
   }
 
   // Phase 11: Serve generated images
@@ -5889,5 +5957,105 @@ export class ProxyServer {
       'Cache-Control': 'public, max-age=86400'
     })
     res.end(data)
+  }
+
+  // Phase 15: ChatGPT OAuth login/callback/status endpoints
+  private async handleChatGPTAuth(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    path: string
+  ): Promise<void> {
+    const method = (req.method || 'GET').toUpperCase()
+
+    if (path === '/auth/chatgpt/login' && method === 'POST') {
+      // Initiate OAuth flow — returns authorization URL for client to open
+      try {
+        const oauthConfig = { ...DEFAULT_CHATGPT_OAUTH_CONFIG }
+        if (this.config.chatgptImage?.enabled === false) {
+          this.sendError(res, 503, 'ChatGPT image generation is disabled')
+          return
+        }
+
+        const { authUrl, waitForCallback } = await initiateOAuthFlow(oauthConfig)
+
+        // Store pending flow — will resolve when user completes OAuth
+        this.pendingOAuthFlow = waitForCallback.then(async ({ tokens }) => {
+          // Find first account without chatgpt tokens, or the primary account
+          const accounts = this.accountPool.getAccounts()
+          const targetAccount = accounts.find(a => !a.chatgpt) || accounts[0]
+          if (targetAccount) {
+            this.accountPool.updateAccount(targetAccount.id, {
+              chatgpt: {
+                accessToken: tokens.accessToken,
+                refreshToken: tokens.refreshToken,
+                expiresAt: tokens.expiresAt,
+                email: tokens.email,
+                consecutiveFailures: 0,
+              }
+            })
+            proxyLogger.info('ChatGPTAuth', `OAuth completed for ${tokens.email || 'unknown'}, stored on account ${targetAccount.id}`)
+          }
+          this.pendingOAuthFlow = null
+          return tokens
+        }).catch(err => {
+          proxyLogger.error('ChatGPTAuth', `OAuth flow failed: ${(err as Error).message}`)
+          this.pendingOAuthFlow = null
+          throw err
+        })
+
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ authUrl, message: 'Open this URL in your browser to login' }))
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        this.sendError(res, 500, message)
+      }
+    } else if (path === '/auth/chatgpt/callback') {
+      // OAuth callback — handled by the callback server in chatgptOAuth.ts
+      // This route only catches misrouted callbacks
+      res.writeHead(200, { 'Content-Type': 'text/html' })
+      res.end('<html><body><h2>OAuth callback received</h2><p>You can close this window.</p></body></html>')
+    } else if (path === '/auth/chatgpt/status' && method === 'GET') {
+      // Return status of all ChatGPT-linked accounts
+      const accounts = this.accountPool.getAccounts()
+        .filter(a => a.chatgpt)
+        .map(a => ({
+          accountId: a.id,
+          email: a.chatgpt!.email,
+          plan: a.chatgpt!.plan,
+          tokenValid: a.chatgpt!.expiresAt > Date.now(),
+          imageQuota: a.chatgpt!.imageQuota,
+          lastImageGen: a.chatgpt!.lastImageGenAt,
+          failures: a.chatgpt!.consecutiveFailures,
+        }))
+
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        accounts,
+        totalAccounts: accounts.length,
+        availableForImageGen: accounts.filter(a => a.tokenValid && a.failures < 5).length,
+        oauthFlowPending: !!this.pendingOAuthFlow,
+      }))
+    } else if (path === '/auth/chatgpt/logout' && method === 'POST') {
+      // Remove ChatGPT tokens from an account
+      const bodyStr = await this.readBody(req)
+      let body: { accountId?: string } = {}
+      try { body = JSON.parse(bodyStr) } catch { /* empty */ }
+
+      const accounts = this.accountPool.getAccounts().filter(a => a.chatgpt)
+      const target = body.accountId
+        ? accounts.find(a => a.id === body.accountId)
+        : accounts[0]
+
+      if (target) {
+        this.accountPool.updateAccount(target.id, { chatgpt: undefined } as any)
+        proxyLogger.info('ChatGPTAuth', `Logged out ChatGPT from account ${target.id}`)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ success: true, accountId: target.id }))
+      } else {
+        this.sendError(res, 404, 'No ChatGPT account found to logout')
+      }
+    } else {
+      this.sendError(res, 404, 'Unknown auth endpoint')
+    }
   }
 }
