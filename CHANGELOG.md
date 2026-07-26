@@ -113,9 +113,14 @@ Findings from a full-codebase audit. Each was reproduced against the source befo
 - Fixed the web file picker hanging forever when the user cancelled the dialog, which left the
   Import button stuck.
 - Fixed the proxy gateway API key being generated with `Math.random()` instead of a CSPRNG.
-- Fixed hosts-file restoration racing a 3-second force-exit on quit, which could leave
-  `kiro.dev` / `amazonaws.com` / `githubcopilot.com` / `cursor.com` pointed at `127.0.0.1`
-  system-wide with nothing listening.
+- **The backend now restores the hosts file when it shuts down.** K-Proxy points `kiro.dev`,
+  `amazonaws.com`, `githubcopilot.com`, and `cursor.com` at `127.0.0.1` system-wide. Nothing
+  undid that on process exit, so `Ctrl-C`, `systemctl stop`, a deploy restart, or an OOM kill
+  left those domains resolving to a port with no listener — breaking Kiro IDE, Copilot, and
+  Cursor until the user edited the hosts file by hand. `SIGINT`/`SIGTERM` now remove the entries
+  under a dedicated 8-second budget (the elevation prompt on Windows can block), and print a
+  loud, actionable message if removal fails. Only Krouter's own marked block is touched; entries
+  the user added themselves are never modified.
 - Fixed unbounded growth in per-model statistics, API-key usage maps, proxy deletion tombstones,
   and per-account sliding windows and rate-limit budgets.
 - Fixed a tunnel socket leak in the registration chain proxy when the client disconnected during
@@ -124,6 +129,10 @@ Findings from a full-codebase audit. Each was reproduced against the source befo
 
 ### Changed
 
+- **Krouter is now web-only.** The Electron desktop app is gone: no `src/main/index.ts`, no
+  preload bridge, no tray, no electron-builder. What remains is the backend, the dashboard SPA,
+  and the CLI. The proxy core, K-Proxy, and registration automation are unchanged and still live
+  under `src/main/`.
 - Type-checked the previously untyped boundaries: the CodeWhisperer ↔ OpenAI conversion, the
   Chrome DevTools Protocol client, and the schemaless account store now have declared shapes.
   This surfaced five latent null-safety defects that `any` had been hiding.

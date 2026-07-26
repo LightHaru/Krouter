@@ -186,14 +186,20 @@ const browserOverrides: Record<string, unknown> = {
   exportToFile: async (data: string, filename: string) => downloadText(data, filename),
   importFromFile: importTextFile,
   startSocialLogin: async (provider: 'Google' | 'Github', usePrivateMode?: boolean) => {
-    const result = await callBackend<{ success: boolean; loginUrl?: string; state?: string; error?: string }>('startSocialLogin', [provider, usePrivateMode])
+    const result = await callBackend<{ success: boolean; loginUrl?: string; state?: string; error?: string }>(
+      'startSocialLogin',
+      [provider, usePrivateMode]
+    )
     if (result.success && result.loginUrl) {
       window.open(result.loginUrl, '_blank', 'noopener,noreferrer')
     }
     return result
   },
   protonOpenLogin: async () => {
-    const result = await callBackend<{ success: boolean; loggedIn: boolean; loginUrl?: string; error?: string }>('protonOpenLogin', [])
+    const result = await callBackend<{ success: boolean; loggedIn: boolean; loginUrl?: string; error?: string }>(
+      'protonOpenLogin',
+      []
+    )
     if (result.loginUrl) {
       window.open(result.loginUrl, '_blank', 'noopener,noreferrer')
     }
@@ -205,21 +211,8 @@ const browserOverrides: Record<string, unknown> = {
   setProactiveRenewalEnabled: async () => ({
     success: false,
     enabled: false,
-    error: 'Kiro IDE proactive renewal is only available in the desktop application.'
-  }),
-  updateTrayAccount: () => undefined,
-  updateTrayAccountList: () => undefined,
-  refreshTrayMenu: () => undefined,
-  updateTrayLanguage: () => undefined,
-  sendCloseConfirmResponse: () => undefined,
-  window: {
-    minimize: () => undefined,
-    maximizeToggle: () => undefined,
-    close: () => undefined,
-    isMaximized: async () => false,
-    getPlatform: async () => 'darwin' as NodeJS.Platform,
-    onMaximizeChange: () => () => undefined
-  }
+    error: 'Kiro IDE proactive renewal is not available in the web dashboard.'
+  })
 }
 
 export const browserApi = new Proxy(browserOverrides, {
@@ -242,8 +235,5 @@ export const browserApi = new Proxy(browserOverrides, {
 export function installBrowserApi(): void {
   if (!window.api) {
     window.api = browserApi
-  }
-  if (!window.electron) {
-    window.electron = {} as Window['electron']
   }
 }

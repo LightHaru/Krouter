@@ -468,10 +468,10 @@ export class Registrar {
       return { existingPath: finalPath, downloadDir: tlsClientDir }
     }
 
-    // 2. 从打包资源复制（安装包自带）
+    // 2. 从 npm package resources 复制（若随包附带 native lib）
     const resourceCandidates = [
-      path.join(process.resourcesPath || '', filename),
-      path.join(__dirname, '..', '..', '..', 'resources', filename)
+      path.join(__dirname, '..', '..', '..', 'resources', filename),
+      path.join(process.cwd(), 'resources', filename)
     ]
     const resourcePath = resourceCandidates.find((candidate) => fs.existsSync(candidate))
     if (resourcePath) {
@@ -558,21 +558,9 @@ export class Registrar {
 
   /** 清理 TLS 客户端资源：仅销毁 SessionClient；ModuleClient 是进程级共享池，不再每次 terminate */
   private async cleanup(): Promise<void> {
-    // Cửa sổ Proton ẩn (show:false, backgroundThrottling:false) không bao giờ tự đóng: trước đây
-    // chỉ IPC 'proton-close' mới đóng nó, nên sau khi đăng ký xong 'window-all-closed' không bao
-    // giờ kích hoạt, app.quit() không được gọi và Krouter thành tiến trình ma còn nguyên một
-    // renderer Chromium. releaseProtonWindow chỉ đóng khi không còn lượt lấy OTP nào đang chạy,
-    // nên registrar chạy song song không phá cửa sổ của nhau.
-    if (this.cfg.useProton && process.versions.electron) {
-      try {
-        const { releaseProtonWindow } = await import('./proton-mail-window')
-        releaseProtonWindow()
-      } catch (err) {
-        this.log(
-          `[Proton] Không đóng được cửa sổ Proton: ${err instanceof Error ? err.message : String(err)}`
-        )
-      }
-    }
+    // (Đã bỏ bước giải phóng cửa sổ Proton của Electron: app desktop không còn tồn tại.
+    //  Ở kiến trúc web-only, phiên Proton chạy trong Chromium do protonBrowserRuntime điều
+    //  khiển qua CDP và tự quản lý vòng đời của nó.)
     if (this.chainRelay) {
       try {
         await this.chainRelay.stop()

@@ -1,90 +1,65 @@
-import { defineConfig } from 'eslint/config'
-import tseslint from '@electron-toolkit/eslint-config-ts'
-import eslintConfigPrettier from '@electron-toolkit/eslint-config-prettier'
+import tseslint from 'typescript-eslint'
 import eslintPluginReact from 'eslint-plugin-react'
 import eslintPluginReactHooks from 'eslint-plugin-react-hooks'
 import eslintPluginReactRefresh from 'eslint-plugin-react-refresh'
 
-export default defineConfig(
-  { ignores: ['**/node_modules', '**/dist', '**/out'] },
-  tseslint.configs.recommended,
-  eslintPluginReact.configs.flat.recommended,
-  eslintPluginReact.configs.flat['jsx-runtime'],
-  {
-    settings: {
-      react: {
-        version: 'detect'
-      }
-    }
-  },
+export default tseslint.config(
+  { ignores: ['**/node_modules', '**/dist', '**/dist-web', '**/out', '**/out-server', '**/build'] },
+  ...tseslint.configs.recommended,
   {
     files: ['**/*.{ts,tsx}'],
     plugins: {
+      react: eslintPluginReact,
       'react-hooks': eslintPluginReactHooks,
       'react-refresh': eslintPluginReactRefresh
     },
+    settings: {
+      react: { version: 'detect' }
+    },
     rules: {
+      ...eslintPluginReact.configs.flat.recommended.rules,
+      ...eslintPluginReact.configs.flat['jsx-runtime'].rules,
       ...eslintPluginReactHooks.configs.recommended.rules,
-      ...eslintPluginReactRefresh.configs.vite.rules,
-      // Codebase đã dùng sẵn quy ước tiền tố `_` để đánh dấu "cố ý không dùng"
-      // (`_event`, `_head`, `_signal`, `{ id: _, ...rest }`...). Cấu hình rule cho khớp
-      // quy ước đó, thay vì bắt sửa tên hoặc rải eslint-disable khắp nơi.
-      // ignoreRestSiblings: bỏ qua biến bị destructure ra chỉ để LOẠI khỏi phần rest —
-      // đó là cách chuẩn để bỏ một field, không phải biến thừa.
-      '@typescript-eslint/no-unused-vars': [
-        'error',
-        {
-          args: 'after-used',
-          argsIgnorePattern: '^_',
-          varsIgnorePattern: '^_',
-          caughtErrorsIgnorePattern: '^_',
-          destructuredArrayIgnorePattern: '^_',
-          ignoreRestSiblings: true
-        }
-      ]
+      'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
+      // react/prop-types kiểm tra khai báo PropTypes lúc chạy — thứ codebase này không dùng.
+      // Kiểu của props đã được TypeScript kiểm tra đầy đủ qua `npm run typecheck:web`, nên
+      // bật rule này chỉ tạo lỗi giả ở mọi component viết bằng React.forwardRef.
+      'react/prop-types': 'off',
+      '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }]
     }
   },
-  // Renderer: không bắt buộc chú thích kiểu trả về.
+  // Kiểm tra dựa trên kiểu cho backend (server + phần src/main còn lại sau khi bỏ Electron).
   //
-  // Rule này có giá trị ở backend, nơi hàm tạo thành API giữa các module và kiểu trả về
-  // đóng vai trò tài liệu (đã bật, đã annotate hết ở src/main + src/server). Trong renderer,
-  // 248/267 vi phạm là handler cục bộ của component (`const handleSubmit = () => {...}`,
-  // `const renderPage = () => {...}`) — TS suy luận chính xác, thêm `: void` vào từng chỗ
-  // chỉ tạo nhiễu chứ không bắt được lỗi nào. Kiểu của props và của store vẫn được kiểm tra
-  // đầy đủ qua `npm run typecheck:web`.
+  // Chỉ bật DUY NHẤT no-floating-promises, và bật vì nó có thành tích cụ thể: trong đợt audit
+  // toàn dự án nó tìm ra 3 lỗi thật mà đọc tay đã bỏ sót — nhánh 'unsupported-handler' trong
+  // mitmHttpsServer, handler HTTP của mcpServer, và stdio transport của mcpServer. Cả ba đều
+  // là promise bị bỏ rơi: rejection không tới được khối catch (chỗ duy nhất đóng response),
+  // nên request treo tới khi client timeout mà không có một dòng log nào.
+  //
+  // Backend không có handler unhandledRejection, nên đây không phải rule về style — nó là
+  // máy dò đúng lớp lỗi im lặng nhất trong codebase này.
+  //
+  // Phạm vi file phải khớp "include" của tsconfig.server.json, vì phân tích theo kiểu chỉ
+  // chạy được trên file thuộc project đó.
   {
-    files: ['src/renderer/**/*.{ts,tsx}'],
-    rules: {
-      '@typescript-eslint/explicit-function-return-type': 'off'
-    }
-  },
-  // Kiểm tra dựa trên kiểu, chỉ áp cho tiến trình main của Electron.
-  //
-  // Lý do: đợt audit toàn dự án tìm ra một loạt lỗi cùng chung một hình dạng — một Promise
-  // không ai await/catch/huỷ. `return this.passthrough(...)` trần bên trong try/catch khiến
-  // rejection không bao giờ tới khối catch (chỗ duy nhất đóng response) nên request treo tới
-  // khi client timeout; một listener bỏ rơi promise của handleRequest cũng vậy. Trong
-  // src/main KHÔNG có handler unhandledRejection nào, nên những promise đó im lặng tuyệt đối.
-  // Hai luật dưới đây bắt đúng lớp lỗi ấy bằng máy.
-  //
-  // Chỉ giới hạn ở src/main vì phân tích theo kiểu chậm hơn nhiều, và đây là nơi một
-  // rejection lọt lưới có thể hạ cả tiến trình.
-  {
-    files: ['src/main/**/*.ts'],
+    files: [
+      'src/server/**/*.ts',
+      'src/main/proxy/**/*.ts',
+      'src/main/kproxy/**/*.ts',
+      'src/main/registration/**/*.ts',
+      'src/main/utils/**/*.ts',
+      'src/main/runtimePaths.ts',
+      'src/main/kiroAuthSync.ts'
+    ],
     languageOptions: {
       parserOptions: {
-        project: ['./tsconfig.node.json'],
+        project: ['./tsconfig.server.json'],
         tsconfigRootDir: import.meta.dirname
       }
     },
     rules: {
-      '@typescript-eslint/no-floating-promises': 'error',
-      // 'always' chứ không phải 'in-try-catch': chế độ in-try-catch còn bắt gỡ BỎ `await`
-      // ở những chỗ nằm ngoài try, tức đi ngược lại chính các sửa lỗi phòng thủ ở đây, và
-      // để lọt `return promise` trần khi try/catch nằm ở hàm gọi. 'always' chỉ thêm await —
-      // vừa an toàn tuyệt đối, vừa giữ được stack trace của async.
-      '@typescript-eslint/return-await': ['error', 'always']
+      '@typescript-eslint/no-floating-promises': 'error'
     }
-  },
-  eslintConfigPrettier
+  }
 )

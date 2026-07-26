@@ -730,7 +730,7 @@ function mergeAccountData(currentRaw: unknown, incomingRaw: unknown): Record<str
 function unsupported(method: string): { success: false; error: string } {
   return {
     success: false,
-    error: `Web backend handler '${method}' has not been ported from Electron yet.`
+    error: `Web backend handler '${method}' is not implemented.`
   }
 }
 
@@ -1825,21 +1825,6 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
     case 'setUseKProxyForApi':
       await store.setUserSetting(user.id, 'useKProxyForApi', Boolean(args[0]))
       return { success: true, enabled: Boolean(args[0]) }
-    case 'getShowWindowShortcut':
-      return store.getUserSetting(user.id, 'showWindowShortcut', 'Ctrl+Shift+K')
-    case 'setShowWindowShortcut':
-      await store.setUserSetting(user.id, 'showWindowShortcut', args[0])
-      return { success: true }
-    case 'getTraySettings':
-      return store.getUserSetting(user.id, 'traySettings', {
-        enabled: false,
-        closeAction: 'quit',
-        showNotifications: false,
-        minimizeOnStart: false
-      })
-    case 'saveTraySettings':
-      await store.setUserSetting(user.id, 'traySettings', { ...(settings.traySettings as Record<string, unknown> || {}), ...(args[0] as Record<string, unknown> || {}) })
-      return { success: true }
     case 'checkForUpdates':
       return checkForUpdatesManual()
     case 'checkForUpdatesManual':
@@ -2654,6 +2639,46 @@ async function main(): Promise<void> {
     })
   })
 
+  /**
+   * Gỡ block hosts của Krouter khi tắt, nếu nó đang bật.
+   *
+   * Có ngân sách thời gian RIÊNG và nhỏ hơn SHUTDOWN_TIMEOUT_MS: trên Windows không chạy
+   * quyền cao, hostsManager phải nâng quyền để ghi, và thao tác đó có thể chờ người dùng.
+   * Không được để nó nuốt hết ngân sách tắt máy rồi khiến store không kịp lưu.
+   *
+   * Không bao giờ ném ra ngoài — tắt máy phải chạy tiếp dù bước này hỏng.
+   */
+  async function restoreHostsOnShutdown(): Promise<void> {
+    const HOSTS_RESTORE_BUDGET_MS = 8_000
+    try {
+      const { hostsManager } = await import('../main/kproxy/hostsManager')
+      const status = await hostsManager.getStatus()
+      if (!status.enabled) return
+
+      await Promise.race([
+        hostsManager.removeEntries(),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`quá ${HOSTS_RESTORE_BUDGET_MS}ms`)),
+            HOSTS_RESTORE_BUDGET_MS
+          )
+        )
+      ])
+      console.log('[Server] Đã gỡ chuyển hướng hosts')
+    } catch (error) {
+      // In thật to: máy người dùng đang ở trạng thái hỏng DNS và họ cần biết để sửa tay.
+      console.error(
+        '[Server] KHÔNG gỡ được chuyển hướng hosts:',
+        error instanceof Error ? error.message : error
+      )
+      console.error(
+        '[Server] Các tên miền kiro.dev / amazonaws.com / githubcopilot.com / cursor.com có thể ' +
+          'vẫn đang trỏ về 127.0.0.1 trên toàn máy. Hãy chạy lại Krouter rồi tắt chuyển hướng ' +
+          'hosts, hoặc sửa tay file hosts với quyền quản trị.'
+      )
+    }
+  }
+
   // Điểm tắt máy duy nhất của tiến trình: ngừng nhận kết nối mới, dừng tunnel,
   // ghi nốt store rồi mới thoát. Module tunnel không được tự ý gọi process.exit.
   let shuttingDown = false
@@ -2677,6 +2702,18 @@ async function main(): Promise<void> {
         }
         sseClients.clear()
         dashboardTunnelRuntime.stopSync()
+
+        // Gỡ chuyển hướng hosts TRƯỚC khi thoát.
+        //
+        // K-Proxy trỏ kiro.dev / amazonaws.com / githubcopilot.com / cursor.com về 127.0.0.1
+        // trên TOÀN MÁY. Nếu tiến trình chết mà không gỡ, các tên miền đó vẫn trỏ vào một cổng
+        // không còn ai nghe — Kiro IDE, Copilot và Cursor hỏng cho tới khi người dùng sửa tay
+        // file hosts. Trên VPS thì một lần restart hay OOM-kill là đủ để rơi vào trạng thái đó.
+        //
+        // removeEntries() chỉ xoá block nằm giữa marker của Krouter nên entry do người dùng
+        // tự thêm không bao giờ bị đụng tới.
+        await restoreHostsOnShutdown()
+
         await store.save()
       } catch (error) {
         console.error('[Server] Lỗi khi tắt an toàn:', error)

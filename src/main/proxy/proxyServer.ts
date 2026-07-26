@@ -1025,7 +1025,11 @@ export class ProxyServer {
 
       // 先停止接受新连接
       main.close(() => {
-        fallback?.close(() => finish()) || finish()
+        // Viết bằng if/else thay cho `a?.close(cb) || cb()`: biểu thức đó dựa vào việc
+        // optional-chaining trả undefined để rẽ nhánh, đọc rất khó và bị no-unused-expressions
+        // bắt. Hành vi giữ nguyên hoàn toàn.
+        if (fallback) fallback.close(() => finish())
+        else finish()
       })
       fallback?.close()
 
@@ -4183,7 +4187,9 @@ export class ProxyServer {
       }
 
       // API Key 验证（健康检查端点除外）
-      if (path !== '/health' && path !== '/') {
+      // Luồng đăng nhập OAuth của ChatGPT phải gọi được TRƯỚC khi người dùng có API key nào,
+      // nên nhóm /auth/chatgpt/ được miễn kiểm tra (đồng bộ với origin/main).
+      if (path !== '/health' && path !== '/' && !path.startsWith('/auth/chatgpt/')) {
         const authResult = this.validateApiKey(req)
         if (!authResult.valid) {
           const errorMsg = authResult.reason || 'Invalid or missing API key'

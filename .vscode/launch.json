@@ -2,38 +2,27 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Debug Main Process",
+      "name": "Debug Backend",
       "type": "node",
       "request": "launch",
       "cwd": "${workspaceRoot}",
-      "runtimeExecutable": "${workspaceRoot}/node_modules/.bin/electron-vite",
-      "windows": {
-        "runtimeExecutable": "${workspaceRoot}/node_modules/.bin/electron-vite.cmd"
-      },
-      "runtimeArgs": ["--sourcemap"],
+      "program": "${workspaceRoot}/out-server/server/index.js",
+      "args": ["--api-only"],
       "env": {
-        "REMOTE_DEBUGGING_PORT": "9222"
-      }
+        "PORT": "4010"
+      },
+      "console": "integratedTerminal"
     },
     {
-      "name": "Debug Renderer Process",
-      "port": 9222,
-      "request": "attach",
-      "type": "chrome",
-      "webRoot": "${workspaceFolder}/src/renderer",
-      "timeout": 60000,
-      "presentation": {
-        "hidden": true
-      }
-    }
-  ],
-  "compounds": [
-    {
-      "name": "Debug All",
-      "configurations": ["Debug Main Process", "Debug Renderer Process"],
-      "presentation": {
-        "order": 1
-      }
+      "name": "Debug Fullstack Server",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceRoot}",
+      "program": "${workspaceRoot}/out-server/server/index.js",
+      "env": {
+        "PORT": "4010"
+      },
+      "console": "integratedTerminal"
     }
   ]
 }

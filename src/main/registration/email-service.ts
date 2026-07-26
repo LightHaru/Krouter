@@ -920,7 +920,8 @@ export async function waitForOTP(
 /**
  * Proton 点号别名取码源：用一个 Proton 母邮箱（如 evanbartellchae@protonmail.com），
  * 前端用 dotVariants 生成点号变体（evanbar.tellcha.e@protonmail.com）作为每个账号的注册邮箱，
- * 所有变体都进同一个 Proton 收件箱。读码经由主进程的隐藏 Proton 窗口（见 proton-mail-window.ts），
+ * 所有变体都进同一个 Proton 收件箱。读码经由后端控制的 Chromium（见
+ * server/services/protonBrowserRuntime.ts，通过 CDP 驱动），
  * 官方网页负责登录与 PGP 解密，本类只接收前端生成好的具体地址并等待取码。
  */
 export class ProtonWebviewService implements TempEmailService {
@@ -951,10 +952,8 @@ export class ProtonWebviewService implements TempEmailService {
     intervalSec: number,
     signal?: AbortSignal
   ): Promise<string> {
-    const runtime = process.versions.electron
-      ? await import('./proton-mail-window')
-      : await import('../../server/services/protonBrowserRuntime')
-    const { waitProtonOtp } = runtime
+    // Chỉ còn một runtime sau khi bỏ app desktop: Chromium do backend điều khiển qua CDP.
+    const { waitProtonOtp } = await import('../../server/services/protonBrowserRuntime')
     return await waitProtonOtp(this.address, {
       timeoutSec,
       intervalSec,

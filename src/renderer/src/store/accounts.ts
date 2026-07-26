@@ -634,7 +634,7 @@ interface AccountsState {
   autoRefreshSyncInfo: boolean // 刷新时是否同步检测账户信息（用量、订阅、封禁状态）
   statusCheckInterval: number // 分钟
 
-  // 主动续期开关（持久化在 main 进程的 electron-store；这里只是镜像，不写 saveToStorage）
+  // 主动续期开关（web backend settings mirror）
   proactiveRenewalEnabled: boolean
   proactiveRenewalLeadMinutes: number
 
@@ -897,7 +897,7 @@ const defaultSort: AccountSort = { field: 'lastUsedAt', order: 'desc' }
 // 默认筛选
 const defaultFilter: AccountFilter = {}
 
-// 从 localStorage 恢复分组 Tab（遵循 Electron renderer 环境总是可用）
+// 从 localStorage 恢复分组 Tab
 const loadActiveGroupTab = (): string => {
   try {
     return localStorage.getItem('accounts_activeGroupTab') || 'all'
@@ -2560,11 +2560,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   setLanguage: (language) => {
     set({ language })
     get().saveToStorage()
-    // 更新托盘菜单语言
     const actualLang = language === 'auto' 
       ? (navigator.language.startsWith('zh') ? 'zh' : 'en')
       : language
-    window.api.updateTrayLanguage(actualLang)
   },
 
   applyTheme: () => {

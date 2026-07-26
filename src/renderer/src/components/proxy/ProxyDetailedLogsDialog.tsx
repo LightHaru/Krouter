@@ -109,7 +109,7 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
     return localStorage.getItem('proxyLogs_displayLimit') || 'all'
   })
   const scrollRef = useRef<HTMLDivElement>(null)
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const loadLogs = useCallback(async () => {
     try {

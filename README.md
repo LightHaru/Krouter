@@ -15,7 +15,7 @@
     <a href="./package.json"><img src="https://img.shields.io/badge/version-2.0.0-blue" alt="Version"/></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-green" alt="License"/></a>
     <a href="#endpoints"><img src="https://img.shields.io/badge/API-OpenAI%20%7C%20Anthropic%20%7C%20Gemini-orange" alt="API compatibility"/></a>
-    <a href="#run-it"><img src="https://img.shields.io/badge/runtime-desktop%20%2B%20server%20%2B%20CLI-black" alt="Runtime"/></a>
+    <a href="#run-it"><img src="https://img.shields.io/badge/runtime-web%20%2B%20CLI-black" alt="Runtime"/></a>
   </p>
 
   <p>
@@ -235,23 +235,26 @@ Found something? Open an issue at
 ```bash
 npm run dev:web           # dashboard with HMR
 npm run dev:api           # backend in watch mode
-npm run typecheck         # node + web projects
+npm run typecheck         # web + server projects
 npm run test:unit         # unit and property tests
 npm run test:e2e          # end-to-end suite
 npm run build:fullstack   # production build
 ```
 
-Krouter runs on three targets that share the proxy core in `src/main/proxy/`:
+Krouter is web-only. Three pieces share the proxy core in `src/main/proxy/`:
 
-| Target | Entry | Notes |
+| Piece | Entry | Role |
 |---|---|---|
-| Electron desktop | `src/main/index.ts` | IPC to the renderer via `src/preload/` |
-| Standalone server | `src/server/index.ts` | Headless; `handleIpc()` mirrors the Electron IPC surface |
-| CLI | `scripts/krouter-cli.cjs` | Wraps the server |
+| Backend | `src/server/index.ts` | HTTP server, `/api/ipc` dispatch, SSE events, the API proxy |
+| Dashboard | `src/renderer/src/` | React SPA; talks to the backend over `/api/ipc` + `EventSource` |
+| CLI | `scripts/krouter-cli.cjs` | Wraps the backend; authenticates with a private token |
 
-Because two runtimes expose the same API to the renderer, they can drift.
-`test/proxy/ipcParity.test.ts` compares all three surfaces and fails if a method exists in one and
-not the other — add a handler to one runtime and forget the other, and the test tells you.
+The dashboard calls `window.api.someMethod(...)`. That call is served either by an override in
+`src/renderer/src/api/browserApi.ts` (browser-only work like downloading a file) or forwarded to
+`handleIpc()` on the backend. Because the forwarding Proxy synthesizes a function for *any* name,
+a typo or an unimplemented method compiles fine and only fails at runtime — this repo has been
+bitten by exactly that. `test/proxy/ipcParity.test.ts` compares the three surfaces (renderer call
+sites, backend handlers, browser overrides) and fails the build instead.
 
 ---
 

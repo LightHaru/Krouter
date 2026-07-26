@@ -2,46 +2,23 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { AccountManager } from './components/accounts'
 import { Sidebar, TitleBar, type PageType } from './components/layout'
-import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, ProxyPage, UsageAnalyticsPage, KProxyPage, ProxyPoolPage, WebhooksPage, DiagnosePage, ConfigSyncPage, SkillsPage, MITMPage, RegisterPage, SubscriptionPage, LogsPage, DocsPage } from './components/pages'
+import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, ProxyPage, KProxyPage, ProxyPoolPage, WebhooksPage, DiagnosePage, ConfigSyncPage, SkillsPage, MITMPage, RegisterPage, SubscriptionPage, LogsPage, DocsPage } from './components/pages'
 import { useWebhookStore } from './store/webhooks'
 import { UpdateDialog } from './components/UpdateDialog'
-import { CloseConfirmDialog } from './components/CloseConfirmDialog'
 import { useAccountsStore } from './store/accounts'
-import {
-  accountProviderFromLocation,
-  accountProviderToHash,
-  customApiProviderIdFromLocation,
-  customApiProviderToHash,
-  pageFromLocation,
-  pageToHash,
-  type AccountProviderRoute
-} from './lib/docsRoute'
+import { pageFromPath } from './lib/docsRoute'
 import { useIsMobile } from './hooks/useIsMobile'
 
-// 托盘信息防抖延迟：后台刷新风暴时合并多次跨进程 IPC 为单次
-const TRAY_UPDATE_DEBOUNCE_MS = 400
 // 后台刷新结果批量化间隔：N 条结果合并到一次 set，避免 N 次 Map 全量复制 + 渲染抖动
 const BACKGROUND_RESULT_FLUSH_MS = 120
 const BACKEND_ACCOUNT_SYNC_INTERVAL_MS = 10000
 const BACKEND_ACCOUNT_SYNC_DEBOUNCE_MS = 800
 
 function App(): React.JSX.Element {
-  const [currentPage, setCurrentPage] = useState<PageType>(() => (
-    pageFromLocation(window.location.pathname, window.location.hash) || 'home'
-  ))
-  const [accountProvider, setAccountProvider] = useState<AccountProviderRoute>(() => (
-    accountProviderFromLocation(window.location.pathname, window.location.hash)
-  ))
-  const [customApiProviderId, setCustomApiProviderId] = useState<string | null>(() => (
-    customApiProviderIdFromLocation(window.location.pathname, window.location.hash)
-  ))
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('krouter_sidebar_collapsed') === 'true')
+  const [currentPage, setCurrentPage] = useState<PageType>('home')
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const isMobile = useIsMobile()
-
-  useEffect(() => {
-    localStorage.setItem('krouter_sidebar_collapsed', String(sidebarCollapsed))
-  }, [sidebarCollapsed])
 
   // Đóng drawer khi thoát chế độ mobile (tránh kẹt overlay khi phóng to cửa sổ).
   useEffect(() => {
@@ -58,75 +35,19 @@ function App(): React.JSX.Element {
     return () => window.removeEventListener('keydown', onKey)
   }, [mobileNavOpen])
 
-  const loadFromStorage = useAccountsStore(state => state.loadFromStorage)
-  const startAutoTokenRefresh = useAccountsStore(state => state.startAutoTokenRefresh)
-  const stopAutoTokenRefresh = useAccountsStore(state => state.stopAutoTokenRefresh)
-  const applyBackgroundRefreshResults = useAccountsStore(state => state.applyBackgroundRefreshResults)
-  const applyBackgroundCheckResults = useAccountsStore(state => state.applyBackgroundCheckResults)
-  const applyProxyAccountUpdate = useAccountsStore(state => state.applyProxyAccountUpdate)
-  const flushSaveImmediately = useAccountsStore(state => state.flushSaveImmediately)
-  const accounts = useAccountsStore(state => state.accounts)
-  const activeAccountId = useAccountsStore(state => state.activeAccountId)
-  const setActiveAccount = useAccountsStore(state => state.setActiveAccount)
-  const checkAndRefreshExpiringTokens = useAccountsStore(state => state.checkAndRefreshExpiringTokens)
-  const updateAccountStatus = useAccountsStore(state => state.updateAccountStatus)
+  const {
+    loadFromStorage,
+    startAutoTokenRefresh,
+    stopAutoTokenRefresh,
+    applyBackgroundRefreshResults,
+    applyBackgroundCheckResults,
+    applyProxyAccountUpdate,
+    flushSaveImmediately,
+    updateAccountStatus
+  } = useAccountsStore()
 
-  // 切换到下一个可用账户
-  const switchToNextAccount = useCallback(() => {
-    const activeAccounts = Array.from(accounts.values()).filter(acc => acc.status === 'active')
-    if (activeAccounts.length <= 1) return
-
-    const currentIndex = activeAccounts.findIndex(acc => acc.id === activeAccountId)
-    const nextIndex = (currentIndex + 1) % activeAccounts.length
-    setActiveAccount(activeAccounts[nextIndex].id)
-  }, [accounts, activeAccountId, setActiveAccount])
-
-  // 托盘信息防抖：账号 Map 频繁变更（后台刷新风暴）时合并 N 次 IPC 为 1 次
-  const trayDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const backendAccountSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const backendAccountSyncInFlightRef = useRef(false)
-  const updateTrayInfo = useCallback(() => {
-    if (trayDebounceRef.current) clearTimeout(trayDebounceRef.current)
-    trayDebounceRef.current = setTimeout(() => {
-      trayDebounceRef.current = null
-      const currentState = useAccountsStore.getState()
-      const currentAccounts = currentState.accounts
-      const currentActiveId = currentState.activeAccountId
-
-      const accountList = Array.from(currentAccounts.values()).map(acc => ({
-        id: acc.id,
-        email: acc.email || 'Unknown',
-        idp: acc.idp || 'Unknown',
-        status: acc.status
-      }))
-      window.api.updateTrayAccountList(accountList)
-
-      if (currentActiveId) {
-        const activeAccount = currentAccounts.get(currentActiveId)
-        if (activeAccount) {
-          window.api.updateTrayAccount({
-            id: activeAccount.id,
-            email: activeAccount.email || 'Unknown',
-            idp: activeAccount.idp || 'Unknown',
-            status: activeAccount.status,
-            subscription: activeAccount.subscription?.title || undefined,
-            usage: activeAccount.usage ? {
-              usedCredits: activeAccount.usage.current || 0,
-              totalCredits: activeAccount.usage.limit || 0,
-              totalRequests: 0,
-              successRequests: 0,
-              failedRequests: 0
-            } : undefined
-          })
-        } else {
-          window.api.updateTrayAccount(null)
-        }
-      } else {
-        window.api.updateTrayAccount(null)
-      }
-    }, TRAY_UPDATE_DEBOUNCE_MS)
-  }, [])
-
   const syncAccountsFromBackend = useCallback((delayMs = 0): void => {
     if (backendAccountSyncTimerRef.current) clearTimeout(backendAccountSyncTimerRef.current)
     backendAccountSyncTimerRef.current = setTimeout(() => {
@@ -147,7 +68,6 @@ function App(): React.JSX.Element {
     loadFromStorage().then(() => {
       startAutoTokenRefresh()
     })
-    // 同步主动续期开关（持久化在 main 进程的 electron-store）
     useAccountsStore.getState().loadProactiveRenewalEnabled()
     // 加载 Webhook 配置
     useWebhookStore.getState().loadFromStorage()
@@ -223,68 +143,43 @@ function App(): React.JSX.Element {
     return () => { unsubscribe?.() }
   }, [])
 
-  const navigateToPage = useCallback((page: PageType): void => {
-    setCurrentPage(page)
-    if (page === 'accounts') setAccountProvider('kiro')
-    const nextHash = pageToHash(page)
-    if (window.location.hash === nextHash) return
-    try {
-      window.history.pushState({ page }, '', nextHash)
-    } catch {
-      window.location.hash = nextHash
-    }
-  }, [])
-
-  const navigateToAccountProvider = useCallback((provider: AccountProviderRoute): void => {
-    setCurrentPage('accounts')
-    setAccountProvider(provider)
-    setCustomApiProviderId(null)
-    const nextHash = accountProviderToHash(provider)
-    if (window.location.hash === nextHash) return
-    try {
-      window.history.pushState({ page: 'accounts', provider }, '', nextHash)
-    } catch {
-      window.location.hash = nextHash
-    }
-  }, [])
-
-  const navigateToCustomApiProvider = useCallback((providerId: string | null): void => {
-    setCurrentPage('accounts')
-    setAccountProvider('customApi')
-    setCustomApiProviderId(providerId)
-    const nextHash = providerId ? customApiProviderToHash(providerId) : accountProviderToHash('customApi')
-    if (window.location.hash === nextHash) return
-    try {
-      window.history.pushState({ page: 'accounts', provider: 'customApi', providerId }, '', nextHash)
-    } catch {
-      window.location.hash = nextHash
-    }
-  }, [])
-
-  // Restore the selected page on refresh and support browser/Electron back-forward.
+  // Đồng bộ URL cho deep-link /docs (không dùng router; chỉ History API).
+  // Mount: nếu vào thẳng /docs thì mở trang docs. popstate: đồng bộ back/forward.
   useEffect(() => {
-    const syncPageFromUrl = (): void => {
-      setCurrentPage(pageFromLocation(window.location.pathname, window.location.hash) || 'home')
-      setAccountProvider(accountProviderFromLocation(window.location.pathname, window.location.hash))
-      setCustomApiProviderId(customApiProviderIdFromLocation(window.location.pathname, window.location.hash))
+    if (pageFromPath(window.location.pathname) === 'docs') {
+      setCurrentPage('docs')
     }
-    window.addEventListener('popstate', syncPageFromUrl)
-    window.addEventListener('hashchange', syncPageFromUrl)
-    return () => {
-      window.removeEventListener('popstate', syncPageFromUrl)
-      window.removeEventListener('hashchange', syncPageFromUrl)
+    const onPop = (): void => {
+      const isDocs = pageFromPath(window.location.pathname) === 'docs'
+      setCurrentPage((prev) => (isDocs ? 'docs' : prev === 'docs' ? 'home' : prev))
     }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
   }, [])
+
+  // Khi currentPage đổi: đồng bộ URL /docs <-> /. Giới hạn ở /docs để tránh hồi quy.
+  useEffect(() => {
+    try {
+      const isDocsPath = pageFromPath(window.location.pathname) === 'docs'
+      if (currentPage === 'docs' && !isDocsPath) {
+        window.history.pushState(null, '', '/docs')
+      } else if (currentPage !== 'docs' && isDocsPath) {
+        window.history.pushState(null, '', '/')
+      }
+    } catch {
+      // pushState best-effort; điều hướng state vẫn hoạt động nếu URL không đổi.
+    }
+  }, [currentPage])
 
   // 应用内页面跳转（轻量 CustomEvent，供深层组件无需 prop 钻取即可切页）
   useEffect(() => {
     const handler = (e: Event): void => {
       const detail = (e as CustomEvent<PageType>).detail
-      if (detail) navigateToPage(detail)
+      if (detail) setCurrentPage(detail)
     }
     window.addEventListener('navigate-page', handler)
     return () => window.removeEventListener('navigate-page', handler)
-  }, [navigateToPage])
+  }, [])
 
   // 关闭/刷新前强制 flush 防抖中的待保存数据，防止数据丢失
   useEffect(() => {
@@ -292,35 +187,11 @@ function App(): React.JSX.Element {
     window.addEventListener('beforeunload', handleBeforeUnload)
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload)
-      if (trayDebounceRef.current) clearTimeout(trayDebounceRef.current)
     }
   }, [flushSaveImmediately])
 
-  // 账户/激活变化时触发托盘更新（内部防抖 + 直接从 store 读取最新数据，避免 stale closure）
-  useEffect(() => {
-    updateTrayInfo()
-  }, [accounts, activeAccountId, updateTrayInfo])
 
-  // 监听托盘刷新账户事件
-  useEffect(() => {
-    const unsubscribe = window.api.onTrayRefreshAccount(() => {
-      checkAndRefreshExpiringTokens()
-      updateTrayInfo()
-    })
-    return () => {
-      unsubscribe()
-    }
-  }, [checkAndRefreshExpiringTokens, updateTrayInfo])
 
-  // 监听托盘切换账户事件
-  useEffect(() => {
-    const unsubscribe = window.api.onTraySwitchAccount(() => {
-      switchToNextAccount()
-    })
-    return () => {
-      unsubscribe()
-    }
-  }, [switchToNextAccount])
 
   // 监听后台刷新结果：缓冲 + 批量化 flush，N 条结果合并为一次 set，消除 Map 复制风暴
   useEffect(() => {
@@ -406,22 +277,13 @@ function App(): React.JSX.Element {
       case 'home':
         return <HomePage />
       case 'accounts':
-        return (
-          <AccountManager
-            provider={accountProvider}
-            customApiProviderId={customApiProviderId}
-            onProviderChange={navigateToAccountProvider}
-            onCustomApiProviderChange={navigateToCustomApiProvider}
-          />
-        )
+        return <AccountManager />
       case 'machineId':
         return <MachineIdPage />
       case 'kiroSettings':
         return <KiroSettingsPage />
       case 'proxy':
         return <ProxyPage />
-      case 'usage':
-        return <UsageAnalyticsPage />
       case 'kproxy':
         return <KProxyPage />
       case 'mitm':
@@ -454,14 +316,14 @@ function App(): React.JSX.Element {
   }
 
   return (
-    <div className={`app-shell ambient-bg${currentPage === 'mitm' ? ' ambient-static' : ''}`}>
-      <TitleBar currentPage={currentPage} showMenuButton={isMobile} onMenuClick={() => setMobileNavOpen(true)} />
+    <div className="app-shell ambient-bg">
+      <TitleBar showMenuButton={isMobile} onMenuClick={() => setMobileNavOpen(true)} />
       <div className="app-workspace">
         {/* Desktop: sidebar tĩnh. Mobile: ẩn, thay bằng drawer bên dưới. */}
         {!isMobile && (
           <Sidebar
             currentPage={currentPage}
-            onPageChange={navigateToPage}
+            onPageChange={setCurrentPage}
             collapsed={sidebarCollapsed}
             onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
           />
@@ -485,7 +347,7 @@ function App(): React.JSX.Element {
       {/* Mobile sidebar drawer */}
       <AnimatePresence>
         {isMobile && mobileNavOpen && (
-          <div className="fixed inset-0 z-[9997]" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          <div className="fixed inset-0 z-[9997]">
             <motion.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
@@ -504,7 +366,7 @@ function App(): React.JSX.Element {
               <Sidebar
                 variant="drawer"
                 currentPage={currentPage}
-                onPageChange={navigateToPage}
+                onPageChange={setCurrentPage}
                 collapsed={false}
                 onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
                 onNavigate={() => setMobileNavOpen(false)}
@@ -515,7 +377,6 @@ function App(): React.JSX.Element {
       </AnimatePresence>
 
       <UpdateDialog />
-      <CloseConfirmDialog />
     </div>
   )
 }
