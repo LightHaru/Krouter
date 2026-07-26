@@ -1,5 +1,6 @@
-import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
+import { fetch as undiciFetch, Agent, type RequestInit as UndiciRequestInit } from 'undici'
 import { safeCreateProxyAgent } from '../../main/proxy/systemProxy'
+import { createDirectDispatcher } from '../../main/proxy/directDispatcher'
 
 const KIRO_AUTH_ENDPOINT = 'https://prod.us-east-1.auth.desktop.kiro.dev'
 const KIRO_VERSION = '0.6.18'
@@ -135,6 +136,29 @@ function isApiKeyCredential(input: { authMethod?: string; provider?: string; kir
 function getApiKeyCredential(input: { kiroApiKey?: string; accessToken?: string }): string | undefined {
   const key = input.kiroApiKey?.trim() || input.accessToken?.trim()
   return key || undefined
+}
+
+let directDispatcher: Agent | null = null
+function getDirectDispatcher(): Agent {
+  if (!directDispatcher) {
+    directDispatcher = createDirectDispatcher(12)
+  }
+  return directDispatcher
+}
+
+function isRetryableNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const causeMessage = error.cause instanceof Error ? error.cause.message : ''
+  const message = `${error.message} ${causeMessage}`.toLowerCase()
+  return message.includes('fetch failed')
+    || message.includes('econnreset')
+    || message.includes('enetunreach')
+    || message.includes('ehostunreach')
+    || message.includes('enotfound')
+    || message.includes('etimedout')
+    || message.includes('timeout')
+    || message.includes('socket hang up')
+    || message.includes('tls')
 }
 
 function buildKiroRestHeaders(input: {
@@ -285,12 +309,20 @@ function subscriptionTypeFromTitle(title: string): string {
 async function fetchWithOptionalProxy(url: string, init: RequestInit, proxyUrl?: string): Promise<Response> {
   const agent = safeCreateProxyAgent(proxyUrl)
   if (agent) {
-    return await undiciFetch(url, { ...init, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+    try {
+      return await undiciFetch(url, { ...init, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+    } catch (error) {
+      if (isRetryableNetworkError(error)) {
+        console.warn(`[KiroAccounts] Proxy fetch failed for ${url}; retrying direct once: ${error instanceof Error ? error.message : String(error)}`)
+        return await undiciFetch(url, { ...init, dispatcher: getDirectDispatcher() } as UndiciRequestInit) as unknown as Response
+      }
+      throw error
+    }
   }
   if (proxyUrl) {
-    throw new Error('Account-bound proxy is configured but could not be used for credential request')
+    console.warn('[KiroAccounts] Account-bound proxy is configured but could not be used for credential request; falling back to direct')
   }
-  return fetch(url, init)
+  return await undiciFetch(url, { ...init, dispatcher: getDirectDispatcher() } as UndiciRequestInit) as unknown as Response
 }
 
 async function refreshOidcToken(input: Required<Pick<CredentialInput, 'refreshToken' | 'clientId' | 'clientSecret'>> & { region: string; proxyUrl?: string }): Promise<RefreshResult> {

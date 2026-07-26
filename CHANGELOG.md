@@ -2,6 +2,142 @@
 
 All notable Krouter changes are tracked here.
 
+## 2.0.0 - 2026-07-26
+
+Krouter is no longer a Kiro-only router. This release adds three more upstream families
+(ChatGPT/Codex, Bedrock images, and arbitrary OpenAI/Anthropic-compatible providers), an
+optional MITM mode that redirects IDE traffic without touching the IDE's own configuration,
+and per-request usage analytics. It also lands a full-codebase audit: 25 defects fixed,
+`no-explicit-any` eliminated from `src/`, and the lint baseline taken to zero errors.
+
+### Added
+
+- **ChatGPT / Codex upstream.** OAuth device-code sign-in with token rotation, a multi-account
+  pool with automatic failover, and per-account quota windows. Serves the `gpt-5.6-sol`,
+  `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, and
+  `gpt-5.3-codex-spark` models with configurable reasoning effort.
+- **Custom API providers.** Register any OpenAI- or Anthropic-compatible endpoint as an upstream,
+  with per-provider base URL, credentials, model allow-list, and a connection test action.
+- **Usage analytics.** Per-request accounting persisted across restarts, aggregated over
+  `today` / `24h` / `7d` / `30d` / `60d` / `all`, broken down by model, account, API key, and
+  endpoint, with a dedicated dashboard page.
+- **MITM HTTPS mode (K-Proxy Phase 12).** A local HTTPS listener plus optional hosts-file
+  redirection that routes Kiro, Copilot, Antigravity, and Cursor traffic through Krouter
+  without editing each IDE's settings. Includes its own root CA, per-host certificate
+  generation, a model-mapping table, and startup diagnostics.
+- **Image generation.** Free image generation over the ChatGPT OAuth session and an Amazon
+  Bedrock image path, exposed at `/v1/images/generations` with a `krouter-image` skill.
+- **MCP server.** Krouter exposes its own account/quota tools over MCP at `/mcp`.
+- **Endpoint catalog in the dashboard.** Every served route is now listed in one place:
+  `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/anthropic/v1/messages`,
+  `/v1/messages/count_tokens`, `/v1beta/models/:model:generateContent` (+ streaming),
+  `/v1/images/generations`, `/v1/models`, `/mcp`, and the skills routes.
+- **Dashboard tunnel.** Publish the local dashboard through a tunnel and read its status from
+  the Proxy page.
+- **Manual token injection** for accounts whose credentials are obtained outside Krouter, plus
+  a VPS helper script.
+- **IPC parity test.** A static test that compares the Electron `ipcMain` surface, the preload
+  API, and the standalone server's `handleIpc` dispatch, so a handler added to one runtime and
+  forgotten in the other now fails CI instead of failing silently at runtime.
+
+### Fixed
+
+Findings from a full-codebase audit. Each was reproduced against the source before the fix.
+
+- **ChatGPT account state was silently discarded.** `persistChatGPTAccounts()` replaced the live
+  account array with a fresh copy on every save, so the account object already returned to the
+  caller was detached. Per-request usage counters were lost on every successful Codex request,
+  and a refresh token rotated for the second or later account in a failover chain was overwritten
+  by the next save — bricking that account after a restart.
+- **Peer-synced accounts were dropped while the API reported success.** The merge step only
+  re-keyed on a collision with a *live* account, never with a deletion tombstone, so
+  `enforceDeletionTombstones` deleted the account immediately after it was written. The response
+  was built from the pre-filter data, so `added` and `addedAccountIds` reported accounts the
+  store had discarded. Tombstones are also produced by automatic proxy maintenance, so this
+  triggered without any user action.
+- **MITM corrupted non-ASCII request bodies.** The TLS-plaintext stream was accumulated as a
+  JavaScript string, so a multi-byte character split across two TCP reads became U+FFFD and the
+  byte count no longer matched `Content-Length`. Any Vietnamese, CJK, or emoji prompt passing
+  through K-Proxy could reach AWS malformed. Header/body splitting is now done on `Buffer`.
+- **Backend schedulers were starved by dashboard autosave.** `saveAccounts` unconditionally
+  re-armed the token-refresh and proxy-maintenance timers, and the dashboard autosaves every
+  30 seconds, so a 5-minute or 30-minute interval never elapsed while a dashboard tab was open.
+  On a headless VPS, tokens expired with nothing refreshing them.
+- **Expired tokens were marked as fresh.** The sanitized SSE payload dropped `accessToken` but
+  kept `expiresIn`; the renderer fell back to the *old* token and gave it the *new* expiry,
+  overwriting the server's correct write-back. Nothing refreshed the account afterwards.
+- **Accounts failing 401/403 were never cooled down.** Unlike the 429, billing, and 5xx branches,
+  the auth-failure branch rotated away without recording the failure, so the dead account stayed
+  fully available and was re-selected on the next request — spending a real SSO refresh each time.
+- **"Reset pool" could leave the pool unusable.** `reset()` cleared account state but not the
+  rate-limit budgets or sliding windows, so under the `smart` strategy every account was still
+  skipped and the next request returned `503 no_eligible_account`.
+- **Requests could hang with no response.** In the MITM HTTPS server, six `return this.passthrough(...)`
+  sites inside `try/catch` returned the promise without awaiting it, so a rejection was adopted
+  after the `try` frame had popped and never reached the `catch` that writes the error response.
+  The same class of bug was fixed in the MCP HTTP handler and stdio transport.
+- **K-Proxy could report "running" with nothing listening.** A failed `listen()` (for example
+  `EADDRINUSE`) left the server object in place, and `isRunning()` was derived from that object,
+  so status reported running, the start guard short-circuited every retry as successful, and the
+  UI toggle flipped back on.
+- **Rotating proxies without credentials had their URL corrupted.** The session-token splice
+  assumed a `user:pass@` segment; without one it inserted the token before the final character,
+  producing an unusable URL that could not be recovered because the original was cleared.
+- **Abandoned registration steps destroyed the next attempt's TLS session.** `withTimeout()`
+  rejected without cancelling the wrapped work, which then called `rebuildTlsClient()` on shared
+  state belonging to the retry. Attempts now carry a generation counter and stale work stops
+  before mutating shared state.
+- **A transient mail-server error hid the OTP permanently.** TempMail.Plus marked a message as
+  checked *before* fetching it, so one failed read removed that message from consideration for
+  the rest of the polling window.
+- Fixed the webhook trigger never being wired in the web/headless runtime, so
+  `proxy-account-suspended`, `proxy-all-exhausted`, and `proxy-pool-low` produced no alert.
+- Fixed MITM being impossible to start from the web dashboard whenever the proxy ran on a port
+  other than 5580, because the server runtime never injected the configured router port.
+- Fixed the Kiro Settings model dropdown listing the aggregated proxy catalog (Bedrock, custom
+  API, ChatGPT) instead of Kiro models, so users saved model ids Kiro IDE cannot resolve.
+- Fixed steering filenames containing Vietnamese, CJK, or accented characters being rejected by
+  every steering handler while still being listed in the UI.
+- Fixed image content being dropped from Codex chat requests, so the model answered as if no
+  image had been attached while the request still returned `200`.
+- Fixed `/v1/responses` returning `502` for OpenAI-compatible providers that omit `usage`.
+- Fixed Gemini streaming skipping usage accounting when the client disconnected, so exhausted
+  accounts still looked like they had quota.
+- Fixed whitespace-only stream deltas being discarded, which diverged from the non-streaming and
+  Gemini paths and could drop indentation inside code blocks.
+- Fixed the clipboard failing silently on the HTTP dashboard (`navigator.clipboard` is
+  secure-context only) — all 26 copy actions now share one helper with an `execCommand` fallback.
+- Fixed an expired session leaving the dashboard in a broken state: `/api/ipc` 401s are now
+  surfaced, the SSE reconnect uses exponential backoff instead of a flat 2-second loop, and the
+  login screen reappears.
+- Fixed the web file picker hanging forever when the user cancelled the dialog, which left the
+  Import button stuck.
+- Fixed the proxy gateway API key being generated with `Math.random()` instead of a CSPRNG.
+- Fixed hosts-file restoration racing a 3-second force-exit on quit, which could leave
+  `kiro.dev` / `amazonaws.com` / `githubcopilot.com` / `cursor.com` pointed at `127.0.0.1`
+  system-wide with nothing listening.
+- Fixed unbounded growth in per-model statistics, API-key usage maps, proxy deletion tombstones,
+  and per-account sliding windows and rate-limit budgets.
+- Fixed a tunnel socket leak in the registration chain proxy when the client disconnected during
+  dial, and a missing overall timeout on the OTP wait step.
+- Fixed `save-mcp-server` throwing an opaque error when `mcp.json` lacked an `mcpServers` key.
+
+### Changed
+
+- Type-checked the previously untyped boundaries: the CodeWhisperer ↔ OpenAI conversion, the
+  Chrome DevTools Protocol client, and the schemaless account store now have declared shapes.
+  This surfaced five latent null-safety defects that `any` had been hiding.
+- Removed `any` from `src/` entirely and took the lint baseline to zero errors.
+- Enabled type-aware `no-floating-promises` and `return-await` for `src/main`, where an unhandled
+  rejection can take down the process.
+- Raised the Vitest timeout to 30s. The previous 5s default caused a test to time out under
+  full-suite load and leak async work into the next test's assertions.
+
+### Removed
+
+- Removed a write-only string accumulator from both streaming paths that grew for the lifetime of
+  every request without ever being read.
+
 ## 1.9.0 - 2026-06-23
 
 ### Added

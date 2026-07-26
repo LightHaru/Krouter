@@ -124,7 +124,7 @@ export const DEFAULT_PROXY_POOL_CONFIG: ProxyPoolConfig = {
   failureThreshold: 3,
   testUrl: 'https://api.ipify.org?format=json',
   testTimeoutMs: 8000,
-  maxUsableLatencyMs: 1000,
+  maxUsableLatencyMs: 2500,
   autoValidateIntervalMin: 0,
   autoValidateConcurrency: 5,
   upstreamProxy: '',

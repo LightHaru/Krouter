@@ -28,7 +28,7 @@ let openPromise: Promise<ModuleClient> | null = null
  */
 export async function acquireModuleClient(opts: AcquireOpts): Promise<ModuleClient> {
   if (shared) return shared
-  if (openPromise) return openPromise
+  if (openPromise) return await openPromise
   openPromise = (async () => {
     const mc = new ModuleClient(opts)
     await mc.open()

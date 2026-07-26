@@ -145,6 +145,8 @@ interface RemoteAccountSyncResult {
   skipped?: number
   remoteTotal?: number
   addedAccountIds?: string[]
+  /** Account đã merge nhưng bị store loại bỏ khi ghi (ví dụ trùng deletion tombstone). */
+  droppedAccountIds?: string[]
   skippedAccountIds?: string[]
   skippedAccounts?: Array<{
     id: string
@@ -673,11 +675,18 @@ interface KiroApi {
 
   // 获取反代服务器状态
   proxyGetStatus: () => Promise<{ running: boolean; config: unknown; stats: unknown; sessionStats?: { totalRequests: number; successRequests: number; failedRequests: number; startTime: number } }>
+  proxyGetUsageAnalytics: (input?: { period?: 'today' | '24h' | '7d' | '30d' | '60d' | 'all'; recentLimit?: number }) => Promise<unknown>
+  proxyClearUsageAnalytics: () => Promise<{ success: boolean }>
+
+  // Dashboard Tunnel: KHÔNG được preload expose nữa (không có ipcMain handler trong src/main).
+  // Khai báo là tùy chọn (?) để phản ánh đúng thực tế lúc chạy — renderer đã dò bằng
+  // `typeof window.api.dashboardTunnelStart !== 'function'` nên UI sẽ tự ẩn đi.
+  // Không xóa hẳn vì src/renderer vẫn tham chiếu tới các tên này và typecheck:web sẽ hỏng.
+  dashboardTunnelGetStatus?: () => Promise<{ running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }>
+  dashboardTunnelStart?: (input?: { localUrl?: string; binary?: string }) => Promise<{ success: boolean; status: { running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }; error?: string }>
+  dashboardTunnelStop?: () => Promise<{ success: boolean; status: { running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }; error?: string }>
 
   // 重置累计 credits
-  dashboardTunnelGetStatus: () => Promise<{ running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }>
-  dashboardTunnelStart: (input?: { localUrl?: string; binary?: string }) => Promise<{ success: boolean; status: { running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }; error?: string }>
-  dashboardTunnelStop: () => Promise<{ success: boolean; status: { running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }; error?: string }>
 
   proxyResetCredits: () => Promise<{ success: boolean }>
 
@@ -729,7 +738,13 @@ interface KiroApi {
   proxyRefreshModels: () => Promise<{ success: boolean; error?: string }>
 
   // 获取可用模型列表
-  proxyGetModels: () => Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string; tier?: 'premium' | 'standard'; servableTiers?: string[]; availableInPool?: boolean; availableForPool?: boolean; probedOk?: boolean; probeResults?: Array<{ modelId: string; tier: string; ok: boolean; error?: string; latencyMs?: number; checkedAt: number }> }>; fromCache?: boolean }>
+  proxyGetModels: () => Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string; supportsThinking?: boolean; thinkingEfforts?: string[]; modelProvider?: string; tier?: 'premium' | 'standard'; servableTiers?: string[]; availableInPool?: boolean; availableForPool?: boolean; probedOk?: boolean; probeResults?: Array<{ modelId: string; tier: string; ok: boolean; error?: string; latencyMs?: number; checkedAt: number }> }>; fromCache?: boolean }>
+  chatgptOAuthGetStatus: () => Promise<{ enabled: boolean; experimental: boolean; catalogVersion: string; reasoningEffort: string; reasoningEfforts: string[]; models: Array<{ id: string; name: string; capabilities: string[]; thinkingEfforts: string[]; availability: 'unverified' | 'available' | 'unavailable'; availableAccounts: number }>; accounts: Array<{ id: string; email?: string; plan?: string; tokenValid: boolean; expiresAt: number; imageQuota?: { used: number; limit: number; resetAt: number }; quotaWindows?: Array<{ key: string; label: string; usedPercent?: number; remainingPercent?: number; resetAt?: number; limitWindowSeconds?: number }>; quotaSyncedAt?: number; quotaError?: string; modelAvailability?: Record<string, 'unverified' | 'available' | 'unavailable'>; localUsage?: { requests: number; inputTokens: number; outputTokens: number; lastRequestAt?: number }; lastRefreshAt?: number; lastError?: string; lastImageGen?: number; failures: number; createdAt: number; updatedAt: number }>; totalAccounts: number; availableForImageGen: number; availableForCodex: number; oauthFlowPending: boolean; pendingFlow?: { id: string; mode: 'local' | 'manual'; startedAt: number; expiresAt: number }; lastError?: string; lastCompletedAt?: number }>
+  chatgptOAuthStart: () => Promise<{ success: boolean; authUrl?: string; flowId?: string; mode?: 'local' | 'manual'; expiresAt?: number; error?: string }>
+  chatgptOAuthSubmitCallback: (callbackUrl: string) => Promise<{ success: boolean; error?: string }>
+  chatgptOAuthRefresh: (accountId?: string) => Promise<{ success: boolean; refreshed: number; errors: number; error?: string }>
+  chatgptOAuthCancel: () => Promise<{ success: boolean; error?: string }>
+  chatgptOAuthLogout: (accountId?: string) => Promise<{ success: boolean; accountId?: string; error?: string }>
   // "Test thật": live-probe từng model theo tier tài khoản
   proxyProbeModels: (input?: { modelIds?: string[]; concurrency?: number }) => Promise<{ success: boolean; error?: string; results?: Array<{ modelId: string; tier: string; ok: boolean; error?: string; latencyMs?: number; accountId?: string; checkedAt: number }> }>
   proxyGetModelProbeResults: () => Promise<{ success: boolean; results: Array<{ modelId: string; tier: string; ok: boolean; error?: string; latencyMs?: number; accountId?: string; checkedAt: number }> }>
@@ -737,8 +752,9 @@ interface KiroApi {
   onModelProbeComplete: (callback: (data: { total: number }) => void) => () => void
   proxyTestBedrock: (input: { accessKeyId?: string; secretAccessKey?: string; sessionToken?: string; region?: string }) => Promise<{ success: boolean; region?: string; error?: string; models?: Array<{ id: string; name?: string; provider?: string; kind: 'foundation' | 'profile' }> }>
   proxyTestXpixi: (input: { apiKey?: string; baseUrl?: string }) => Promise<{ success: boolean; error?: string; models?: Array<{ id: string }> }>
+  proxyTestCustomApi: (input: { id: string; name: string; enabled: boolean; protocol: 'openai' | 'anthropic'; authType?: 'bearer' | 'x-api-key'; apiKey?: string; baseUrl: string; routePrefix?: string; models?: string[]; customHeaders?: Record<string, string>; keys?: Array<{ id: string; name: string; apiKey: string; enabled: boolean; createdAt?: number; lastTestedAt?: number; lastError?: string }>; reasoningEffort?: 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'; modelDiscoveryMode?: 'auto' | 'manual'; modelsSyncedAt?: number; modelsSyncError?: string }) => Promise<{ success: boolean; error?: string; models?: Array<{ id: string; upstreamId: string; name?: string; providerId: string; providerName: string }> }>
 
-  proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null }> }) => Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; apiKey?: { id?: string; name?: string; key: string }; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }>
+  proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; supportsThinking?: boolean; thinkingEfforts?: string[]; modelProvider?: string }>; reasoningEffort?: string }) => Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; apiKey?: { id?: string; name?: string; key: string }; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }>
 
   // 获取账户可用模型列表
   accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }> }>
@@ -805,6 +821,15 @@ interface KiroApi {
 
   // 获取 K-Proxy 状态
   kproxyGetStatus: () => Promise<{ running: boolean; config: unknown; stats: unknown; caInfo: unknown }>
+
+  kproxyGetHostsStatus: () => Promise<{ enabled: boolean; entries: Array<{ ip: string; hostname: string; enabled: boolean; ideType?: string }>; error?: string }>
+  kproxyToggleHosts: (enabled: boolean) => Promise<{ success: boolean; enabled?: boolean; entries?: Array<{ ip: string; hostname: string; enabled: boolean; ideType?: string }>; error?: string }>
+  kproxySetHostsIdeTypes: (ideTypes: Array<'kiro' | 'copilot' | 'antigravity' | 'cursor'>) => Promise<{ success: boolean; enabled?: boolean; entries?: Array<{ ip: string; hostname: string; enabled: boolean; ideType?: string }>; error?: string }>
+  kproxyGetModelMappings: () => Promise<{ success: boolean; mappings: Array<{ ideModel: string; krouterModel: string; ideType: 'kiro' | 'copilot' | 'antigravity' | 'cursor' | 'custom'; enabled: boolean }> }>
+  kproxySaveModelMappings: (mappings: Array<{ ideModel: string; krouterModel: string; ideType: 'kiro' | 'copilot' | 'antigravity' | 'cursor' | 'custom'; enabled: boolean }>) => Promise<{ success: boolean; error?: string }>
+  mitmGetStatus: () => Promise<{ running: boolean; port: number; listenerReachable?: boolean; routerReachable?: boolean; lastDiagnosticAt?: number | null; lastDiagnosticError?: string | null; connections: number; interceptedRequests: number; passthroughRequests?: number; byIdeType?: Record<string, number>; routerSuccesses?: number; routerFailures?: number; lastRequestAt?: number | null; lastInterceptAt?: number | null; lastRouterStatus?: number | null; recentDecisions?: Array<{ timestamp: number; hostname: string; method: string; path: string; ideType: string; action: 'intercept' | 'passthrough' | 'router-success' | 'router-failure'; reason?: string; sourceModel?: string; mappedModel?: string; status?: number }> }>
+  mitmStart: () => Promise<{ success: boolean; port?: number; error?: string }>
+  mitmStop: () => Promise<{ success: boolean; error?: string }>
 
   // 更新 K-Proxy 配置
   kproxyUpdateConfig: (config: { port?: number; host?: string; mitmDomains?: string[]; deviceId?: string; autoStart?: boolean; logRequests?: boolean }) => Promise<{ success: boolean; config?: unknown; error?: string }>

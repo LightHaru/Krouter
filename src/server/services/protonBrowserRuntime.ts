@@ -29,16 +29,38 @@ interface ScanResult {
   err?: string
 }
 
+/**
+ * Bề mặt WebSocket tối thiểu mà CdpClient cần. Khai báo tại chỗ thay vì `any`: runtime có
+ * thể cấp WebSocket toàn cục (kiểu DOM) hoặc WebSocket của undici (kiểu EventEmitter), nên
+ * không có một kiểu dựng sẵn nào phủ được cả hai.
+ */
+interface MinimalWebSocket {
+  readyState: number
+  send(data: string): void
+  close(): void
+  addEventListener?: (event: string, listener: (payload?: unknown) => void) => void
+  on?: (event: string, listener: (payload?: unknown) => void) => void
+}
+
+/** Lấy thông điệp lỗi từ event lỗi của WebSocket mà không cần ép kiểu `any`. */
+function wsErrorMessage(event: unknown): string {
+  if (!event || typeof event !== 'object') return ''
+  const record = event as { message?: unknown; error?: { message?: unknown } }
+  if (typeof record.message === 'string') return record.message
+  if (typeof record.error?.message === 'string') return record.error.message
+  return ''
+}
+
 interface CdpResponse {
   id?: number
   method?: string
   params?: unknown
-  result?: any
+  result?: unknown
   error?: { message?: string }
 }
 
 interface PendingCommand {
-  resolve: (value: any) => void
+  resolve: (value: unknown) => void
   reject: (error: Error) => void
   timeout: ReturnType<typeof setTimeout>
 }
@@ -49,14 +71,17 @@ class CdpClient {
   private eventWaiters = new Map<string, Array<(params: unknown) => void>>()
   private closed = false
 
-  constructor(private readonly ws: any) {
-    addWsListener(ws, 'message', (event: any) => void this.handleMessage(event))
+  constructor(private readonly ws: MinimalWebSocket) {
+    addWsListener(ws, 'message', (event) => void this.handleMessage(event))
     addWsListener(ws, 'close', () => this.handleClose())
-    addWsListener(ws, 'error', (event: any) => this.handleError(event))
+    addWsListener(ws, 'error', (event) => this.handleError(event))
   }
 
   static async connect(url: string): Promise<CdpClient> {
-    const WsCtor = (globalThis as any).WebSocket || require('undici').WebSocket
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- dự phòng lúc chạy: chỉ dùng WebSocket của undici khi runtime không có sẵn WebSocket toàn cục
+    const undiciWebSocket = require('undici').WebSocket
+    const WsCtor = ((globalThis as { WebSocket?: unknown }).WebSocket ||
+      undiciWebSocket) as new (url: string) => MinimalWebSocket
     const ws = new WsCtor(url)
     await waitForWsOpen(ws)
     return new CdpClient(ws)
@@ -75,16 +100,20 @@ class CdpClient {
     }
   }
 
-  send(method: string, params?: Record<string, unknown>, timeoutMs = 15000): Promise<any> {
+  send<T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs = 15000
+  ): Promise<T> {
     if (this.closed) return Promise.reject(new Error('CDP connection is closed'))
     const id = this.nextId++
     const payload = JSON.stringify({ id, method, params: params || {} })
-    return new Promise((resolve, reject) => {
+    return new Promise<T>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id)
         reject(new Error(`CDP command timed out: ${method}`))
       }, timeoutMs)
-      this.pending.set(id, { resolve, reject, timeout })
+      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timeout })
       this.ws.send(payload)
     })
   }
@@ -106,7 +135,7 @@ class CdpClient {
     })
   }
 
-  private async handleMessage(event: any): Promise<void> {
+  private async handleMessage(event: unknown): Promise<void> {
     const raw = await messageText(event)
     if (!raw) return
     let message: CdpResponse
@@ -143,8 +172,8 @@ class CdpClient {
     this.eventWaiters.clear()
   }
 
-  private handleError(event: any): void {
-    const message = event?.message || event?.error?.message || 'CDP websocket error'
+  private handleError(event: unknown): void {
+    const message = wsErrorMessage(event) || 'CDP websocket error'
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeout)
       pending.reject(new Error(message))
@@ -160,7 +189,7 @@ let activeProxy = ''
 let viewport = { ...DEFAULT_VIEWPORT }
 let otpQueue: Promise<unknown> = Promise.resolve()
 
-function addWsListener(ws: any, event: string, listener: (payload?: unknown) => void): void {
+function addWsListener(ws: MinimalWebSocket, event: string, listener: (payload?: unknown) => void): void {
   if (typeof ws.addEventListener === 'function') {
     ws.addEventListener(event, listener)
   } else if (typeof ws.on === 'function') {
@@ -168,18 +197,24 @@ function addWsListener(ws: any, event: string, listener: (payload?: unknown) => 
   }
 }
 
-async function messageText(event: any): Promise<string> {
-  const data = event?.data ?? event
+async function messageText(event: unknown): Promise<string> {
+  // Tuỳ implementation, listener nhận MessageEvent ({ data }) hoặc thẳng phần payload.
+  const data =
+    event && typeof event === 'object' && 'data' in event
+      ? (event as { data: unknown }).data
+      : event
   if (typeof data === 'string') return data
   if (Buffer.isBuffer(data)) return data.toString('utf8')
   if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8')
   if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('utf8')
-  if (data && typeof data.text === 'function') return await data.text()
+  // Blob (WebSocket của trình duyệt) phơi ra .text()
+  const blobLike = data as { text?: () => Promise<string> } | null | undefined
+  if (blobLike && typeof blobLike.text === 'function') return await blobLike.text()
   if (data === undefined || data === null) return ''
-  return Buffer.from(data).toString('utf8')
+  return Buffer.from(data as Uint8Array).toString('utf8')
 }
 
-function waitForWsOpen(ws: any): Promise<void> {
+function waitForWsOpen(ws: MinimalWebSocket): Promise<void> {
   if (ws.readyState === 1) return Promise.resolve()
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('Timed out connecting to Chromium DevTools')), 15000)
@@ -187,9 +222,9 @@ function waitForWsOpen(ws: any): Promise<void> {
       clearTimeout(timeout)
       resolve()
     })
-    addWsListener(ws, 'error', (event: any) => {
+    addWsListener(ws, 'error', (event) => {
       clearTimeout(timeout)
-      reject(new Error(event?.message || 'Failed to connect to Chromium DevTools'))
+      reject(new Error(wsErrorMessage(event) || 'Failed to connect to Chromium DevTools'))
     })
   })
 }
@@ -409,7 +444,11 @@ async function setViewport(width: number, height: number): Promise<void> {
 
 async function evaluate<T>(expression: string, awaitPromise = false): Promise<T> {
   const cdp = await ensureClient()
-  const result = await cdp.send('Runtime.evaluate', {
+  // Hình dạng kết quả Runtime.evaluate theo Chrome DevTools Protocol.
+  const result = await cdp.send<{
+    exceptionDetails?: { text?: string }
+    result?: { value?: unknown }
+  }>('Runtime.evaluate', {
     expression,
     awaitPromise,
     returnByValue: true,

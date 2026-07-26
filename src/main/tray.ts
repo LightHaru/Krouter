@@ -253,6 +253,7 @@ function buildTrayMenu(): Menu {
     label: isEn ? 'Copy Proxy Address' : '复制代理地址',
     icon: getMenuIcon('copy'),
     click: () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ: clipboard chỉ cần khi người dùng bấm sao chép từ khay hệ thống
       const { clipboard } = require('electron')
       const proxyStatus = callbacks?.getProxyStatus()
       if (proxyStatus?.running) {

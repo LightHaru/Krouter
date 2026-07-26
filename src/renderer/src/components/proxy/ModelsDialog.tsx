@@ -54,6 +54,7 @@ export function ModelsDialog({
   const [error, setError] = useState<string | null>(null)
   // Live model probe ("Test thật")
   const [probing, setProbing] = useState(false)
+  const [testingModelIds, setTestingModelIds] = useState<Set<string>>(new Set())
   const [probeProgress, setProbeProgress] = useState<{ done: number; total: number } | null>(null)
   const [onlyWorking, setOnlyWorking] = useState(false)
   // IP 限制提示是否显示 (用户点击关闭后持久化)
@@ -84,12 +85,12 @@ export function ModelsDialog({
     }
   }
 
-  const runProbe = async () => {
+  const runProbe = async (modelIds?: string[]) => {
     setProbing(true)
     setProbeProgress({ done: 0, total: 0 })
     setError(null)
     try {
-      const result = await window.api.proxyProbeModels({ concurrency: 3 })
+      const result = await window.api.proxyProbeModels({ modelIds, concurrency: modelIds?.length ? 1 : 3 })
       if (!result.success) {
         setError(result.error || 'Failed to probe models')
       }
@@ -100,6 +101,20 @@ export function ModelsDialog({
       setProbeProgress(null)
       // Reload models to pick up freshly cached probe annotations.
       fetchModels()
+    }
+  }
+
+  const testOneModel = async (modelId: string): Promise<void> => {
+    setTestingModelIds((current) => new Set(current).add(modelId))
+    setError(null)
+    try {
+      const result = await window.api.proxyProbeModels({ modelIds: [modelId], concurrency: 1 })
+      if (!result.success) setError(result.error || `Failed to test ${modelId}`)
+      await fetchModels()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unknown error')
+    } finally {
+      setTestingModelIds((current) => { const next = new Set(current); next.delete(modelId); return next })
     }
   }
 
@@ -194,7 +209,7 @@ export function ModelsDialog({
               <Button
                 variant="outline"
                 size="sm"
-                onClick={runProbe}
+                onClick={() => void runProbe()}
                 disabled={loading || probing}
                 className="rounded-lg"
                 title={isEn ? 'Send a minimal ping to each model per tier to confirm what actually works' : 'Gửi ping tối thiểu tới từng model theo tier để xác nhận model nào chạy thật'}
@@ -321,6 +336,11 @@ export function ModelsDialog({
                               {isEn ? 'No account' : 'Không có tài khoản'}
                             </Badge>
                           )}
+                          {model.modelProvider && (
+                            <Badge variant="outline" className="h-4 px-1.5 text-[9px] font-normal text-muted-foreground">
+                              {model.modelProvider.startsWith('custom:') ? model.modelProvider.slice(7) : model.modelProvider}
+                            </Badge>
+                          )}
                           {/* Live-probe result badges per tier ("Test thật") */}
                           {model.probeResults?.map((p) => (
                             <Badge
@@ -348,7 +368,7 @@ export function ModelsDialog({
                     <p className="text-[11px] text-muted-foreground line-clamp-2 mb-2 pl-4">
                       {model.description || (isEn ? 'No description' : '无描述')}
                     </p>
-                    <div className="flex items-center justify-between pt-2 border-t border-border/50">
+                    <div className="flex items-center justify-between gap-2 pt-2 border-t border-border/50">
                       <div className="flex items-center gap-2">
                         <div className="flex items-center gap-1">
                           {model.inputTypes?.includes('TEXT') && (
@@ -379,11 +399,24 @@ export function ModelsDialog({
                           </Badge>
                         )}
                       </div>
-                      <div className="flex items-center gap-1 text-[11px] font-mono text-muted-foreground">
-                        <Hash className="h-3 w-3" />
-                        <span className="text-green-600 dark:text-green-400">{formatTokens(model.maxInputTokens)}</span>
-                        <span>/</span>
-                        <span className="text-orange-600 dark:text-orange-400">{formatTokens(model.maxOutputTokens)}</span>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className={cn('h-7 rounded-lg px-2 text-[10px]', model.probedOk === true && 'border-emerald-500/30 text-emerald-600', model.probedOk === false && 'border-destructive/30 text-destructive')}
+                          onClick={() => void testOneModel(model.id)}
+                          disabled={probing || testingModelIds.has(model.id)}
+                          title={isEn ? `Send a minimal live request to ${model.id}` : `Gửi request tối thiểu để test ${model.id}`}
+                        >
+                          {testingModelIds.has(model.id) ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : <Zap className="mr-1 h-3 w-3" />}
+                          {testingModelIds.has(model.id) ? (isEn ? 'Testing' : 'Đang test') : model.probedOk === true ? (isEn ? 'Works' : 'Chạy tốt') : (isEn ? 'Test' : 'Kiểm tra')}
+                        </Button>
+                        <div className="flex items-center gap-1 text-[11px] font-mono text-muted-foreground">
+                          <Hash className="h-3 w-3" />
+                          <span className="text-green-600 dark:text-green-400">{formatTokens(model.maxInputTokens)}</span>
+                          <span>/</span>
+                          <span className="text-orange-600 dark:text-orange-400">{formatTokens(model.maxOutputTokens)}</span>
+                        </div>
                       </div>
                     </div>
                   </div>

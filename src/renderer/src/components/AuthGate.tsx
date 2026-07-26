@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react'
 import { Check, KeyRound, Loader2, Lock, Shuffle } from 'lucide-react'
 import { getSession, login, setupAdmin, type AuthUser } from '@/api/authClient'
+import { AUTH_LOST_EVENT } from '@/api/browserApi'
 import krouterMark from '@/assets/krouter-mark.svg'
 import { APP_NAME } from '@/brand'
 import { cn } from '@/lib/utils'
@@ -22,6 +23,9 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
   const [generatedPassword, setGeneratedPassword] = useState('')
   const [pendingUser, setPendingUser] = useState<AuthUser | null>(null)
   const [error, setError] = useState('')
+  // Lỗi của vòng poll nền tách riêng khỏi lỗi validate form, để poll 3 giây
+  // không xoá mất thông báo người dùng đang đọc (vd "Mật khẩu cần ít nhất 8 ký tự")
+  const [pollError, setPollError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
   const refreshSession = useCallback(async (): Promise<void> => {
@@ -36,12 +40,24 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
       .finally(() => setLoading(false))
   }, [refreshSession])
 
+  // Backend trả 401 (phiên hết hạn hoặc bị đẩy ra) -> quay lại màn hình đăng nhập.
+  // Trước đây `user` không bao giờ được đặt lại null sau lần mount đầu, nên form đăng nhập
+  // không hiện lại và dashboard cứ render dữ liệu cache cũ như thể vẫn đang đăng nhập.
+  useEffect(() => {
+    const onAuthLost = (): void => {
+      setUser(null)
+      setError('Phiên đăng nhập đã hết hạn, vui lòng đăng nhập lại')
+    }
+    window.addEventListener(AUTH_LOST_EVENT, onAuthLost)
+    return () => window.removeEventListener(AUTH_LOST_EVENT, onAuthLost)
+  }, [])
+
   useEffect(() => {
     if (!setupRequired || user) return
     const timer = window.setInterval(() => {
       refreshSession()
-        .then(() => setError(''))
-        .catch(() => undefined)
+        .then(() => setPollError(''))
+        .catch((err) => setPollError(err instanceof Error ? err.message : 'Không kết nối được máy chủ'))
     }, 3000)
     return () => window.clearInterval(timer)
   }, [refreshSession, setupRequired, user])
@@ -201,7 +217,7 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
           </div>
         )}
 
-        <ErrorText error={error} />
+        <ErrorText error={error || pollError} />
 
         <button
           type="submit"
@@ -247,26 +263,38 @@ export function AuthGate({ children }: AuthGateProps): React.ReactNode {
 }
 
 function AuthShell({ children, onSubmit }: { children: React.ReactNode; onSubmit?: (event: FormEvent) => void }): React.ReactNode {
-  const content = (
-    <div className="w-full max-w-sm glass-card-strong rounded-2xl border border-foreground/10 p-5 shadow-xl">
-      {children}
-    </div>
-  )
+  const content = <div className="auth-form-panel">{children}</div>
 
   return (
-    <div className="h-screen ambient-bg flex items-center justify-center p-4">
-      {onSubmit ? (
-        <form onSubmit={onSubmit} className="w-full max-w-sm">
-          {content}
-        </form>
-      ) : content}
+    <div className="auth-screen">
+      <div className="auth-frame">
+        <aside className="auth-story">
+          <div>
+            <div className="flex items-center gap-3">
+              <div className="brand-mark border-white/20 bg-white/10"><img src={krouterMark} alt="" className="h-8 w-8 brightness-0 invert" /></div>
+              <div>
+                <div className="text-lg font-extrabold tracking-tight text-white">{APP_NAME}</div>
+                <div className="text-[9px] font-bold uppercase tracking-[0.24em] text-emerald-100/65">Routing control plane</div>
+              </div>
+            </div>
+            <h2 className="mt-16 max-w-sm text-4xl font-extrabold leading-[1.04] tracking-[-0.045em] text-white">Every model.<br />One reliable route.</h2>
+            <p className="mt-5 max-w-sm text-sm leading-6 text-emerald-50/65">Operate Kiro accounts, Bedrock capacity and compatible APIs from one private control surface.</p>
+          </div>
+          <div className="grid grid-cols-3 gap-3 border-t border-white/10 pt-5">
+            <div><div className="font-mono text-lg font-bold text-white">24/7</div><div className="mt-1 text-[9px] uppercase tracking-wider text-emerald-50/50">Routing</div></div>
+            <div><div className="font-mono text-lg font-bold text-white">3x</div><div className="mt-1 text-[9px] uppercase tracking-wider text-emerald-50/50">Providers</div></div>
+            <div><div className="font-mono text-lg font-bold text-white">Local</div><div className="mt-1 text-[9px] uppercase tracking-wider text-emerald-50/50">Private</div></div>
+          </div>
+        </aside>
+        {onSubmit ? <form onSubmit={onSubmit} className="auth-form-wrap">{content}</form> : <div className="auth-form-wrap">{content}</div>}
+      </div>
     </div>
   )
 }
 
 function BrandIcon(): React.ReactNode {
   return (
-    <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10 text-primary">
+    <div className="brand-mark">
       <img src={krouterMark} alt="" className="h-8 w-8" />
     </div>
   )

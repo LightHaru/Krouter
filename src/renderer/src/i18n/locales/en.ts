@@ -47,6 +47,7 @@ const en = {
     machineId: 'Mã máy',
     kiroSettings: 'Cài đặt Kiro',
     proxy: 'Proxy API',
+    usage: 'Usage & Analytics',
     kproxy: 'K-Proxy',
     mitm: 'MITM Proxy',
     proxyPool: 'Kho proxy',

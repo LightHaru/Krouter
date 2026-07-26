@@ -1,3 +1,4 @@
+import crypto from 'crypto'
 import { randomFullName } from './browser-identity'
 
 export interface RegistrationConfig {
@@ -34,7 +35,7 @@ export interface RegistrationConfig {
 
   // TempMail.Plus + 自建域名
   useTempMailPlus: boolean
-  tempMailPlusEmail: string  // tempmail.plus 用户名（不含 @mailto.plus）
+  tempMailPlusEmail: string // tempmail.plus 用户名（不含 @mailto.plus）
   tempMailPlusEpin: string
   tempMailPlusDomain: string // 自建域名
   useTingamefiMail: boolean
@@ -56,15 +57,19 @@ export function genPassword(): string {
   const digits = '0123456789'
   const special = '!@#$%^&*'
 
+  // Mật khẩu này là thông tin đăng nhập thật của tài khoản và được lưu lại, nên bắt buộc dùng CSPRNG.
+  // Math.random() của V8 là xorshift128+ với trạng thái có thể khôi phục được, mà chính phiên đăng ký
+  // này còn để lộ một chuỗi dài đầu ra của cùng bộ sinh đó cho nhà cung cấp proxy (ubidGen, visitorId,
+  // randomEmailPrefix, token _session-XXXXXXXX...). crypto.randomInt là bộ sinh không thiên lệch.
   let pw = ''
-  for (let i = 0; i < 3; i++) pw += upper[Math.floor(Math.random() * upper.length)]
-  for (let i = 0; i < 6; i++) pw += lower[Math.floor(Math.random() * lower.length)]
-  for (let i = 0; i < 3; i++) pw += digits[Math.floor(Math.random() * digits.length)]
-  for (let i = 0; i < 2; i++) pw += special[Math.floor(Math.random() * special.length)]
+  for (let i = 0; i < 3; i++) pw += upper[crypto.randomInt(upper.length)]
+  for (let i = 0; i < 6; i++) pw += lower[crypto.randomInt(lower.length)]
+  for (let i = 0; i < 3; i++) pw += digits[crypto.randomInt(digits.length)]
+  for (let i = 0; i < 2; i++) pw += special[crypto.randomInt(special.length)]
 
   const arr = pw.split('')
   for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1))
+    const j = crypto.randomInt(i + 1)
     ;[arr[i], arr[j]] = [arr[j], arr[i]]
   }
   return arr.join('')

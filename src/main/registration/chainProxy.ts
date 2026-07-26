@@ -49,6 +49,13 @@ interface ConnectResponse {
   bodySnippet: string
 }
 
+/**
+ * Thời gian chờ tối đa cho một lượt CONNECT.
+ * connectViaHttpUpstream gọi sock.setTimeout(0) ngay sau khi bắt tay với upstream, nên nếu proxy
+ * im lặng (hoặc trả về thứ không phân tích được) thì không còn cơ chế nào khác đánh thức promise.
+ */
+const CONNECT_RESPONSE_TIMEOUT_MS = 20000
+
 export interface ChainDiagnose {
   upstreamReachable: boolean
   upstreamError?: string
@@ -109,7 +116,11 @@ export class ChainProxyRelay {
       // 强制销毁所有活跃隧道连接：否则 server.close() 会等 DLL Go http.Transport
       // 的 Keep-Alive 连接自然超时（~60s），导致注册结束后 cleanup 卡住一分钟
       for (const sock of this.sockets) {
-        try { sock.destroy() } catch { /* ignore */ }
+        try {
+          sock.destroy()
+        } catch {
+          /* ignore */
+        }
       }
       this.sockets.clear()
       if (!srv) {
@@ -137,12 +148,29 @@ export class ChainProxyRelay {
       const port = Number(m[2])
       this.dialChain(host, port)
         .then((tunnel) => {
+          // dialChain mất tới ~40 giây. Nếu client đã đóng trong lúc đó thì listener
+          // client.on('close') đăng ký dưới đây sẽ KHÔNG bao giờ chạy, và vì this.sockets
+          // chỉ theo dõi socket phía client nên stop() cũng không với tới tunnel này —
+          // mỗi lần cancel/restart lúc concurrency cao là rò một socket + một fd
+          // (cả hai đường dial đều tắt reaping timeout bằng setTimeout(0) + keep-alive).
+          if (client.destroyed || !client.writable) {
+            tunnel.destroy()
+            return
+          }
+          this.sockets.add(tunnel)
+          tunnel.once('close', () => {
+            this.sockets.delete(tunnel)
+          })
+
           client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
           client.pipe(tunnel)
           tunnel.pipe(client)
           client.on('close', () => tunnel.destroy())
           tunnel.on('close', () => client.destroy())
-          tunnel.on('error', () => { client.destroy(); tunnel.destroy() })
+          tunnel.on('error', () => {
+            client.destroy()
+            tunnel.destroy()
+          })
         })
         .catch((err: unknown) => {
           this.log(`[ProxyChain] 隧道建立失败: ${err instanceof Error ? err.message : String(err)}`)
@@ -177,7 +205,10 @@ export class ChainProxyRelay {
     return new Promise((resolve, reject) => {
       const sock = net.connect(this.upstream.port, this.upstream.host)
       sock.setTimeout(20000)
-      sock.once('timeout', () => { sock.destroy(); reject(new Error('上游中转连接超时')) })
+      sock.once('timeout', () => {
+        sock.destroy()
+        reject(new Error('上游中转连接超时'))
+      })
       sock.once('error', reject)
       sock.once('connect', () => {
         sock.setNoDelay(true)
@@ -185,9 +216,15 @@ export class ChainProxyRelay {
           .then((resp) => {
             sock.setTimeout(0)
             if (resp.status === 200) resolve(sock)
-            else { sock.destroy(); reject(new Error(this.formatConnectError('上游中转', resp))) }
+            else {
+              sock.destroy()
+              reject(new Error(this.formatConnectError('上游中转', resp)))
+            }
           })
-          .catch((err: Error) => { sock.destroy(); reject(err) })
+          .catch((err: Error) => {
+            sock.destroy()
+            reject(err)
+          })
       })
     })
   }
@@ -245,7 +282,28 @@ export class ChainProxyRelay {
       }
       const req = lines.join('\r\n') + '\r\n\r\n'
 
-      this.readHttpResponse(sock).then(resolve, reject)
+      // Đồng hồ riêng cho CONNECT: bảo đảm promise luôn được giải quyết dù proxy không phản hồi.
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        reject(new Error(`Proxy CONNECT không phản hồi trong ${CONNECT_RESPONSE_TIMEOUT_MS}ms`))
+      }, CONNECT_RESPONSE_TIMEOUT_MS)
+
+      this.readHttpResponse(sock).then(
+        (resp) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve(resp)
+        },
+        (err: Error) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          reject(err)
+        }
+      )
       sock.write(req)
     })
   }
@@ -285,7 +343,17 @@ export class ChainProxyRelay {
           }
           resolve(parsed)
         } else if (viaClose) {
-          reject(new Error(raw ? `代理返回不可解析: ${raw.slice(0, 120)}` : '代理连接被对端关闭（无任何响应）'))
+          reject(
+            new Error(
+              raw ? `代理返回不可解析: ${raw.slice(0, 120)}` : '代理连接被对端关闭（无任何响应）'
+            )
+          )
+        } else {
+          // cleanup() đã gỡ toàn bộ listener: không reject ở đây thì promise treo vĩnh viễn.
+          // Xảy ra khi dữ liệu có \r\n\r\n nhưng dòng đầu không phải status line HTTP/1.x
+          // (preface HTTP/2, lời chào SOCKS...): dialChain sẽ không resolve cũng không reject,
+          // socket client không nhận được 200 lẫn 502 và rò rỉ cho tới khi watchdog 55s nổ.
+          reject(new Error(`代理返回不可解析: ${raw.slice(0, 120)}`))
         }
       }
       const onData = (d: Buffer): void => {
@@ -293,7 +361,10 @@ export class ChainProxyRelay {
         const sep = buf.indexOf('\r\n\r\n')
         if (sep >= 0) finish(buf, false)
       }
-      const onErr = (err: Error): void => { cleanup(); reject(err) }
+      const onErr = (err: Error): void => {
+        cleanup()
+        reject(err)
+      }
       const onEnd = (): void => finish(buf, true)
       sock.on('data', onData)
       sock.once('error', onErr)
@@ -303,7 +374,9 @@ export class ChainProxyRelay {
   }
 
   private formatConnectError(stage: string, resp: ConnectResponse): string {
-    const suffix = resp.bodySnippet ? ` body=${resp.bodySnippet.replace(/[\r\n]/g, ' ').slice(0, 120)}` : ''
+    const suffix = resp.bodySnippet
+      ? ` body=${resp.bodySnippet.replace(/[\r\n]/g, ' ').slice(0, 120)}`
+      : ''
     return `${stage} CONNECT 失败: HTTP ${resp.status} ${resp.statusText}${suffix}`
   }
 
@@ -358,9 +431,19 @@ export class ChainProxyRelay {
   private tcpProbe(host: string, port: number, timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
       const sock = net.connect(port, host)
-      const timer = setTimeout(() => { sock.destroy(); reject(new Error(`TCP 连接超时 ${host}:${port}`)) }, timeoutMs)
-      sock.once('connect', () => { clearTimeout(timer); sock.destroy(); resolve() })
-      sock.once('error', (err) => { clearTimeout(timer); reject(err) })
+      const timer = setTimeout(() => {
+        sock.destroy()
+        reject(new Error(`TCP 连接超时 ${host}:${port}`))
+      }, timeoutMs)
+      sock.once('connect', () => {
+        clearTimeout(timer)
+        sock.destroy()
+        resolve()
+      })
+      sock.once('error', (err) => {
+        clearTimeout(timer)
+        reject(err)
+      })
     })
   }
 }

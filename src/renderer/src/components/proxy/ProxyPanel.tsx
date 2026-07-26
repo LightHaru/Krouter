@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
-import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2, ExternalLink } from 'lucide-react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { Play, Square, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2, ExternalLink } from 'lucide-react'
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Switch, Badge, Select } from '../ui'
 import { ProxySecurityPanel } from './ProxySecurityPanel'
 import { useAccountsStore } from '../../store/accounts'
@@ -11,9 +11,13 @@ import { ModelMappingDialog } from './ModelMappingDialog'
 import { ApiKeyManager } from './ApiKeyManager'
 import { ClientConfigDialog } from './ClientConfigDialog'
 import { RecentRequestsPanel } from './RecentRequestsPanel'
+import { PROXY_ENDPOINT_GROUPS } from './proxyEndpointCatalog'
 import { createPortal } from 'react-dom'
+import { copyText } from '@/lib/utils'
 
 const PROXY_STATUS_REFRESH_MS = 5000
+// Chặn tối đa 1 lần refresh thống kê mỗi giây khi có response từ reverse proxy
+const STATS_REFRESH_THROTTLE_MS = 1000
 
 function compactNumber(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
@@ -80,6 +84,8 @@ interface ProxyConfig {
   payloadSizeLimitKB?: number
   enableTokenBufferReserve?: boolean
   tokenBufferReserve?: number
+  autoCachePoint?: boolean
+  autoCachePointMaxPoints?: number
   autoSwitchOnQuotaExhausted?: boolean
   accountSelectionStrategy?: 'smart' | 'round-robin' | 'sticky' | 'least-used'
   // 多账号轮询范围（与 main/proxy/types.ts 保持一致）
@@ -175,10 +181,6 @@ export function ProxyPanel() {
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [recentLogs, setRecentLogs] = useState<RecentLogEntry[]>(_proxyRecentLogs)
-  const [isSyncing, setIsSyncing] = useState(false)
-  const [isRefreshingModels, setIsRefreshingModels] = useState(false)
-  const [syncSuccess, setSyncSuccess] = useState(false)
-  const [refreshSuccess, setRefreshSuccess] = useState(false)
   const [showLogsDialog, setShowLogsDialog] = useState(false)
   const [showDetailedLogsDialog, setShowDetailedLogsDialog] = useState(false)
   const [showModelsDialog, setShowModelsDialog] = useState(false)
@@ -195,13 +197,38 @@ export function ProxyPanel() {
   const [tunnelLoading, setTunnelLoading] = useState(false)
   const [tunnelCopied, setTunnelCopied] = useState(false)
 
+  // Bản nháp của các ô Cổng / Địa chỉ nghe / API Key: giữ chuỗi thô người dùng đang gõ,
+  // chỉ ghi cấu hình khi rời ô hoặc nhấn Enter (tránh restart listener theo từng ký tự).
+  const [portDraft, setPortDraft] = useState(String(config.port))
+  const [hostDraft, setHostDraft] = useState(config.host)
+  const [apiKeyDraft, setApiKeyDraft] = useState(config.apiKey || '')
+  const portFocusedRef = useRef(false)
+  const hostFocusedRef = useRef(false)
+  const apiKeyFocusedRef = useRef(false)
+  // Dirty flag: chỉ ghi khi người dùng THỰC SỰ gõ vào ô đó. Nếu chỉ dựa vào "khác config"
+  // thì kịch bản sau sẽ âm thầm quay ngược cấu hình: người dùng click vào ô Port (chưa gõ gì),
+  // cùng lúc cổng bị đổi từ nơi khác (CLI/admin API) → effect đồng bộ bị bỏ qua vì đang focus
+  // → khi rời ô, commit thấy draft cũ khác config mới và ghi đè lại giá trị cũ.
+  const portDirtyRef = useRef(false)
+  const hostDirtyRef = useRef(false)
+  const apiKeyDirtyRef = useRef(false)
+
   const accounts = useAccountsStore(state => state.accounts)
 
   // 生成随机 API Key
   const generateApiKey = useCallback(() => {
+    // Giá trị này là bearer credential thật của gateway (proxyServer kiểm tra nó) và cũng là
+    // thứ thoả mãn guard cho phép bind ra host không phải loopback. Math.random() không phải
+    // CSPRNG nên không được dùng để sinh credential hướng mạng.
     const randomHex = (len: number) => {
       const chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
-      return Array.from({ length: len }, () => chars[Math.floor(Math.random() * chars.length)]).join('')
+      const bytes = new Uint8Array(len)
+      if (typeof globalThis.crypto?.getRandomValues === 'function') {
+        globalThis.crypto.getRandomValues(bytes)
+      } else {
+        for (let i = 0; i < len; i++) bytes[i] = Math.floor(Math.random() * 256)
+      }
+      return Array.from(bytes, (byte) => chars[byte % chars.length]).join('')
     }
     
     let newKey: string
@@ -229,7 +256,7 @@ export function ProxyPanel() {
   // 复制 API Key
   const copyApiKey = useCallback(() => {
     if (config.apiKey) {
-      navigator.clipboard.writeText(config.apiKey)
+      copyText(config.apiKey)
       setApiKeyCopied(true)
       setTimeout(() => setApiKeyCopied(false), 1500)
     }
@@ -299,6 +326,55 @@ export function ProxyPanel() {
     await fetchStatus()
   }, [fetchStatus, isEn])
 
+  // Chỉ đồng bộ ô nhập từ config khi người dùng không đang gõ trong ô đó,
+  // để snapshot của server (fetchStatus mỗi 5 giây) không đè lên nội dung đang soạn.
+  useEffect(() => {
+    if (!portFocusedRef.current) { setPortDraft(String(config.port)); portDirtyRef.current = false }
+  }, [config.port])
+  useEffect(() => {
+    if (!hostFocusedRef.current) { setHostDraft(config.host); hostDirtyRef.current = false }
+  }, [config.host])
+  useEffect(() => {
+    if (!apiKeyFocusedRef.current) { setApiKeyDraft(config.apiKey || ''); apiKeyDirtyRef.current = false }
+  }, [config.apiKey])
+
+  // Ghi cổng khi rời ô / nhấn Enter. Giá trị rỗng hoặc không hợp lệ thì trả về cổng cũ,
+  // không thay bằng mặc định 5580 như trước (Backspace từng làm proxy restart sang 5580).
+  const commitPort = useCallback(() => {
+    if (!portDirtyRef.current) return
+    portDirtyRef.current = false
+    const parsed = parseInt(portDraft, 10)
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+      setPortDraft(String(config.port))
+      return
+    }
+    if (parsed === config.port) return
+    setConfig(prev => ({ ...prev, port: parsed }))
+    void saveProxyConfig({ port: parsed })
+  }, [portDraft, config.port, saveProxyConfig])
+
+  const commitHost = useCallback(() => {
+    if (!hostDirtyRef.current) return
+    hostDirtyRef.current = false
+    const value = hostDraft.trim()
+    if (!value) {
+      setHostDraft(config.host)
+      return
+    }
+    if (value === config.host) return
+    setConfig(prev => ({ ...prev, host: value }))
+    void saveProxyConfig({ host: value })
+  }, [hostDraft, config.host, saveProxyConfig])
+
+  const commitApiKey = useCallback(() => {
+    if (!apiKeyDirtyRef.current) return
+    apiKeyDirtyRef.current = false
+    const nextApiKey = apiKeyDraft || undefined
+    if ((config.apiKey || '') === (nextApiKey || '')) return
+    setConfig(prev => ({ ...prev, apiKey: nextApiKey }))
+    void saveProxyConfig({ apiKey: nextApiKey })
+  }, [apiKeyDraft, config.apiKey, saveProxyConfig])
+
   const fetchTunnelStatus = useCallback(async () => {
     if (typeof window.api.dashboardTunnelGetStatus !== 'function') return
     try {
@@ -343,7 +419,7 @@ export function ProxyPanel() {
 
   const copyTunnelUrl = useCallback(() => {
     if (!tunnelStatus?.publicUrl) return
-    navigator.clipboard.writeText(tunnelStatus.publicUrl)
+    copyText(tunnelStatus.publicUrl)
     setTunnelCopied(true)
     setTimeout(() => setTunnelCopied(false), 1500)
   }, [tunnelStatus?.publicUrl])
@@ -355,92 +431,31 @@ export function ProxyPanel() {
         setAvailableModels(result.models.map((m: { id: string; name?: string }) => ({ id: m.id, name: m.name || m.id })))
       }
     } catch {
+      /* danh sách model chỉ để gợi ý; lấy không được thì bỏ qua, không làm phiền người dùng */
     }
   }, [])
-
-  // 同步账号到反代池：所有 active 账号 = 1 个大池（不再按分组过滤）。
-  const syncAccounts = useCallback(async () => {
-    setIsSyncing(true)
-    setSyncSuccess(false)
-    try {
-      // Single big pool: every active account is a candidate. The Strategy/Scope
-      // selectors were removed (all accounts always form one pool with smart
-      // tier-aware failover), so no group filtering happens here anymore.
-      const candidates = Array.from(accounts.values())
-        .filter(acc => acc.status === 'active' && acc.credentials?.accessToken)
-
-      const proxyAccounts = candidates.map(acc => ({
-          id: acc.id,
-          email: acc.email,
-          accessToken: acc.credentials.accessToken,
-          kiroApiKey: acc.credentials.kiroApiKey,
-          refreshToken: acc.credentials?.refreshToken,
-          profileArn: acc.profileArn,
-          expiresAt: acc.credentials?.expiresAt,
-          machineId: acc.machineId,
-          // Token 刷新所需字段
-          clientId: acc.credentials?.clientId,
-          clientSecret: acc.credentials?.clientSecret,
-          region: acc.credentials?.apiRegion || acc.credentials?.region || 'us-east-1',
-          authMethod: acc.credentials?.authMethod,
-          provider: acc.credentials?.provider || acc.idp,
-          // Subscription tier tag drives smart tier routing (premium models -> paid
-          // accounts only). Without this the pool treats every account as unknown-tier,
-          // so a paid/Enterprise account is never recognized and premium models
-          // (Opus, etc.) get wrongly routed to Bedrock instead of the paid account.
-          subscriptionType: acc.subscription?.type,
-          // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险），即便前端忘了重同步也安全
-          groupId: acc.groupId
-        }))
-
-      const result = await window.api.proxySyncAccounts(proxyAccounts)
-      if (result.success) {
-        setAccountCount(result.accountCount || 0)
-        await fetchStatus()
-        setSyncSuccess(true)
-        setTimeout(() => setSyncSuccess(false), 2000)
-      }
-    } catch (err) {
-      console.error('Failed to sync accounts:', err)
-    } finally {
-      setIsSyncing(false)
-    }
-  }, [accounts, fetchStatus])
 
   // 复制地址（0.0.0.0 对人不可读，复制为 localhost）
   const copyAddress = () => {
     const displayHost = config.host === '0.0.0.0' ? 'localhost' : config.host
     const address = `http://${displayHost}:${config.port}`
-    navigator.clipboard.writeText(address)
+    copyText(address)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
-  }
-
-  // 刷新模型缓存
-  const handleRefreshModels = async () => {
-    setIsRefreshingModels(true)
-    setRefreshSuccess(false)
-    try {
-      const result = await window.api.proxyRefreshModels()
-      if (result.success) {
-        await loadAvailableModels()
-        setRefreshSuccess(true)
-        setTimeout(() => setRefreshSuccess(false), 2000)
-      } else {
-        setError(result.error || (isEn ? 'Failed to refresh models' : 'Làm mới model thất bại'))
-      }
-    } catch (err) {
-      setError((err as Error).message)
-    } finally {
-      setIsRefreshingModels(false)
-    }
   }
 
   // 加载历史日志
   useEffect(() => {
     window.api.proxyLoadLogs().then(result => {
       if (result.success && result.logs.length > 0) {
-        setRecentLogs(result.logs)
+        // Phải nạp cả biến module: subscription onProxyResponse dựng lại danh sách từ
+        // _proxyRecentLogs, nếu vẫn rỗng thì response đầu tiên sẽ xoá sạch lịch sử và
+        // effect lưu debounce ghi đè bản rỗng đó xuống đĩa.
+        // Chỉ nạp khi đang rỗng để lần remount sau không đè mất log mới trong bộ nhớ.
+        if (_proxyRecentLogs.length === 0) {
+          _proxyRecentLogs = result.logs
+          setRecentLogs(result.logs)
+        }
       }
     })
   }, [])
@@ -474,7 +489,24 @@ export function ProxyPanel() {
     ensureProxyResponseListenerRegistered()
     _refSetProxyRecentLogs = setRecentLogs
     // 触发一次统计刷新即可（统计有独立的 fetchStatus，不依赖订阅）
-    const unsubStatsHook = window.api.onProxyResponse(() => { fetchStatus() })
+    // Bóp tối đa 1 lần refresh mỗi giây: mỗi response vốn kéo theo 2 IPC (status + accounts),
+    // ở mức 20 req/phút là hơn 40 IPC/phút, trong khi polling 5 giây phía dưới đã phủ đúng dữ liệu này.
+    let lastStatsRefreshAt = 0
+    let statsRefreshTimer: ReturnType<typeof setTimeout> | null = null
+    const unsubStatsHook = window.api.onProxyResponse(() => {
+      const waitMs = STATS_REFRESH_THROTTLE_MS - (Date.now() - lastStatsRefreshAt)
+      if (waitMs <= 0) {
+        lastStatsRefreshAt = Date.now()
+        void fetchStatus()
+        return
+      }
+      if (statsRefreshTimer) return
+      statsRefreshTimer = setTimeout(() => {
+        statsRefreshTimer = null
+        lastStatsRefreshAt = Date.now()
+        void fetchStatus()
+      }, waitMs)
+    })
 
     const unsubError = window.api.onProxyError((err) => {
       console.error('[Proxy] Error:', err)
@@ -493,6 +525,7 @@ export function ProxyPanel() {
       unsubStatsHook()
       unsubError()
       unsubStatus()
+      if (statsRefreshTimer) clearTimeout(statsRefreshTimer)
       _refSetProxyRecentLogs = null
     }
   }, [fetchStatus, loadAvailableModels])
@@ -508,35 +541,6 @@ export function ProxyPanel() {
       clearInterval(timer)
     }
   }, [fetchStatus])
-
-  // 用 ref 持有最新的 syncAccounts，避免把它放进下方 effect 依赖导致循环重触发
-  const syncAccountsRef = useRef(syncAccounts)
-  useEffect(() => { syncAccountsRef.current = syncAccounts }, [syncAccounts])
-
-  /**
-   * 账号集合签名：只反映"参与同步的账号 id + 分组"，**不含** token / 用量 / 状态时间戳。
-   * 这样后台 token 刷新、用量更新等高频变动不会触发重新同步（避免按钮疯狂闪烁），
-   * 仅在真正增删账号 / 改分组时才同步。token 更新由主进程账号池自身刷新逻辑处理。
-   */
-  const accountsSyncSignature = useMemo(() => {
-    return Array.from(accounts.values())
-      .filter(a => a.status === 'active' && a.credentials?.accessToken)
-      .map(a => `${a.id}:${a.groupId || ''}`)
-      .sort()
-      .join('|')
-  }, [accounts])
-
-  // 账号集合变化时同步（防抖 600ms + 仅签名变化才触发；跳过首次 mount 避免每次进页面都同步）
-  const syncMountedRef = useRef(false)
-  useEffect(() => {
-    if (!isRunning) return
-    if (!syncMountedRef.current) {
-      syncMountedRef.current = true
-      return
-    }
-    const timer = setTimeout(() => { void syncAccountsRef.current() }, 600)
-    return () => clearTimeout(timer)
-  }, [accountsSyncSignature, isRunning])
 
   // 实时更新运行时间
   const [uptime, setUptime] = useState(0)
@@ -564,9 +568,9 @@ export function ProxyPanel() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="proxy-console-stack space-y-4">
       {/* 状态卡片 */}
-      <Card className="hover-lift relative z-10">
+      <Card className="proxy-runtime-console relative z-10">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -603,14 +607,14 @@ export function ProxyPanel() {
         <CardContent className="space-y-4">
           {/* Backend-managed actions */}
           <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={() => void syncAccounts()} variant="outline" className="gap-2" disabled={isSyncing}>
-              {isSyncing ? <Loader2 className="h-4 w-4 animate-spin" /> : syncSuccess ? <Check className="h-4 w-4 text-success" /> : <RefreshCw className="h-4 w-4" />}
-              {isSyncing ? (isEn ? 'Syncing...' : 'Đang đồng bộ...') : syncSuccess ? (isEn ? 'Synced!' : 'Đã đồng bộ') : (isEn ? 'Sync Accounts' : 'Đồng bộ tài khoản')}
-            </Button>
-            <Button onClick={handleRefreshModels} variant="outline" className="gap-2" disabled={isRefreshingModels}>
-              {isRefreshingModels ? <Loader2 className="h-4 w-4 animate-spin" /> : refreshSuccess ? <Check className="h-4 w-4 text-success" /> : <RefreshCw className="h-4 w-4" />}
-              {isRefreshingModels ? (isEn ? 'Refreshing...' : 'Đang làm mới...') : refreshSuccess ? (isEn ? 'Refreshed!' : 'Đã làm mới') : (isEn ? 'Refresh Models' : 'Làm mới model')}
-            </Button>
+            <div className="proxy-auto-catalog-status">
+              <Activity className="h-4 w-4" />
+              <span>
+                <strong>{isEn ? 'Automatic catalog' : 'Catalog tu dong'}</strong>
+                <small>{isEn ? 'Accounts and models sync in the backend' : 'Tai khoan va model do backend tu dong dong bo'}</small>
+              </span>
+              <Badge variant="success">{availableModels.length} models</Badge>
+            </div>
             <Button onClick={() => setShowModelsDialog(true)} variant="outline" className="gap-2">
               <Cpu className="h-4 w-4" />
               {isEn ? 'View Models' : 'Xem model'}
@@ -726,12 +730,11 @@ export function ProxyPanel() {
               <Input
                 id="port"
                 type="number"
-                value={config.port}
-                onChange={(e) => {
-                  const newPort = parseInt(e.target.value) || 5580
-                  setConfig(prev => ({ ...prev, port: newPort }))
-                  void saveProxyConfig({ port: newPort })
-                }}
+                value={portDraft}
+                onFocus={() => { portFocusedRef.current = true }}
+                onChange={(e) => { portDirtyRef.current = true; setPortDraft(e.target.value) }}
+                onBlur={() => { portFocusedRef.current = false; commitPort() }}
+                onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
                 className="h-9"
               />
             </div>
@@ -753,12 +756,11 @@ export function ProxyPanel() {
               </div>
               <Input
                 id="host"
-                value={config.host}
-                onChange={(e) => {
-                  const newHost = e.target.value
-                  setConfig(prev => ({ ...prev, host: newHost }))
-                  void saveProxyConfig({ host: newHost })
-                }}
+                value={hostDraft}
+                onFocus={() => { hostFocusedRef.current = true }}
+                onChange={(e) => { hostDirtyRef.current = true; setHostDraft(e.target.value) }}
+                onBlur={() => { hostFocusedRef.current = false; commitHost() }}
+                onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
                 className={`h-9 ${config.host === '0.0.0.0' ? 'border-warning/50' : ''}`}
               />
             </div>
@@ -795,12 +797,11 @@ export function ProxyPanel() {
                   id="apiKey"
                   type={showApiKey ? 'text' : 'password'}
                   placeholder={isEn ? 'Leave empty to skip auth' : 'Để trống để bỏ xác thực'}
-                  value={config.apiKey || ''}
-                  onChange={(e) => {
-                    const newApiKey = e.target.value || undefined
-                    setConfig(prev => ({ ...prev, apiKey: newApiKey }))
-                    void saveProxyConfig({ apiKey: newApiKey })
-                  }}
+                  value={apiKeyDraft}
+                  onFocus={() => { apiKeyFocusedRef.current = true }}
+                  onChange={(e) => { apiKeyDirtyRef.current = true; setApiKeyDraft(e.target.value) }}
+                  onBlur={() => { apiKeyFocusedRef.current = false; commitApiKey() }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
                   className="pr-9 h-9"
                 />
                 <Button
@@ -957,7 +958,7 @@ export function ProxyPanel() {
                 </div>
               </div>
               {/* Token Buffer Reserve — 占 3 列合为一行：开关 + 输入 */}
-              <div className="col-span-3 space-y-1.5">
+              <div className="sm:col-span-2 lg:col-span-3 space-y-1.5">
                 <Label htmlFor="tokenBufferReserve" className="text-xs" title={isEn ? 'When enabled, reserves N tokens below context window for trim (e.g. 200K → trim at 180K). When disabled, never trims.' : 'Khi bật, chừa N token dưới context window để làm ngưỡng cắt (ví dụ 200K -> cắt ở 180K). Khi tắt sẽ không cắt lịch sử.'}>{isEn ? 'Token Buffer Reserve (auto-trim history)' : 'Dự phòng token (tự cắt lịch sử)'}</Label>
                 <div className="flex items-center gap-2">
                   <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent w-[160px] flex-shrink-0">
@@ -989,6 +990,38 @@ export function ProxyPanel() {
                     className="h-9 flex-1"
                   />
                 </div>
+              </div>
+              <div className="sm:col-span-2 space-y-1.5">
+                <Label htmlFor="autoCachePoint" className="text-xs" title={isEn ? 'Automatically adds Kiro cache points when the client does not provide explicit cache controls.' : 'Tự thêm cache point của Kiro khi client không gửi cache control.'}>{isEn ? 'Prompt Cache Automation' : 'Tự động cache prompt'}</Label>
+                <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent">
+                  <span className="text-xs text-muted-foreground">{config.autoCachePoint !== false ? (isEn ? 'Automatic cache points' : 'Tự chèn cache point') : (isEn ? 'Client controls cache' : 'Client tự điều khiển cache')}</span>
+                  <Switch
+                    id="autoCachePoint"
+                    checked={config.autoCachePoint !== false}
+                    onCheckedChange={(checked) => {
+                      setConfig(prev => ({ ...prev, autoCachePoint: checked }))
+                      void saveProxyConfig({ autoCachePoint: checked })
+                    }}
+                    className="scale-90"
+                  />
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="autoCachePointMaxPoints" className="text-xs">{isEn ? 'Maximum Cache Points' : 'Số cache point tối đa'}</Label>
+                <Input
+                  id="autoCachePointMaxPoints"
+                  type="number"
+                  min={1}
+                  max={4}
+                  value={config.autoCachePointMaxPoints ?? 4}
+                  onChange={(event) => {
+                    const points = Math.min(4, Math.max(1, Number.parseInt(event.target.value, 10) || 4))
+                    setConfig(prev => ({ ...prev, autoCachePointMaxPoints: points }))
+                    void saveProxyConfig({ autoCachePointMaxPoints: points })
+                  }}
+                  disabled={config.autoCachePoint === false}
+                  className="h-9"
+                />
               </div>
             </div>
           </div>
@@ -1093,6 +1126,21 @@ export function ProxyPanel() {
 
       {/* 第二行统计卡片 - Token 分解和 Cache */}
       {isRunning && stats && (
+        <div className="space-y-3">
+        <Card className="overflow-hidden border-primary/25 bg-gradient-to-r from-primary/5 via-card to-card">
+          <CardContent className="p-0">
+            <div className="grid grid-cols-2 lg:grid-cols-[1.35fr_repeat(4,1fr)]">
+              <div className="col-span-2 lg:col-span-1 p-4 border-b lg:border-b-0 lg:border-r border-border">
+                <div className="flex items-center gap-2"><Cpu className="h-4 w-4 text-primary" /><strong className="text-sm">{isEn ? 'Inference intelligence' : 'Điều phối suy luận'}</strong></div>
+                <p className="mt-1 text-[10px] text-muted-foreground">{isEn ? 'Live reasoning, prompt cache and context protection telemetry.' : 'Theo dõi thinking, cache prompt và bảo vệ context theo thời gian thực.'}</p>
+              </div>
+              <div className="p-3 border-r border-border"><small className="block text-[8px] text-muted-foreground uppercase">{isEn ? 'Cache mode' : 'Chế độ cache'}</small><strong className="text-xs">{config.autoCachePoint !== false ? `${isEn ? 'Auto' : 'Tự động'} · ${config.autoCachePointMaxPoints ?? 4} points` : (isEn ? 'Client controlled' : 'Client điều khiển')}</strong></div>
+              <div className="p-3 lg:border-r border-border"><small className="block text-[8px] text-muted-foreground uppercase">{isEn ? 'Cache hit rate' : 'Tỷ lệ cache hit'}</small><strong className="text-xs text-emerald-600">{(() => { const read = stats.cacheReadTokens || 0; const total = (stats.inputTokens || 0) + read; return total ? `${(read / total * 100).toFixed(1)}%` : '-' })()}</strong></div>
+              <div className="p-3 border-t lg:border-t-0 border-r border-border"><small className="block text-[8px] text-muted-foreground uppercase">{isEn ? 'Reasoning share' : 'Tỷ trọng thinking'}</small><strong className="text-xs text-violet-600">{(stats.outputTokens || 0) ? `${((stats.reasoningTokens || 0) / (stats.outputTokens || 1) * 100).toFixed(1)}%` : '-'}</strong></div>
+              <div className="p-3 border-t lg:border-t-0 border-border"><small className="block text-[8px] text-muted-foreground uppercase">{isEn ? 'Context guard' : 'Bảo vệ context'}</small><strong className="text-xs">{config.enableTokenBufferReserve ? `${compactNumber(config.tokenBufferReserve || 20000)} ${isEn ? 'reserved' : 'dự phòng'}` : (isEn ? 'Manual' : 'Thủ công')}</strong></div>
+            </div>
+          </CardContent>
+        </Card>
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           <Card className="hover-lift bg-gradient-to-br from-indigo-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
@@ -1178,6 +1226,7 @@ export function ProxyPanel() {
             </CardContent>
           </Card>
         </div>
+        </div>
       )}
 
       {/* API 端点说明 */}
@@ -1190,70 +1239,30 @@ export function ProxyPanel() {
             {isEn ? 'API Endpoints' : 'Endpoint API'}
           </CardTitle>
         </CardHeader>
-        <CardContent className="proxy-endpoint-list space-y-1.5 text-sm">
-          <div className="flex items-center gap-2">
-            <span className="text-orange-500 w-11 flex-shrink-0 font-mono">POST</span>
-            <code className="text-muted-foreground flex-1 font-mono">/v1/chat/completions</code>
-            <span className="text-xs text-muted-foreground">{isEn ? 'OpenAI Compatible' : 'Tương thích OpenAI'}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-orange-500 w-11 flex-shrink-0 font-mono">POST</span>
-            <code className="text-muted-foreground flex-1 font-mono">/v1/responses</code>
-            <span className="text-xs text-muted-foreground">{isEn ? 'OpenAI Responses' : 'OpenAI Responses'}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-orange-500 w-11 flex-shrink-0 font-mono">POST</span>
-            <code className="text-muted-foreground flex-1 font-mono">/v1/messages</code>
-            <span className="text-xs text-muted-foreground">{isEn ? 'Claude Compatible' : 'Tương thích Claude'}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-orange-500 w-11 flex-shrink-0 font-mono">POST</span>
-            <code className="text-muted-foreground flex-1 font-mono">/anthropic/v1/messages</code>
-            <span className="text-xs text-muted-foreground">{isEn ? 'Claude Code' : 'Claude Code'}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-orange-500 w-11 flex-shrink-0 font-mono">POST</span>
-            <code className="text-muted-foreground flex-1 font-mono">/v1/messages/count_tokens</code>
-            <span className="text-xs text-muted-foreground">{isEn ? 'Token Count' : 'Đếm token'}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-green-500 w-11 flex-shrink-0 font-mono">GET</span>
-            <code className="text-muted-foreground flex-1 font-mono">/v1/models</code>
-            <span className="text-xs text-muted-foreground">{isEn ? 'Model List' : 'Danh sách model'}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-orange-500 w-11 flex-shrink-0 font-mono">POST</span>
-            <code className="text-muted-foreground flex-1 font-mono">/v1beta/models/*:generateContent</code>
-            <span className="text-xs text-muted-foreground">{isEn ? 'Gemini Compatible' : 'Tương thích Gemini'}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-green-500 w-11 flex-shrink-0 font-mono">GET</span>
-            <code className="text-muted-foreground flex-1 font-mono">/v1beta/models</code>
-            <span className="text-xs text-muted-foreground">{isEn ? 'Gemini Models' : 'Model Gemini'}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-green-500 w-11 flex-shrink-0 font-mono">GET</span>
-            <code className="text-muted-foreground flex-1 font-mono">/health</code>
-            <span className="text-xs text-muted-foreground">{isEn ? 'Health Check' : 'Kiểm tra health'}</span>
-          </div>
-          <div className="border-t pt-2 mt-2 space-y-1.5">
-            <div className="text-xs text-muted-foreground mb-1">{isEn ? 'Admin API (Requires API Key)' : 'Admin API (cần API Key)'}</div>
-            <div className="flex items-center gap-2">
-              <span className="text-green-500 w-11 flex-shrink-0 font-mono">GET</span>
-              <code className="text-muted-foreground flex-1 font-mono">/admin/stats</code>
-              <span className="text-xs text-muted-foreground">{isEn ? 'Detailed Stats' : 'Thống kê chi tiết'}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-green-500 w-11 flex-shrink-0 font-mono">GET</span>
-              <code className="text-muted-foreground flex-1 font-mono">/admin/accounts</code>
-              <span className="text-xs text-muted-foreground">{isEn ? 'Account List' : 'Danh sách tài khoản'}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-green-500 w-11 flex-shrink-0 font-mono">GET</span>
-              <code className="text-muted-foreground flex-1 font-mono">/admin/logs</code>
-              <span className="text-xs text-muted-foreground">{isEn ? 'Request Logs' : 'Log request'}</span>
-            </div>
-          </div>
+        <CardContent className="proxy-endpoint-list grid gap-3 text-sm lg:grid-cols-2">
+          {PROXY_ENDPOINT_GROUPS.map((group) => (
+            <section key={group.id} className="rounded-xl border bg-muted/20 p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-foreground/80">
+                  {isEn ? group.title.en : group.title.vi}
+                </h3>
+                <Badge variant="outline" className="text-[10px]">{group.endpoints.length}</Badge>
+              </div>
+              <div className="space-y-1.5">
+                {group.endpoints.map((endpoint) => (
+                  <div key={`${endpoint.method}:${endpoint.path}`} className="proxy-endpoint-row flex items-center gap-2 rounded-md px-1 py-0.5">
+                    <span className={`${endpoint.method === 'GET' ? 'text-green-500' : 'text-orange-500'} w-11 flex-shrink-0 font-mono text-xs`}>
+                      {endpoint.method}
+                    </span>
+                    <code className="min-w-0 flex-1 font-mono text-xs text-muted-foreground">{endpoint.path}</code>
+                    <span className="text-right text-[11px] text-muted-foreground">
+                      {isEn ? endpoint.label.en : endpoint.label.vi}{endpoint.optional ? ` (${isEn ? 'optional' : 'tùy chọn'})` : ''}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ))}
         </CardContent>
       </Card>
 

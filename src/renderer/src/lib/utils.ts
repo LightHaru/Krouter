@@ -5,6 +5,44 @@ export function cn(...inputs: ClassValue[]): string {
   return twMerge(clsx(inputs))
 }
 
+/**
+ * Chép text vào clipboard, trả về true nếu thành công.
+ *
+ * navigator.clipboard chỉ tồn tại trong secure context. Máy chủ standalone của Krouter là
+ * http.createServer thuần (không có listener HTTPS nào trong src/server), nên trên
+ * http://<ip-vps>:<port> lời gọi này ném TypeError ngay lập tức — 26 chỗ gọi trong renderer
+ * trước đây không chỗ nào feature-detect hay fallback, và phần lớn còn hiện thông báo
+ * "đã chép" ngay sau đó nên người dùng tưởng thành công. Electron không bị vì file:// là
+ * origin đáng tin.
+ */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // rơi xuống fallback bên dưới
+  }
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    // Giữ ngoài luồng hiển thị nhưng vẫn phải nằm trong DOM và focus được thì execCommand mới chạy.
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.top = '-1000px'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    textarea.setSelectionRange(0, textarea.value.length)
+    const ok = document.execCommand('copy')
+    textarea.remove()
+    return ok
+  } catch {
+    return false
+  }
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B'
   const k = 1024

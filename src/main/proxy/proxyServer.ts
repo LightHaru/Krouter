@@ -4,10 +4,12 @@ import https from 'https'
 import fs from 'fs'
 import nodePath from 'path'
 import crypto from 'crypto'
+import dns from 'dns'
 import { v4 as uuidv4 } from 'uuid'
 import type { Socket } from 'net'
 import type {
   OpenAIChatRequest,
+  OpenAIChatResponse,
   OpenAIMessage,
   OpenAIResponsesRequest,
   ClaudeRequest,
@@ -21,19 +23,26 @@ import type {
   KiroUsage,
   TokenRefreshCallback
 } from './types'
-import { AccountPool, ErrorType, classifyError, isBillingOrQuotaError, isThrottleError } from './accountPool'
+import {
+  AccountPool,
+  ErrorType,
+  classifyError,
+  isBillingOrQuotaError,
+  isThrottleError
+} from './accountPool'
 import {
   callKiroApiStream,
   callKiroApi,
   fetchKiroModels,
   isKiroToolInputIntegrityError,
+  setStreamTimeouts,
   setModelContextWindow,
   buildKiroPayload,
   mapModelId,
   resolveProfileArn,
   type KiroModel
 } from './kiroApi'
-import { proxyLogger, endpointMetrics, generateTraceId, categorizeError } from './logger'
+import { proxyLogger, endpointMetrics, categorizeError } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
   openaiToKiro,
@@ -47,6 +56,7 @@ import {
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
+import type { CacheProfile } from './promptCacheTracker'
 import { getRuntimeUserDataPath } from '../runtimePaths'
 import {
   KIRO_PROXY_DEFAULT_THINKING_EFFORTS,
@@ -82,22 +92,49 @@ import {
   converseUsageToKiro
 } from './bedrock'
 import {
-  isXpixiModel,
-  callXpixi
-} from './xpixi'
-import { generateImage, ImageStorageManager } from './bedrockImage'
+  CUSTOM_API_REASONING_EFFORTS,
+  allCustomProviders,
+  callCustomApiClaude,
+  callCustomApiOpenAI,
+  findCustomProvider,
+  listCustomApiModels,
+  normalizeCustomProvider,
+  type CustomApiProviderConfig
+} from './customApi'
+import { BedrockImageApiError, generateImage, ImageStorageManager } from './bedrockImage'
 import {
+  ChatGPTImageApiError,
   generateChatGPTImage,
-  isChatGPTImageModel,
   isBedrockImageModel,
   DEFAULT_CHATGPT_IMAGE_CONFIG,
   type ChatGPTImageConfig
 } from './chatgptImage'
 import {
   initiateOAuthFlow,
+  isTokenValid,
+  refreshAccessToken,
   DEFAULT_CHATGPT_OAUTH_CONFIG,
-  type ChatGPTOAuthConfig
+  type ChatGPTAccountState,
+  type ChatGPTTokenSet,
+  type OAuthFlowMode
 } from './chatgptOAuth'
+import {
+  CHATGPT_REASONING_EFFORTS,
+  buildCodexPayloadFromChat,
+  buildCodexPayloadFromResponses,
+  chatGPTCodexThinkingEfforts,
+  ChatGPTCodexApiError,
+  DEFAULT_CHATGPT_CODEX_CONFIG,
+  extractChatGPTCodexError,
+  fetchChatGPTUsage,
+  isChatGPTCodexModel,
+  iterateCodexSse,
+  listChatGPTCodexModels,
+  normalizeChatGPTReasoningEffort,
+  requestChatGPTCodex,
+  stripChatGPTPrefix,
+  type ChatGPTCodexConfig
+} from './chatgptCodex'
 import { SkillsManager } from './skills'
 import { McpServer } from './mcpServer'
 
@@ -117,20 +154,49 @@ export interface ProxyUsageStatsUpdate {
 
 export interface ProxyServerEvents {
   onRequest?: (info: { path: string; method: string; accountId?: string }) => void
-  onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; accountId?: string; accountEmail?: string; error?: string }) => void
+  onResponse?: (info: {
+    path: string
+    model?: string
+    status: number
+    tokens?: number
+    inputTokens?: number
+    outputTokens?: number
+    cacheReadTokens?: number
+    cacheWriteTokens?: number
+    reasoningTokens?: number
+    credits?: number
+    responseTime?: number
+    accountId?: string
+    accountEmail?: string
+    error?: string
+  }) => void
   onError?: (error: Error) => void
-  onConfigChanged?: (config: ProxyConfig) => void  // API Key 用量更新时触发
+  onConfigChanged?: (config: ProxyConfig) => void // API Key 用量更新时触发
   onStatusChange?: (running: boolean, port: number) => void
   onTokenRefresh?: TokenRefreshCallback
   onAccountUpdate?: (account: ProxyAccount) => void
   // 账号被 Kiro 后端长期封禁（如 TEMPORARILY_SUSPENDED / AccountSuspendedException）
   // 不同于临时 token 失效，需人工解封
-  onAccountSuspended?: (info: { accountId: string; email?: string; reason: string; message: string }) => void
-  onAccountQuotaExhausted?: (info: { accountId: string; email?: string; resetAt?: number; message: string }) => void
+  onAccountSuspended?: (info: {
+    accountId: string
+    email?: string
+    reason: string
+    message: string
+  }) => void
+  onAccountQuotaExhausted?: (info: {
+    accountId: string
+    email?: string
+    resetAt?: number
+    message: string
+  }) => void
   onCreditsUpdate?: (totalCredits: number) => void
   onTokensUpdate?: (inputTokens: number, outputTokens: number) => void
   onUsageStatsUpdate?: (usage: ProxyUsageStatsUpdate) => void
-  onRequestStatsUpdate?: (totalRequests: number, successRequests: number, failedRequests: number) => void
+  onRequestStatsUpdate?: (
+    totalRequests: number,
+    successRequests: number,
+    failedRequests: number
+  ) => void
   onPoolEmpty?: () => Promise<void> // 账号池为空时触发（冷启动懒加载）
 }
 
@@ -193,7 +259,9 @@ function modelDisplayName(id: string, modelName?: string): string {
   return id
     .split('-')
     .filter(Boolean)
-    .map(part => part === 'gpt' ? 'GPT' : part === 'ai' ? 'AI' : part[0]?.toUpperCase() + part.slice(1))
+    .map((part) =>
+      part === 'gpt' ? 'GPT' : part === 'ai' ? 'AI' : part[0]?.toUpperCase() + part.slice(1)
+    )
     .join(' ')
 }
 
@@ -222,7 +290,8 @@ function modelInputModalities(inputTypes?: string[]): ModelModality[] {
   for (const item of inputTypes ?? []) {
     const lower = item.toLowerCase()
     if (lower.includes('image')) values.add('image')
-    if (lower.includes('pdf') || lower.includes('document') || lower.includes('file')) values.add('pdf')
+    if (lower.includes('pdf') || lower.includes('document') || lower.includes('file'))
+      values.add('pdf')
     if (lower.includes('audio')) values.add('audio')
     if (lower.includes('video')) values.add('video')
   }
@@ -248,8 +317,12 @@ function extractThinkingEfforts(schema?: Record<string, unknown> | null): string
   const typeField = thinkingProps?.type as Record<string, unknown> | undefined
   const enumValues = typeField?.enum as string[] | undefined
   if (enumValues?.includes('adaptive') || enumValues?.includes('disabled')) {
-    const effortField = (props.output_config as Record<string, unknown> | undefined)?.properties as Record<string, unknown> | undefined
-    const effortEnum = (effortField?.effort as Record<string, unknown> | undefined)?.enum as string[] | undefined
+    const effortField = (props.output_config as Record<string, unknown> | undefined)?.properties as
+      | Record<string, unknown>
+      | undefined
+    const effortEnum = (effortField?.effort as Record<string, unknown> | undefined)?.enum as
+      | string[]
+      | undefined
     return effortEnum || undefined
   }
   return undefined
@@ -259,12 +332,39 @@ function modelSchemaSupportsThinking(schema?: Record<string, unknown> | null): b
   return !!(schema?.properties as Record<string, unknown> | undefined)?.thinking
 }
 
+/**
+ * Hình dạng model mà proxy trả về cho UI và cho /v1/models.
+ * Trước đây shape này chỉ tồn tại dưới dạng kiểu suy luận và được tham chiếu bằng
+ * `ReturnType<typeof ProxyServer.mapKiroModelToApi>` ở hơn 8 chỗ; đặt tên cho nó vừa
+ * đọc dễ hơn vừa cho phép chú thích kiểu trả về tường minh.
+ */
+export interface KiroApiModel {
+  id: string
+  name: string
+  description: string
+  inputTypes?: string[]
+  maxInputTokens?: number | null
+  maxOutputTokens?: number | null
+  rateMultiplier?: number
+  rateUnit?: string
+  supportsThinking: boolean
+  thinkingEfforts?: string[]
+  supportsPromptCaching: boolean
+  modelProvider?: string
+}
+
 function clientModelSupportsThinking(id: string, schema?: Record<string, unknown> | null): boolean {
   return modelSchemaSupportsThinking(schema) || kiroProxyModelSupportsThinking(id)
 }
 
-function clientModelThinkingEfforts(id: string, schema?: Record<string, unknown> | null): string[] | undefined {
-  return extractThinkingEfforts(schema) || (clientModelSupportsThinking(id, schema) ? KIRO_PROXY_DEFAULT_THINKING_EFFORTS : undefined)
+function clientModelThinkingEfforts(
+  id: string,
+  schema?: Record<string, unknown> | null
+): string[] | undefined {
+  return (
+    extractThinkingEfforts(schema) ||
+    (clientModelSupportsThinking(id, schema) ? KIRO_PROXY_DEFAULT_THINKING_EFFORTS : undefined)
+  )
 }
 
 function buildClientModel(input: {
@@ -278,7 +378,11 @@ function buildClientModel(input: {
   maxOutputTokens?: number | null
   rateMultiplier?: number
   rateUnit?: string
-  promptCaching?: { supportsPromptCaching: boolean; maximumCacheCheckpointsPerRequest?: number | null; minimumTokensPerCacheCheckpoint?: number | null } | null
+  promptCaching?: {
+    supportsPromptCaching: boolean
+    maximumCacheCheckpointsPerRequest?: number | null
+    minimumTokensPerCacheCheckpoint?: number | null
+  } | null
   additionalModelRequestFieldsSchema?: Record<string, unknown> | null
   modelProvider?: string | null
 }): ClientModel {
@@ -286,10 +390,18 @@ function buildClientModel(input: {
   const inputModalities = modelInputModalities(input.supportedInputTypes)
   const outputModalities: ModelModality[] = ['text']
   const output = modelOutputLimit(input.id, input.maxOutputTokens)
-  const context = typeof input.maxInputTokens === 'number' && input.maxInputTokens > 0 ? input.maxInputTokens : 200000
-  const supportsThinking = clientModelSupportsThinking(input.id, input.additionalModelRequestFieldsSchema)
+  const context =
+    typeof input.maxInputTokens === 'number' && input.maxInputTokens > 0
+      ? input.maxInputTokens
+      : 200000
+  const supportsThinking = clientModelSupportsThinking(
+    input.id,
+    input.additionalModelRequestFieldsSchema
+  )
   const reasoning = supportsThinking
-  const interleaved: ClientModel['interleaved'] = supportsThinking ? { field: 'reasoning_content' } : false
+  const interleaved: ClientModel['interleaved'] = supportsThinking
+    ? { field: 'reasoning_content' }
+    : false
 
   return {
     id: input.id,
@@ -303,7 +415,7 @@ function buildClientModel(input: {
     model_name: input.modelName || name,
     family: modelFamily(input.id),
     release_date: '',
-    attachment: inputModalities.some(item => item !== 'text'),
+    attachment: inputModalities.some((item) => item !== 'text'),
     reasoning,
     temperature: true,
     tool_call: true,
@@ -311,14 +423,16 @@ function buildClientModel(input: {
     cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
     limit: {
       context,
-      ...(typeof input.maxInputTokens === 'number' && input.maxInputTokens > 0 ? { input: input.maxInputTokens } : {}),
+      ...(typeof input.maxInputTokens === 'number' && input.maxInputTokens > 0
+        ? { input: input.maxInputTokens }
+        : {}),
       output
     },
     modalities: { input: inputModalities, output: outputModalities },
     capabilities: {
       temperature: true,
       reasoning,
-      attachment: inputModalities.some(item => item !== 'text'),
+      attachment: inputModalities.some((item) => item !== 'text'),
       toolcall: true,
       input: modelCapabilityMap(inputModalities),
       output: modelCapabilityMap(outputModalities),
@@ -326,7 +440,9 @@ function buildClientModel(input: {
     },
     context_length: context,
     max_tokens: output,
-    ...(typeof input.maxInputTokens === 'number' && input.maxInputTokens > 0 ? { max_input_tokens: input.maxInputTokens } : {}),
+    ...(typeof input.maxInputTokens === 'number' && input.maxInputTokens > 0
+      ? { max_input_tokens: input.maxInputTokens }
+      : {}),
     max_output_tokens: output,
     inputTypes: input.supportedInputTypes,
     rateMultiplier: input.rateMultiplier,
@@ -356,7 +472,10 @@ function buildClientModel(input: {
 }
 
 // 请求体超限错误（统一识别用，触发 413 响应）
-function buildKiroPresetClientModel(preset: (typeof KIRO_PROXY_MODEL_PRESETS)[number], created: number): ClientModel {
+function buildKiroPresetClientModel(
+  preset: (typeof KIRO_PROXY_MODEL_PRESETS)[number],
+  created: number
+): ClientModel {
   return buildClientModel({
     id: preset.id,
     created,
@@ -385,7 +504,10 @@ function buildKiroPresetModel(preset: (typeof KIRO_PROXY_MODEL_PRESETS)[number])
 }
 
 class BodyTooLargeError extends Error {
-  constructor(public readonly received: number, public readonly limit: number) {
+  constructor(
+    public readonly received: number,
+    public readonly limit: number
+  ) {
     super(`Request body too large: ${received} bytes exceeds limit of ${limit} bytes`)
     this.name = 'BodyTooLargeError'
   }
@@ -405,14 +527,25 @@ export interface NoAccountDiagnosis {
 
 const MIN_PROXY_RETRY_DELAY_MS = 5_000
 const MAX_PROXY_RETRY_DELAY_MS = 10_000
+/**
+ * Trần số model được theo dõi trong thống kê. Khoá đến từ chuỗi model thô của client và
+ * mapModelId cố ý fallback cho id lạ, nên nếu không chặn thì stats.modelStats (trả về
+ * dashboard) và apiKey.usage.byModel (ghi store.json mỗi request) phình vô hạn.
+ */
+const MAX_TRACKED_MODELS = 200
 
 export class ProxyServer {
   private server: http.Server | https.Server | null = null
-  private fallbackServer: http.Server | null = null  // HTTPS 启用时同时监听 HTTP（可选）
+  private fallbackServer: http.Server | null = null // HTTPS 启用时同时监听 HTTP（可选）
   private accountPool: AccountPool
   private config: ProxyConfig
   private stats: ProxyStats
-  private sessionStats: { totalRequests: number; successRequests: number; failedRequests: number; startTime: number }
+  private sessionStats: {
+    totalRequests: number
+    successRequests: number
+    failedRequests: number
+    startTime: number
+  }
   private events: ProxyServerEvents
   private refreshingTokens: Set<string> = new Set() // 防止并发刷新
   private isHttps: boolean = false
@@ -424,7 +557,10 @@ export class ProxyServer {
   /** P1-8 会话粘性：session hint → accountId 的映射（10 分钟 TTL） */
   private sessionAffinity: Map<string, { accountId: string; lastAt: number }> = new Map()
   private modelLoadBalanceState: Map<string, number> = new Map()
-  private accountModelCapabilityCache: Map<string, { timestamp: number; modelIds: Set<string> }> = new Map()
+  /** 模型映射通配符编译后的正则缓存（key = rule.sourceModel），避免每个请求重新编译 */
+  private modelMappingRegexCache: Map<string, RegExp> = new Map()
+  private accountModelCapabilityCache: Map<string, { timestamp: number; modelIds: Set<string> }> =
+    new Map()
   // In-flight capability warms, keyed by account id, so a cache-miss triggers at
   // most ONE background fetchKiroModels per account instead of one per request.
   // Mirrors Kiro-Go: capability is refreshed out-of-band, never inline on the
@@ -462,8 +598,19 @@ export class ProxyServer {
   private mcpServer: McpServer
   /** Phase 15: ChatGPT image generation config */
   private chatgptImageConfig: ChatGPTImageConfig = DEFAULT_CHATGPT_IMAGE_CONFIG
-  /** Phase 15: Pending OAuth flow (null when no flow in progress) */
-  private pendingOAuthFlow: Promise<any> | null = null
+  private chatgptCodexConfig: ChatGPTCodexConfig = DEFAULT_CHATGPT_CODEX_CONFIG
+  private chatgptRefreshLocks = new Map<string, Promise<ChatGPTAccountState>>()
+  /** Pending OAuth flow. Manual flows wait for a callback URL submitted by the VPS UI. */
+  private pendingOAuthFlow: {
+    id: string
+    mode: OAuthFlowMode
+    startedAt: number
+    expiresAt: number
+    submitCallbackUrl?: (callbackUrl: string) => Promise<{ tokens: ChatGPTTokenSet }>
+    cancel: (reason?: string) => void
+  } | null = null
+  private lastChatGPTOAuthError: string | null = null
+  private lastChatGPTOAuthCompletedAt?: number
 
   /**
    * 从请求中提取 session hint，用于稳定 conversationId
@@ -497,9 +644,7 @@ export class ProxyServer {
     // 优先级 2.5：metadata 中的 session/conversation
     const metadata = b.metadata as Record<string, unknown> | undefined
     if (metadata) {
-      const metaHint =
-        (metadata.session_id as string) ||
-        (metadata.conversation_id as string)
+      const metaHint = (metadata.session_id as string) || (metadata.conversation_id as string)
       if (metaHint) return metaHint
     }
 
@@ -525,6 +670,21 @@ export class ProxyServer {
       sessionAffinityEnabled: false,
       ...config
     }
+    this.chatgptImageConfig = {
+      ...DEFAULT_CHATGPT_IMAGE_CONFIG,
+      ...(this.config.chatgptImage || {})
+    }
+    this.chatgptCodexConfig = {
+      ...DEFAULT_CHATGPT_CODEX_CONFIG,
+      ...(this.config.chatgptCodex || {}),
+      catalogVersion: DEFAULT_CHATGPT_CODEX_CONFIG.catalogVersion,
+      reasoningEffort: normalizeChatGPTReasoningEffort(this.config.chatgptCodex?.reasoningEffort)
+    }
+    this.config.chatgptCodex = this.chatgptCodexConfig
+    this.config.customApiProviders = (this.config.customApiProviders || []).map(
+      normalizeCustomProvider
+    )
+    this.applyStreamTimeoutConfig()
     this.normalizeAccountBalancingConfig()
     this.accountPool = new AccountPool()
     this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
@@ -558,7 +718,9 @@ export class ProxyServer {
       const skillsBuiltinDir = nodePath.join(__dirname, '../../../docs/skills')
       const skillsCustomDir = nodePath.join(getRuntimeUserDataPath(), 'skills')
       this.skillsManager = new SkillsManager(skillsBuiltinDir, skillsCustomDir)
-    } catch { /* skills optional */ }
+    } catch {
+      /* skills optional */
+    }
 
     // Phase 14: Initialize MCP server
     this.mcpServer = new McpServer({
@@ -584,8 +746,11 @@ export class ProxyServer {
   private isBindingExternal(host?: string): boolean {
     if (!host) return false
     const h = host.toLowerCase().trim()
-    return h === '0.0.0.0' || h === '::' || h === '*' || (
-      h !== '127.0.0.1' && h !== '::1' && h !== 'localhost'
+    return (
+      h === '0.0.0.0' ||
+      h === '::' ||
+      h === '*' ||
+      (h !== '127.0.0.1' && h !== '::1' && h !== 'localhost')
     )
   }
 
@@ -598,25 +763,47 @@ export class ProxyServer {
 
     // P0-2 安全护栏：外网绑定 + 无 API Key → 拒绝启动（用户可以显式 allowExternalWithoutApiKey 解除）
     if (this.isBindingExternal(this.config.host)) {
-      const hasAnyKey = (this.config.apiKeys?.some(k => k.enabled && k.key) ?? false) || !!this.config.apiKey
+      const hasAnyKey =
+        (this.config.apiKeys?.some((k) => k.enabled && k.key) ?? false) || !!this.config.apiKey
       if (!hasAnyKey && !this.config.allowExternalWithoutApiKey) {
         const err = new Error(
           `[Security] Refused to start: host=${this.config.host} exposes to network but no API Key configured. ` +
-          `Set at least one API Key, or change host to 127.0.0.1, or set allowExternalWithoutApiKey=true (NOT RECOMMENDED).`
+            `Set at least one API Key, or change host to 127.0.0.1, or set allowExternalWithoutApiKey=true (NOT RECOMMENDED).`
         )
         console.error('[ProxyServer]', err.message)
         this.events.onError?.(err)
         throw err
       }
       if (!hasAnyKey) {
-        console.warn(`[ProxyServer] [Security] WARNING: binding to ${this.config.host} without API Key (allowExternalWithoutApiKey=true). This exposes your accounts to the network!`)
+        console.warn(
+          `[ProxyServer] [Security] WARNING: binding to ${this.config.host} without API Key (allowExternalWithoutApiKey=true). This exposes your accounts to the network!`
+        )
       }
     }
 
-    return new Promise((resolve, reject) => {
+    return await new Promise((resolve, reject) => {
       this.isStopping = false
-      const requestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => 
-        this.handleRequest(req, res)
+      // 防止 handleRequest 逃逸的异常变成 unhandledRejection 而让整个进程崩溃
+      const requestHandler = (req: http.IncomingMessage, res: http.ServerResponse): void => {
+        this.handleRequest(req, res).catch((error) => {
+          console.error('[ProxyServer] Unhandled request error:', error)
+          try {
+            if (res.writableEnded || res.destroyed) return
+            if (!res.headersSent) {
+              res.writeHead(500, { 'Content-Type': 'application/json' })
+              res.end(
+                JSON.stringify({
+                  error: { message: 'Internal server error', type: 'error', code: 500 }
+                })
+              )
+            } else {
+              res.end()
+            }
+          } catch {
+            /* ignore */
+          }
+        })
+      }
 
       // 检查是否启用 TLS
       if (this.config.tls?.enabled) {
@@ -662,7 +849,7 @@ export class ProxyServer {
           setTimeout(() => {
             if (!this.isStopping && this.config.autoStart && !this.isRunning()) {
               console.log('[ProxyServer] Auto-restarting...')
-              this.start().catch(err => {
+              this.start().catch((err) => {
                 console.error('[ProxyServer] Auto-restart failed:', err)
               })
             }
@@ -675,7 +862,7 @@ export class ProxyServer {
       const headersMs = this.config.headersTimeoutMs ?? 60_000
       this.server.keepAliveTimeout = keepAliveMs
       this.server.headersTimeout = Math.max(headersMs, keepAliveMs + 1000) // headers 必须 > keepAlive，否则 Node 会 warn
-      this.server.requestTimeout = 0  // 流式响应可能很长，禁用 request 总超时
+      this.server.requestTimeout = 0 // 流式响应可能很长，禁用 request 总超时
 
       // 启动定期清理（每 5 分钟）
       if (this.cleanupTimer) clearInterval(this.cleanupTimer)
@@ -685,7 +872,10 @@ export class ProxyServer {
 
       const protocol = this.isHttps ? 'https' : 'http'
       this.server.listen(this.config.port, this.config.host, () => {
-        proxyLogger.info('ProxyServer', `Started on ${protocol}://${this.config.host}:${this.config.port} (keepAlive=${keepAliveMs}ms)`)
+        proxyLogger.info(
+          'ProxyServer',
+          `Started on ${protocol}://${this.config.host}:${this.config.port} (keepAlive=${keepAliveMs}ms)`
+        )
         this.stats.startTime = Date.now()
         // 重置会话统计
         this.sessionStats = {
@@ -699,7 +889,11 @@ export class ProxyServer {
       })
 
       // D4 启用 TLS 时同时监听 HTTP fallback 端口（如果配置了 fallbackPort）
-      if (this.isHttps && this.config.fallbackPort && this.config.fallbackPort !== this.config.port) {
+      if (
+        this.isHttps &&
+        this.config.fallbackPort &&
+        this.config.fallbackPort !== this.config.port
+      ) {
         const fallback = http.createServer(requestHandler)
         fallback.keepAliveTimeout = keepAliveMs
         fallback.headersTimeout = Math.max(headersMs, keepAliveMs + 1000)
@@ -708,9 +902,14 @@ export class ProxyServer {
           this.sockets.add(socket)
           socket.on('close', () => this.sockets.delete(socket))
         })
-        fallback.on('error', (err) => proxyLogger.warn('ProxyServer', `Fallback HTTP error: ${err.message}`))
+        fallback.on('error', (err) =>
+          proxyLogger.warn('ProxyServer', `Fallback HTTP error: ${err.message}`)
+        )
         fallback.listen(this.config.fallbackPort, this.config.host, () => {
-          proxyLogger.info('ProxyServer', `Fallback HTTP listening on http://${this.config.host}:${this.config.fallbackPort}`)
+          proxyLogger.info(
+            'ProxyServer',
+            `Fallback HTTP listening on http://${this.config.host}:${this.config.fallbackPort}`
+          )
         })
         this.fallbackServer = fallback
       }
@@ -721,7 +920,7 @@ export class ProxyServer {
   // P1-13 当 tls.enabled 但未提供 cert/key 时，自动生成自签证书
   private getTlsOptions(): https.ServerOptions {
     const tls = this.config.tls!
-    
+
     let cert: string
     let key: string
 
@@ -736,14 +935,20 @@ export class ProxyServer {
     } else {
       // 自动生成自签证书（位于 userData/proxy-tls/）
       try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ: selfSignedCert kéo theo node-forge, chỉ cần khi bật HTTPS
         const { ensureProxySelfSignedCert } = require('./selfSignedCert')
         const hostnames = [this.config.host || '127.0.0.1']
         const result = ensureProxySelfSignedCert(getRuntimeUserDataPath(), hostnames)
-        proxyLogger.info('ProxyServer', `Using self-signed TLS cert (SAN=${result.altNames.join(',')}, fingerprint=${result.fingerprint.slice(0, 19)}...)`)
+        proxyLogger.info(
+          'ProxyServer',
+          `Using self-signed TLS cert (SAN=${result.altNames.join(',')}, fingerprint=${result.fingerprint.slice(0, 19)}...)`
+        )
         cert = result.cert
         key = result.key
       } catch (err) {
-        throw new Error(`TLS enabled but no certificate/key provided and auto-generation failed: ${(err as Error).message}`)
+        throw new Error(
+          `TLS enabled but no certificate/key provided and auto-generation failed: ${(err as Error).message}`
+        )
       }
     }
 
@@ -755,6 +960,7 @@ export class ProxyServer {
    */
   getSelfSignedCertInfo(): import('./selfSignedCert').ProxySelfSignedCert | null {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ: selfSignedCert kéo theo node-forge, chỉ cần khi bật HTTPS
       const { ensureProxySelfSignedCert } = require('./selfSignedCert')
       return ensureProxySelfSignedCert(getRuntimeUserDataPath(), [this.config.host || '127.0.0.1'])
     } catch (err) {
@@ -766,9 +972,14 @@ export class ProxyServer {
   /** 强制重新生成自签证书（用户在 UI 上点"重新生成"） */
   regenerateSelfSignedCert(): import('./selfSignedCert').ProxySelfSignedCert | null {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ: selfSignedCert kéo theo node-forge, chỉ cần khi bật HTTPS
       const { ensureProxySelfSignedCert } = require('./selfSignedCert')
       this.appendAuditLog('regenerate_self_signed_cert', { host: this.config.host })
-      return ensureProxySelfSignedCert(getRuntimeUserDataPath(), [this.config.host || '127.0.0.1'], true)
+      return ensureProxySelfSignedCert(
+        getRuntimeUserDataPath(),
+        [this.config.host || '127.0.0.1'],
+        true
+      )
     } catch (err) {
       proxyLogger.warn('ProxyServer', `regenerateSelfSignedCert failed: ${(err as Error).message}`)
       return null
@@ -791,18 +1002,23 @@ export class ProxyServer {
     const main = this.server
     const fallback = this.fallbackServer
 
-    return new Promise((resolve) => {
+    return await new Promise((resolve) => {
       let done = false
-      const finish = () => {
+      const finish = (): void => {
         if (done) return
         done = true
+        // 取消强制关闭定时器，防止它在下一次 start() 之后才触发并杀掉新服务器的连接
+        clearTimeout(forceTimer)
         proxyLogger.info('ProxyServer', 'Stopped')
         this.server = null
         this.fallbackServer = null
         this.isStopping = false
         this.activeRequests.clear()
         this.sockets.clear()
-        if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null }
+        if (this.cleanupTimer) {
+          clearInterval(this.cleanupTimer)
+          this.cleanupTimer = null
+        }
         this.events.onStatusChange?.(false, this.config.port)
         resolve()
       }
@@ -814,16 +1030,32 @@ export class ProxyServer {
       fallback?.close()
 
       // P1-14 优雅停止：给正在进行中的请求时间完成，超时再强制
-      this.activeRequests.forEach(controller => {
+      this.activeRequests.forEach((controller) => {
         // 给客户端一个明确的 stop 信号，但不立即中断已发送的响应流
-        try { controller.abort(new Error('Proxy server stopped')) } catch { /* ignore */ }
+        try {
+          controller.abort(new Error('Proxy server stopped'))
+        } catch {
+          /* ignore */
+        }
       })
 
       // 超时强制 destroy
-      setTimeout(() => {
-        this.sockets.forEach(socket => { try { socket.destroy() } catch { /* ignore */ } })
-        finish()
-      }, Math.max(0, gracefulMs))
+      // 先快照 socket 集合：this.sockets 会被下一次 start() 继续复用，
+      // 若直接闭包引用它，快速重启后这个定时器会销毁新服务器的活跃连接
+      const socketsToKill = new Set(this.sockets)
+      const forceTimer = setTimeout(
+        () => {
+          socketsToKill.forEach((socket) => {
+            try {
+              socket.destroy()
+            } catch {
+              /* ignore */
+            }
+          })
+          finish()
+        },
+        Math.max(0, gracefulMs)
+      )
     })
   }
 
@@ -833,12 +1065,20 @@ export class ProxyServer {
   updateConfig(config: Partial<ProxyConfig>): void {
     // 标记需要重启的字段
     const restartTriggerFields: Array<keyof ProxyConfig> = ['port', 'host', 'tls', 'fallbackPort']
-    const willRestart = restartTriggerFields.some(k => k in config && JSON.stringify(this.config[k]) !== JSON.stringify(config[k]))
+    const willRestart = restartTriggerFields.some(
+      (k) => k in config && JSON.stringify(this.config[k]) !== JSON.stringify(config[k])
+    )
     if (willRestart && this.isRunning()) {
       this._needsRestart = true
-      proxyLogger.warn('ProxyServer', `Config change requires restart: ${restartTriggerFields.filter(k => k in config).join(', ')}`)
+      proxyLogger.warn(
+        'ProxyServer',
+        `Config change requires restart: ${restartTriggerFields.filter((k) => k in config).join(', ')}`
+      )
     }
-    this.appendAuditLog('config_changed', { fields: Object.keys(config), needsRestart: willRestart })
+    this.appendAuditLog('config_changed', {
+      fields: Object.keys(config),
+      needsRestart: willRestart
+    })
     if (config.modelMappings) {
       this.modelLoadBalanceState.clear()
     }
@@ -846,7 +1086,34 @@ export class ProxyServer {
       this.bedrockModelIdCache = null
       this.poolModelSupportCache.clear()
     }
+    if (config.customApiProviders) {
+      config = {
+        ...config,
+        customApiProviders: config.customApiProviders.map(normalizeCustomProvider)
+      }
+    }
+    if (config.chatgptImage) {
+      const nextImageConfig = { ...this.chatgptImageConfig, ...config.chatgptImage }
+      this.chatgptImageConfig = { ...DEFAULT_CHATGPT_IMAGE_CONFIG, ...nextImageConfig }
+      config = { ...config, chatgptImage: nextImageConfig }
+    }
+    if (config.chatgptCodex) {
+      const nextCodexConfig = { ...this.chatgptCodexConfig, ...config.chatgptCodex }
+      nextCodexConfig.reasoningEffort = normalizeChatGPTReasoningEffort(
+        nextCodexConfig.reasoningEffort
+      )
+      this.chatgptCodexConfig = {
+        ...DEFAULT_CHATGPT_CODEX_CONFIG,
+        ...nextCodexConfig,
+        catalogVersion: DEFAULT_CHATGPT_CODEX_CONFIG.catalogVersion
+      }
+      nextCodexConfig.catalogVersion = DEFAULT_CHATGPT_CODEX_CONFIG.catalogVersion
+      config = { ...config, chatgptCodex: nextCodexConfig }
+    }
     this.config = { ...this.config, ...config }
+    if (config.streamFirstByteTimeoutMs !== undefined || config.streamIdleTimeoutMs !== undefined) {
+      this.applyStreamTimeoutConfig()
+    }
     this.normalizeAccountBalancingConfig()
     // 同步账号选择策略到 accountPool
     this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
@@ -916,9 +1183,8 @@ export class ProxyServer {
     }
   }
 
-
   private validateClaudeContentBlocks(blocks: ClaudeContentBlock[]): void {
-    blocks.forEach(block => {
+    blocks.forEach((block) => {
       this.validateCacheControl(block.cache_control)
       if (Array.isArray(block.content)) {
         this.validateClaudeContentBlocks(block.content)
@@ -927,51 +1193,149 @@ export class ProxyServer {
   }
 
   private validateOpenAICacheControls(request: OpenAIChatRequest): void {
-    request.messages.forEach(message => {
+    request.messages.forEach((message) => {
       this.validateCacheControl(message.cache_control)
       if (Array.isArray(message.content)) {
-        message.content.forEach(part => this.validateCacheControl(part.cache_control))
+        message.content.forEach((part) => this.validateCacheControl(part.cache_control))
       }
     })
-    request.tools?.forEach(tool => this.validateCacheControl(tool.cache_control))
+    request.tools?.forEach((tool) => this.validateCacheControl(tool.cache_control))
   }
 
   private validateClaudeCacheControls(request: ClaudeRequest): void {
     if (Array.isArray(request.system)) {
-      request.system.forEach(block => this.validateCacheControl(block.cache_control))
+      request.system.forEach((block) => this.validateCacheControl(block.cache_control))
     }
-    request.messages.forEach(message => {
+    request.messages.forEach((message) => {
       this.validateCacheControl(message.cache_control)
       if (Array.isArray(message.content)) {
         this.validateClaudeContentBlocks(message.content)
       }
     })
-    request.tools?.forEach(tool => this.validateCacheControl(tool.cache_control))
+    request.tools?.forEach((tool) => this.validateCacheControl(tool.cache_control))
+  }
+
+  /**
+   * SSRF 防护：判断一个已解析的 IP 是否落在禁止访问的网段
+   * （回环 / 私有网段 / 链路本地即云元数据 169.254.169.254 / 唯一本地 / 组播 / 未指定地址）
+   */
+  private isBlockedAddress(ip: string): boolean {
+    if (!ip) return true
+    let addr = ip.trim().toLowerCase()
+    // 去掉 IPv6 的 zone id（如 fe80::1%eth0）
+    const zoneAt = addr.indexOf('%')
+    if (zoneAt >= 0) addr = addr.slice(0, zoneAt)
+    // IPv4-mapped IPv6（::ffff:127.0.0.1）按 IPv4 规则判断，避免绕过
+    const mapped = addr.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/)
+    if (mapped) addr = mapped[1]
+
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(addr)) {
+      const parts = addr.split('.').map((part) => parseInt(part, 10))
+      if (parts.some((n) => !Number.isFinite(n) || n < 0 || n > 255)) return true
+      const [a, b] = parts
+      if (a === 0) return true // 0.0.0.0/8 未指定
+      if (a === 10) return true // 10/8 私有
+      if (a === 127) return true // 127/8 回环
+      if (a === 169 && b === 254) return true // 169.254/16 链路本地（云元数据）
+      if (a === 172 && b >= 16 && b <= 31) return true // 172.16/12 私有
+      if (a === 192 && b === 168) return true // 192.168/16 私有
+      if (a === 100 && b >= 64 && b <= 127) return true // 100.64/10 CGNAT
+      if (a === 192 && b === 0) return true // 192.0.0/24 + 192.0.2/24 保留
+      if (a === 198 && (b === 18 || b === 19)) return true // 198.18/15 基准测试网段
+      if (a >= 224) return true // 组播 / 保留 / 广播
+      return false
+    }
+
+    // IPv6
+    if (addr === '::' || addr === '::1') return true // 未指定 / 回环
+    const head = parseInt(addr.split(':')[0] || '0', 16)
+    if (Number.isNaN(head)) return true
+    if ((head & 0xffc0) === 0xfe80) return true // fe80::/10 链路本地
+    if ((head & 0xfe00) === 0xfc00) return true // fc00::/7 唯一本地
+    if ((head & 0xff00) === 0xff00) return true // ff00::/8 组播
+    return false
+  }
+
+  /**
+   * SSRF 防护：远程图片 URL 必须是 http(s)，且解析出的每一个 IP 都不能落在内网段
+   */
+  private async assertRemoteImageUrlAllowed(
+    url: string
+  ): Promise<{ address: string; family: number }> {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      throw new Error(`Blocked image URL protocol: ${parsed.protocol}`)
+    }
+    const hostname = parsed.hostname.replace(/^\[/, '').replace(/\]$/, '')
+    if (!hostname) throw new Error('Blocked image URL: empty hostname')
+    const resolved = await dns.promises.lookup(hostname, { all: true })
+    const addresses = Array.isArray(resolved) ? resolved : [resolved]
+    if (addresses.length === 0) throw new Error(`Blocked image URL: ${hostname} did not resolve`)
+    for (const entry of addresses) {
+      if (this.isBlockedAddress(entry.address)) {
+        throw new Error(
+          `Blocked image URL: ${hostname} resolves to non-public address ${entry.address}`
+        )
+      }
+    }
+    // Trả về địa chỉ đã kiểm để bên gọi GHIM đúng IP đó khi kết nối.
+    return { address: addresses[0].address, family: addresses[0].family }
   }
 
   private async downloadImageDataUrl(url: string, signal?: AbortSignal): Promise<string> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 15000)
-    const abort = () => controller.abort(this.getAbortError(signal))
+    const abort = (): void => controller.abort(this.getAbortError(signal))
     try {
       if (signal?.aborted) throw this.getAbortError(signal)
       signal?.addEventListener('abort', abort, { once: true })
+      // SSRF 防护：先校验协议 + 解析出的 IP，再发出请求
+      const pinned = await this.assertRemoteImageUrlAllowed(url)
       const agent = (() => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ để tránh phụ thuộc vòng proxyServer <-> systemProxy
         const { getSystemProxy, safeCreateProxyAgent } = require('./systemProxy')
-        const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
+        const envProxy =
+          process.env.HTTPS_PROXY ||
+          process.env.https_proxy ||
+          process.env.HTTP_PROXY ||
+          process.env.http_proxy
         const envAgent = safeCreateProxyAgent(envProxy)
         if (envAgent) return envAgent
         return safeCreateProxyAgent(getSystemProxy())
       })()
-      const { fetch: undiciFetch } = require('undici')
-      const response = agent
-        ? await undiciFetch(url, { signal: controller.signal, dispatcher: agent }) as unknown as globalThis.Response
-        : await fetch(url, { signal: controller.signal })
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ: chỉ dựng dispatcher undici khi thật sự đi qua proxy
+      const { fetch: undiciFetch, Agent } = require('undici')
+      // redirect: 'error' —— 禁止跟随重定向，否则公网域名可以 302 跳回内网绕过上面的校验
+      const fetchOptions: Record<string, unknown> = { signal: controller.signal, redirect: 'error' }
+      if (agent) {
+        // Đi qua proxy thì chính proxy mới là bên phân giải tên miền, ta không ghim được IP.
+        fetchOptions.dispatcher = agent
+      } else {
+        // GHIM IP đã kiểm: undici sẽ tự phân giải lại hostname khi mở socket, nên nếu chỉ
+        // kiểm trước rồi fetch theo tên miền thì kẻ tấn công dùng DNS rebinding (TTL 0,
+        // luân phiên IP công cộng / 127.0.0.1) là vượt qua được toàn bộ hàng rào ở trên.
+        // lookup ở đây luôn trả về đúng địa chỉ vừa được xác thực; SNI và Host vẫn giữ hostname gốc.
+        fetchOptions.dispatcher = new Agent({
+          connect: {
+            lookup: (
+              _hostname: string,
+              _options: unknown,
+              callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void
+            ): void => {
+              callback(null, pinned.address, pinned.family)
+            }
+          }
+        })
+      }
+      const response = (await undiciFetch(url, fetchOptions)) as unknown as globalThis.Response
       if (!response.ok) {
         throw new Error(`Failed to download image: HTTP ${response.status}`)
       }
       const contentType = response.headers.get('content-type')?.split(';')[0]?.toLowerCase()
-      if (!contentType || !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(contentType)) {
+      if (
+        !contentType ||
+        !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(contentType)
+      ) {
         throw new Error(`Unsupported image content-type: ${contentType || 'unknown'}`)
       }
       const arrayBuffer = await response.arrayBuffer()
@@ -979,36 +1343,63 @@ export class ProxyServer {
         throw new Error('Image exceeds 10MB limit')
       }
       return `data:${contentType};base64,${Buffer.from(arrayBuffer).toString('base64')}`
+    } catch (error) {
+      // 中断语义必须原样透传，否则上层的 isAbortError 判断会失效
+      if (
+        this.isAbortError(error, signal) ||
+        (error instanceof Error && error.name === 'AbortError')
+      )
+        throw error
+      // 细节只写本地日志：对调用方统一返回固定文案，避免变成内网扫描/端口探测的 oracle
+      console.warn(
+        '[ProxyServer] Remote image download failed:',
+        error instanceof Error ? error.message : String(error)
+      )
+      throw new Error('Failed to download remote image')
     } finally {
       clearTimeout(timeout)
       signal?.removeEventListener('abort', abort)
     }
   }
 
-  private async resolveOpenAIHttpImages(request: OpenAIChatRequest, signal?: AbortSignal): Promise<OpenAIChatRequest> {
-    await Promise.all(request.messages.map(async message => {
-      if (!Array.isArray(message.content)) return
-      await Promise.all(message.content.map(async part => {
-        if (part.type !== 'image_url' || !part.image_url?.url.startsWith('http')) return
-        part.image_url.url = await this.downloadImageDataUrl(part.image_url.url, signal)
-      }))
-    }))
+  private async resolveOpenAIHttpImages(
+    request: OpenAIChatRequest,
+    signal?: AbortSignal
+  ): Promise<OpenAIChatRequest> {
+    await Promise.all(
+      request.messages.map(async (message) => {
+        if (!Array.isArray(message.content)) return
+        await Promise.all(
+          message.content.map(async (part) => {
+            if (part.type !== 'image_url' || !part.image_url?.url.startsWith('http')) return
+            part.image_url.url = await this.downloadImageDataUrl(part.image_url.url, signal)
+          })
+        )
+      })
+    )
     return request
   }
 
-  private async resolveClaudeHttpImages(request: ClaudeRequest, signal?: AbortSignal): Promise<ClaudeRequest> {
-    await Promise.all(request.messages.map(async message => {
-      if (!Array.isArray(message.content)) return
-      await Promise.all(message.content.map(async block => {
-        if (block.type !== 'image' || block.source?.type !== 'url') return
-        const dataUrl = await this.downloadImageDataUrl(block.source.url, signal)
-        const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
-        if (!match) {
-          throw new Error('Downloaded image produced invalid data URL')
-        }
-        block.source = { type: 'base64', media_type: match[1], data: match[2] }
-      }))
-    }))
+  private async resolveClaudeHttpImages(
+    request: ClaudeRequest,
+    signal?: AbortSignal
+  ): Promise<ClaudeRequest> {
+    await Promise.all(
+      request.messages.map(async (message) => {
+        if (!Array.isArray(message.content)) return
+        await Promise.all(
+          message.content.map(async (block) => {
+            if (block.type !== 'image' || block.source?.type !== 'url') return
+            const dataUrl = await this.downloadImageDataUrl(block.source.url, signal)
+            const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
+            if (!match) {
+              throw new Error('Downloaded image produced invalid data URL')
+            }
+            block.source = { type: 'base64', media_type: match[1], data: match[2] }
+          })
+        )
+      })
+    )
     return request
   }
 
@@ -1019,18 +1410,27 @@ export class ProxyServer {
       return { ...request, tools: undefined, tool_choice: undefined }
     }
 
-    if (request.tool_choice && typeof request.tool_choice === 'object' && request.tool_choice.type === 'function' && !request.tool_choice.function?.name) {
+    if (
+      request.tool_choice &&
+      typeof request.tool_choice === 'object' &&
+      request.tool_choice.type === 'function' &&
+      !request.tool_choice.function?.name
+    ) {
       throw new Error('tool_choice function requires a tool name')
     }
 
-    if (request.tool_choice && typeof request.tool_choice === 'object' && request.tool_choice.function?.name) {
+    if (
+      request.tool_choice &&
+      typeof request.tool_choice === 'object' &&
+      request.tool_choice.function?.name
+    ) {
       const selectedToolName = request.tool_choice.function.name
-      if (!request.tools?.some(tool => tool.function.name === selectedToolName)) {
+      if (!request.tools?.some((tool) => tool.function.name === selectedToolName)) {
         throw new Error(`tool_choice references unknown tool: ${selectedToolName}`)
       }
       return {
         ...request,
-        tools: request.tools?.filter(tool => tool.function.name === selectedToolName)
+        tools: request.tools?.filter((tool) => tool.function.name === selectedToolName)
       }
     }
 
@@ -1050,12 +1450,12 @@ export class ProxyServer {
 
     if (request.tool_choice?.name) {
       const selectedToolName = request.tool_choice.name
-      if (!request.tools?.some(tool => tool.name === selectedToolName)) {
+      if (!request.tools?.some((tool) => tool.name === selectedToolName)) {
         throw new Error(`tool_choice references unknown tool: ${selectedToolName}`)
       }
       return {
         ...request,
-        tools: request.tools?.filter(tool => tool.name === selectedToolName)
+        tools: request.tools?.filter((tool) => tool.name === selectedToolName)
       }
     }
 
@@ -1201,7 +1601,12 @@ export class ProxyServer {
   }
 
   // 获取会话统计（当前服务运行期间的统计）
-  getSessionStats(): { totalRequests: number; successRequests: number; failedRequests: number; startTime: number } {
+  getSessionStats(): {
+    totalRequests: number
+    successRequests: number
+    failedRequests: number
+    startTime: number
+  } {
     return { ...this.sessionStats }
   }
 
@@ -1217,8 +1622,12 @@ export class ProxyServer {
   }
 
   private isAbortError(error: unknown, signal?: AbortSignal): boolean {
-    return signal?.aborted === true
-      || (error instanceof Error && (error.message.includes('Client disconnected') || error.message.includes('Proxy server stopped')))
+    return (
+      signal?.aborted === true ||
+      (error instanceof Error &&
+        (error.message.includes('Client disconnected') ||
+          error.message.includes('Proxy server stopped')))
+    )
   }
 
   private throwIfAborted(signal?: AbortSignal): void {
@@ -1244,7 +1653,9 @@ export class ProxyServer {
     if (!errMsg) return null
 
     // 1) 显式 reason: "TEMPORARILY_SUSPENDED" (Kiro 风控)
-    const reasonMatch = errMsg.match(/"reason"\s*:\s*"(TEMPORARILY_SUSPENDED|ACCOUNT_SUSPENDED|PERMANENTLY_SUSPENDED)"/i)
+    const reasonMatch = errMsg.match(
+      /"reason"\s*:\s*"(TEMPORARILY_SUSPENDED|ACCOUNT_SUSPENDED|PERMANENTLY_SUSPENDED)"/i
+    )
     if (reasonMatch) {
       // 尝试提取 message 字段
       const msgMatch = errMsg.match(/"message"\s*:\s*"([^"]+)"/)
@@ -1252,7 +1663,10 @@ export class ProxyServer {
     }
 
     // 2) 文本特征 "temporarily suspended" / "user id is ... suspended"
-    if (/User\s+ID\s+is\s+(temporarily\s+)?suspended/i.test(errMsg) || /temporarily\s+suspended/i.test(errMsg)) {
+    if (
+      /User\s+ID\s+is\s+(temporarily\s+)?suspended/i.test(errMsg) ||
+      /temporarily\s+suspended/i.test(errMsg)
+    ) {
       const msgMatch = errMsg.match(/"message"\s*:\s*"([^"]+)"/)
       return { reason: 'TEMPORARILY_SUSPENDED', message: msgMatch?.[1] || errMsg }
     }
@@ -1278,7 +1692,7 @@ export class ProxyServer {
         signal?.removeEventListener('abort', abort)
         resolve()
       }, ms)
-      const abort = () => {
+      const abort = (): void => {
         clearTimeout(timeout)
         reject(this.getAbortError(signal))
       }
@@ -1305,20 +1719,28 @@ export class ProxyServer {
     const key = `${account.id}:${group}`
     const paceMs = group === 'opus' ? this.OPUS_MODEL_PACE_MS : 0
     const previous = this.modelPaceQueues.get(key) || Promise.resolve()
-    const queued = previous.catch(() => undefined).then(async () => {
-      this.throwIfAborted(signal)
-      const waitMs = Math.max(0, (this.modelPaceReadyAt.get(key) || 0) - Date.now())
-      if (waitMs > 0) {
-        proxyLogger.info('ProxyServer', `Pacing ${modelId || group} on ${account.email || account.id.slice(0, 8)} for ${waitMs}ms`)
-        await this.waitForRetry(waitMs, signal)
-      }
-      try {
-        return await work()
-      } finally {
-        this.modelPaceReadyAt.set(key, Date.now() + paceMs)
-      }
-    })
-    const marker = queued.then(() => undefined, () => undefined)
+    const queued = previous
+      .catch(() => undefined)
+      .then(async () => {
+        this.throwIfAborted(signal)
+        const waitMs = Math.max(0, (this.modelPaceReadyAt.get(key) || 0) - Date.now())
+        if (waitMs > 0) {
+          proxyLogger.info(
+            'ProxyServer',
+            `Pacing ${modelId || group} on ${account.email || account.id.slice(0, 8)} for ${waitMs}ms`
+          )
+          await this.waitForRetry(waitMs, signal)
+        }
+        try {
+          return await work()
+        } finally {
+          this.modelPaceReadyAt.set(key, Date.now() + paceMs)
+        }
+      })
+    const marker = queued.then(
+      () => undefined,
+      () => undefined
+    )
     this.modelPaceQueues.set(key, marker)
     try {
       return await queued
@@ -1329,11 +1751,11 @@ export class ProxyServer {
 
   private async abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
     this.throwIfAborted(signal)
-    if (!signal) return promise
+    if (!signal) return await promise
     return await Promise.race([
       promise,
       new Promise<T>((_, reject) => {
-        const abort = () => reject(this.getAbortError(signal))
+        const abort = (): void => reject(this.getAbortError(signal))
         signal.addEventListener('abort', abort, { once: true })
         promise.then(
           () => signal.removeEventListener('abort', abort),
@@ -1355,7 +1777,7 @@ export class ProxyServer {
   }
 
   // 获取可用模型列表
-  private static mapKiroModelToApi(m: KiroModel) {
+  private static mapKiroModelToApi(m: KiroModel): KiroApiModel {
     return {
       id: m.modelId,
       name: m.modelName,
@@ -1365,7 +1787,10 @@ export class ProxyServer {
       maxOutputTokens: m.tokenLimits?.maxOutputTokens,
       rateMultiplier: m.rateMultiplier,
       rateUnit: m.rateUnit,
-      supportsThinking: clientModelSupportsThinking(m.modelId, m.additionalModelRequestFieldsSchema),
+      supportsThinking: clientModelSupportsThinking(
+        m.modelId,
+        m.additionalModelRequestFieldsSchema
+      ),
       thinkingEfforts: clientModelThinkingEfforts(m.modelId, m.additionalModelRequestFieldsSchema),
       supportsPromptCaching: m.promptCaching?.supportsPromptCaching || false,
       modelProvider: m.modelProvider || undefined
@@ -1373,7 +1798,9 @@ export class ProxyServer {
   }
 
   /** Bedrock models the IAM identity can call, mapped to the UI model shape. */
-  private async getBedrockApiModels(signal?: AbortSignal): Promise<ReturnType<typeof ProxyServer.mapKiroModelToApi>[]> {
+  private async getBedrockApiModels(
+    signal?: AbortSignal
+  ): Promise<ReturnType<typeof ProxyServer.mapKiroModelToApi>[]> {
     const list = await this.listBedrockClientModels(signal)
     return list.map((m) => ({
       id: m.id,
@@ -1390,13 +1817,86 @@ export class ProxyServer {
       modelProvider: m.owned_by || 'bedrock'
     })) as ReturnType<typeof ProxyServer.mapKiroModelToApi>[]
   }
-  async getAvailableModels(signal?: AbortSignal): Promise<{ models: ReturnType<typeof ProxyServer.mapKiroModelToApi>[]; fromCache: boolean }> {
+
+  private applyStreamTimeoutConfig(): void {
+    setStreamTimeouts({
+      firstByteMs: this.config.streamFirstByteTimeoutMs ?? 120_000,
+      idleMs: this.config.streamIdleTimeoutMs ?? 300_000
+    })
+  }
+
+  private async getCustomApiModels(
+    signal?: AbortSignal
+  ): Promise<ReturnType<typeof ProxyServer.mapKiroModelToApi>[]> {
+    const providers = allCustomProviders(this.config.customApiProviders, this.config.xpixi)
+    const lists = await Promise.all(
+      providers.map(async (provider) => {
+        try {
+          const models = provider.models?.length
+            ? provider.models.map((upstreamId) => ({
+                id:
+                  provider.id === 'xpixi' && provider.name.includes('(legacy)')
+                    ? upstreamId
+                    : `${provider.routePrefix || provider.id}/${upstreamId}`,
+                upstreamId,
+                name: upstreamId,
+                providerId: provider.id,
+                providerName: provider.name
+              }))
+            : await listCustomApiModels(provider, signal)
+          return models.map((model) => ({
+            id: model.id,
+            name: model.name || model.upstreamId,
+            description: `${provider.name} · ${provider.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'} compatible`,
+            inputTypes: ['TEXT', 'IMAGE'],
+            maxInputTokens: undefined,
+            maxOutputTokens: undefined,
+            rateMultiplier: undefined,
+            rateUnit: undefined,
+            supportsThinking: true,
+            thinkingEfforts: [...CUSTOM_API_REASONING_EFFORTS],
+            supportsPromptCaching: false,
+            modelProvider: `custom:${provider.id}`
+          }))
+        } catch (error) {
+          proxyLogger.warn(
+            'ProxyServer',
+            `Custom provider ${provider.name} model discovery failed: ${error instanceof Error ? error.message : String(error)}`
+          )
+          return []
+        }
+      })
+    )
+    return lists.flat() as ReturnType<typeof ProxyServer.mapKiroModelToApi>[]
+  }
+
+  private getChatGPTApiModels(): ReturnType<typeof ProxyServer.mapKiroModelToApi>[] {
+    if (!this.chatgptCodexConfig.enabled) return []
+    return listChatGPTCodexModels(this.chatgptCodexConfig).map((model) => ({
+      id: `chatgpt/${model.id}`,
+      name: model.name,
+      description: `ChatGPT/Codex Experimental · ${model.capabilities.join(', ')}`,
+      inputTypes: model.capabilities.includes('image') ? ['TEXT', 'IMAGE'] : ['TEXT'],
+      maxInputTokens: model.contextWindow,
+      maxOutputTokens: model.maxOutputTokens,
+      rateMultiplier: undefined,
+      rateUnit: undefined,
+      supportsThinking: model.capabilities.includes('reasoning'),
+      thinkingEfforts: chatGPTCodexThinkingEfforts(model.id),
+      supportsPromptCaching: false,
+      modelProvider: 'chatgpt'
+    })) as ReturnType<typeof ProxyServer.mapKiroModelToApi>[]
+  }
+
+  async getAvailableModels(
+    signal?: AbortSignal
+  ): Promise<{ models: ReturnType<typeof ProxyServer.mapKiroModelToApi>[]; fromCache: boolean }> {
     const now = Date.now()
-    
+
     let kiroModels: KiroModel[]
     let fromCache = false
 
-    if (this.modelCache && (now - this.modelCache.timestamp) < this.MODEL_CACHE_TTL) {
+    if (this.modelCache && now - this.modelCache.timestamp < this.MODEL_CACHE_TTL) {
       kiroModels = this.modelCache.models
       fromCache = true
     } else {
@@ -1404,13 +1904,12 @@ export class ProxyServer {
       const account = await this.getAvailableAccount(signal)
       this.throwIfAborted(signal)
       if (!account) {
-        // No Kiro account, but Bedrock may still be configured and usable.
-        try {
-          const bedrockModels = await this.getBedrockApiModels(signal)
-          return { models: bedrockModels, fromCache: false }
-        } catch {
-          return { models: [], fromCache: false }
-        }
+        const providerModels: ReturnType<typeof ProxyServer.mapKiroModelToApi>[] = []
+        if (isBedrockConfigured(this.config.bedrock))
+          providerModels.push(...(await this.getBedrockApiModels(signal).catch(() => [])))
+        providerModels.push(...(await this.getCustomApiModels(signal)))
+        providerModels.push(...this.getChatGPTApiModels())
+        return { models: providerModels, fromCache: false }
       }
 
       try {
@@ -1424,25 +1923,63 @@ export class ProxyServer {
             }
             // Seed the pool-wide catalog from the base fetch too, so at minimum
             // the fetched account's models carry full metadata.
-            this.poolModelCatalog.set(normalizeKiroModelIdForCompare(m.modelId), { model: m, timestamp: now })
+            this.poolModelCatalog.set(normalizeKiroModelIdForCompare(m.modelId), {
+              model: m,
+              timestamp: now
+            })
           }
         }
       } catch (error) {
         if (this.isAbortError(error, signal)) throw error
         console.error('[ProxyServer] Failed to fetch models:', error)
-        return { models: [], fromCache: false }
+        const providerModels: ReturnType<typeof ProxyServer.mapKiroModelToApi>[] = []
+        if (isBedrockConfigured(this.config.bedrock))
+          providerModels.push(...(await this.getBedrockApiModels(signal).catch(() => [])))
+        providerModels.push(...(await this.getCustomApiModels(signal)))
+        providerModels.push(...this.getChatGPTApiModels())
+        return { models: providerModels, fromCache: false }
       }
     }
 
     // 合并隐藏模型（与 /v1/models 端点一致）
-    const modelIds = new Set(kiroModels.map(m => m.modelId))
+    const modelIds = new Set(kiroModels.map((m) => m.modelId))
     const presetModels = KIRO_PROXY_MODEL_PRESETS.map(buildKiroPresetModel)
     const hiddenModels: KiroModel[] = [
-      { modelId: 'claude-3.7-sonnet', modelName: 'Claude 3.7 Sonnet', description: 'Claude 3.7 Sonnet (hidden)', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel,
-      { modelId: 'simple-task', modelName: 'Simple Task', description: 'Kiro fast model (routes to Haiku)', supportedInputTypes: ['TEXT'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 4096 } } as KiroModel,
-      { modelId: 'CLAUDE_SONNET_4_20250514_V1_0', modelName: 'Claude Sonnet 4 (CW)', description: 'CodeWhisperer internal ID', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel,
-      { modelId: 'CLAUDE_HAIKU_4_5_20251001_V1_0', modelName: 'Claude Haiku 4.5 (CW)', description: 'CodeWhisperer internal ID', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel,
-      { modelId: 'CLAUDE_3_7_SONNET_20250219_V1_0', modelName: 'Claude 3.7 Sonnet (CW)', description: 'CodeWhisperer internal ID', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel
+      {
+        modelId: 'claude-3.7-sonnet',
+        modelName: 'Claude 3.7 Sonnet',
+        description: 'Claude 3.7 Sonnet (hidden)',
+        supportedInputTypes: ['TEXT', 'IMAGE'],
+        tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 }
+      } as KiroModel,
+      {
+        modelId: 'simple-task',
+        modelName: 'Simple Task',
+        description: 'Kiro fast model (routes to Haiku)',
+        supportedInputTypes: ['TEXT'],
+        tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 4096 }
+      } as KiroModel,
+      {
+        modelId: 'CLAUDE_SONNET_4_20250514_V1_0',
+        modelName: 'Claude Sonnet 4 (CW)',
+        description: 'CodeWhisperer internal ID',
+        supportedInputTypes: ['TEXT', 'IMAGE'],
+        tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 }
+      } as KiroModel,
+      {
+        modelId: 'CLAUDE_HAIKU_4_5_20251001_V1_0',
+        modelName: 'Claude Haiku 4.5 (CW)',
+        description: 'CodeWhisperer internal ID',
+        supportedInputTypes: ['TEXT', 'IMAGE'],
+        tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 }
+      } as KiroModel,
+      {
+        modelId: 'CLAUDE_3_7_SONNET_20250219_V1_0',
+        modelName: 'Claude 3.7 Sonnet (CW)',
+        description: 'CodeWhisperer internal ID',
+        supportedInputTypes: ['TEXT', 'IMAGE'],
+        tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 }
+      } as KiroModel
     ]
     const merged = [...kiroModels]
     for (const model of [...presetModels, ...hiddenModels]) {
@@ -1464,12 +2001,33 @@ export class ProxyServer {
             apiModels.push(bm)
           }
         }
-        proxyLogger.info('ProxyServer', `Bedrock: Merged ${bedrockModels.length} models into available list`)
+        proxyLogger.info(
+          'ProxyServer',
+          `Bedrock: Merged ${bedrockModels.length} models into available list`
+        )
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        proxyLogger.error('ProxyServer', `Bedrock models merge (getAvailableModels) failed: ${message}`)
+        proxyLogger.error(
+          'ProxyServer',
+          `Bedrock models merge (getAvailableModels) failed: ${message}`
+        )
         // Cache the error so UI can display it
         this.bedrockLastError = { message, timestamp: Date.now() }
+      }
+    }
+
+    const customModels = await this.getCustomApiModels(signal)
+    const customSeen = new Set(apiModels.map((model) => model.id))
+    for (const customModel of customModels) {
+      if (!customSeen.has(customModel.id)) {
+        customSeen.add(customModel.id)
+        apiModels.push(customModel)
+      }
+    }
+    for (const chatgptModel of this.getChatGPTApiModels()) {
+      if (!customSeen.has(chatgptModel.id)) {
+        customSeen.add(chatgptModel.id)
+        apiModels.push(chatgptModel)
       }
     }
 
@@ -1479,7 +2037,9 @@ export class ProxyServer {
     // account has it — not just the single account we fetched the base list from.
     const forceScan = this.pendingPoolScan
     this.pendingPoolScan = false
-    const poolUnion = await this.getPoolCapabilityUnion(forceScan, signal).catch(() => new Set<string>())
+    const poolUnion = await this.getPoolCapabilityUnion(forceScan, signal).catch(
+      () => new Set<string>()
+    )
 
     // Merge in models that ONLY higher-tier accounts expose (e.g. an Enterprise
     // account's gpt-5.6-*, claude-sonnet-5, claude-opus-4.6). The base list above
@@ -1504,17 +2064,32 @@ export class ProxyServer {
       // servableTiers: những tier ĐƯỢC PHÉP phục vụ model này (từ Tier_Eligibility_Map).
       const servableTiers = allowedTiersForModel(model.id, map)
       // availableInPool: giữ nghĩa cũ (capability union) để không phá client hiện có.
-      const availableInPool = tier === 'standard'
-        ? true
-        : poolUnion.size === 0 ? undefined : poolUnion.has(normalized)
+      const availableInPool =
+        tier === 'standard' ? true : poolUnion.size === 0 ? undefined : poolUnion.has(normalized)
       // availableForPool: THEO TAG TIER thật có trong pool (nhanh, không network). Standard =>
       // luôn true nếu pool có account; premium => true nếu pool có tier được phép HOẶC unknown.
       const availableForPool = poolCanServeByTag(poolAccounts, model.id, map)
       // Kết quả live-probe gần nhất (nếu đã bấm "Test thật"), lọc theo model.
       const probes = this.modelProbeCache.get(normalized)
-      const probeResults = probes ? probes.filter((p) => tiersInPool.has(p.tier)) : undefined
+      const probeResults = probes
+        ? probes.filter(
+            (p) =>
+              p.tier === 'bedrock' ||
+              p.tier === 'chatgpt' ||
+              p.tier.startsWith('custom:') ||
+              tiersInPool.has(p.tier as KiroTier)
+          )
+        : undefined
       const probedOk = probeResults ? probeResults.some((p) => p.ok) : undefined
-      return { ...model, tier, servableTiers, availableInPool, availableForPool, probeResults, probedOk }
+      return {
+        ...model,
+        tier,
+        servableTiers,
+        availableInPool,
+        availableForPool,
+        probeResults,
+        probedOk
+      }
     })
     return { models: annotated, fromCache }
   }
@@ -1595,12 +2170,40 @@ export class ProxyServer {
     }
 
     // Dựng danh sách phép thử (model × tier hợp lệ & có account đại diện).
-    const jobs: Array<{ modelId: string; tier: KiroTier; account: ProxyAccount }> = []
+    type ProbeJob =
+      | { kind: 'kiro'; modelId: string; tier: KiroTier; account: ProxyAccount }
+      | { kind: 'bedrock'; modelId: string }
+      | { kind: 'chatgpt'; modelId: string }
+      | {
+          kind: 'custom'
+          modelId: string
+          provider: CustomApiProviderConfig
+          upstreamModelId: string
+        }
+    const jobs: ProbeJob[] = []
     for (const modelId of modelIds) {
+      if (isChatGPTCodexModel(modelId, this.chatgptCodexConfig)) {
+        jobs.push({ kind: 'chatgpt', modelId })
+        continue
+      }
+      const custom = findCustomProvider(modelId, this.config.customApiProviders, this.config.xpixi)
+      if (custom) {
+        jobs.push({
+          kind: 'custom',
+          modelId,
+          provider: custom.provider,
+          upstreamModelId: custom.upstreamModelId
+        })
+        continue
+      }
+      if (isBedrockModel(modelId, this.config.bedrock)) {
+        jobs.push({ kind: 'bedrock', modelId })
+        continue
+      }
       const allowed = new Set(allowedTiersForModel(modelId, map))
       for (const [tier, account] of repByTier.entries()) {
         if (!allowed.has(tier)) continue
-        jobs.push({ modelId, tier, account })
+        jobs.push({ kind: 'kiro', modelId, tier, account })
       }
     }
 
@@ -1609,7 +2212,15 @@ export class ProxyServer {
     for (let i = 0; i < jobs.length; i += concurrency) {
       this.throwIfAborted(signal)
       const batch = jobs.slice(i, i + concurrency)
-      const batchResults = await Promise.all(batch.map((job) => this.probeOneModel(job.modelId, job.tier, job.account, signal)))
+      const batchResults = await Promise.all(
+        batch.map((job) => {
+          if (job.kind === 'custom')
+            return this.probeCustomModel(job.modelId, job.provider, job.upstreamModelId, signal)
+          if (job.kind === 'bedrock') return this.probeBedrockModel(job.modelId, signal)
+          if (job.kind === 'chatgpt') return this.probeChatGPTModel(job.modelId, signal)
+          return this.probeOneModel(job.modelId, job.tier, job.account, signal)
+        })
+      )
       for (const r of batchResults) {
         results.push(r)
         done++
@@ -1624,11 +2235,147 @@ export class ProxyServer {
   }
 
   /** Gửi 1 ping tối thiểu 1 model trên 1 account; trả về kết quả probe. */
-  private async probeOneModel(modelId: string, tier: KiroTier, account: ProxyAccount, signal?: AbortSignal): Promise<ModelProbeResult> {
+  private async probeCustomModel(
+    modelId: string,
+    provider: CustomApiProviderConfig,
+    upstreamModelId: string,
+    signal?: AbortSignal
+  ): Promise<ModelProbeResult> {
+    const startedAt = Date.now()
+    try {
+      await callCustomApiOpenAI(
+        {
+          model: modelId,
+          messages: [{ role: 'user', content: 'Reply OK' }],
+          max_tokens: 2,
+          stream: false
+        },
+        provider,
+        upstreamModelId,
+        signal
+      )
+      return {
+        modelId,
+        tier: `custom:${provider.id}`,
+        ok: true,
+        latencyMs: Date.now() - startedAt,
+        accountId: `custom:${provider.id}`,
+        checkedAt: Date.now()
+      }
+    } catch (error) {
+      if (this.isAbortError(error, signal)) throw error
+      return {
+        modelId,
+        tier: `custom:${provider.id}`,
+        ok: false,
+        error: this.sanitizeErrorMessage(
+          error instanceof Error ? error.message : String(error)
+        ).slice(0, 200),
+        latencyMs: Date.now() - startedAt,
+        accountId: `custom:${provider.id}`,
+        checkedAt: Date.now()
+      }
+    }
+  }
+
+  private async probeBedrockModel(
+    modelId: string,
+    signal?: AbortSignal
+  ): Promise<ModelProbeResult> {
+    const startedAt = Date.now()
+    try {
+      if (!isBedrockConfigured(this.config.bedrock)) throw new Error('Bedrock is not configured')
+      await bedrockConverse(
+        this.config.bedrock!,
+        stripBedrockPrefix(modelId),
+        openAIToConverse({
+          model: modelId,
+          messages: [{ role: 'user', content: 'Reply OK' }],
+          max_tokens: 2
+        }),
+        signal
+      )
+      return {
+        modelId,
+        tier: 'bedrock',
+        ok: true,
+        latencyMs: Date.now() - startedAt,
+        accountId: 'bedrock',
+        checkedAt: Date.now()
+      }
+    } catch (error) {
+      if (this.isAbortError(error, signal)) throw error
+      return {
+        modelId,
+        tier: 'bedrock',
+        ok: false,
+        error: this.sanitizeErrorMessage(
+          error instanceof Error ? error.message : String(error)
+        ).slice(0, 200),
+        latencyMs: Date.now() - startedAt,
+        accountId: 'bedrock',
+        checkedAt: Date.now()
+      }
+    }
+  }
+
+  private async probeChatGPTModel(
+    modelId: string,
+    signal?: AbortSignal
+  ): Promise<ModelProbeResult> {
+    const startedAt = Date.now()
+    try {
+      const payload = buildCodexPayloadFromChat(
+        {
+          model: modelId,
+          messages: [{ role: 'user', content: 'Reply OK' }],
+          max_tokens: 2,
+          stream: false
+        },
+        this.chatgptCodexConfig.reasoningEffort
+      )
+      const { account, response } = await this.requestChatGPTWithFallback(payload, modelId, signal)
+      await response.text()
+      return {
+        modelId,
+        tier: 'chatgpt',
+        ok: true,
+        latencyMs: Date.now() - startedAt,
+        accountId: account.id,
+        checkedAt: Date.now()
+      }
+    } catch (error) {
+      if (this.isAbortError(error, signal)) throw error
+      return {
+        modelId,
+        tier: 'chatgpt',
+        ok: false,
+        error: this.sanitizeErrorMessage(
+          error instanceof Error ? error.message : String(error)
+        ).slice(0, 200),
+        latencyMs: Date.now() - startedAt,
+        checkedAt: Date.now()
+      }
+    }
+  }
+
+  private async probeOneModel(
+    modelId: string,
+    tier: KiroTier,
+    account: ProxyAccount,
+    signal?: AbortSignal
+  ): Promise<ModelProbeResult> {
     const startedAt = Date.now()
     try {
       if (this.accountPool.isSuspended(account)) {
-        return { modelId, tier, ok: false, error: 'account suspended', accountId: account.id, checkedAt: Date.now() }
+        return {
+          modelId,
+          tier,
+          ok: false,
+          error: 'account suspended',
+          accountId: account.id,
+          checkedAt: Date.now()
+        }
       }
       // Refresh token nếu sắp hết hạn để tránh 401 giả.
       let acc = account
@@ -1639,19 +2386,18 @@ export class ProxyServer {
       const profileArn = resolveProfileArn(acc) ?? acc.profileArn
       const kiroModelId = mapModelId(modelId)
       // Ping tối thiểu: 1 message "hi", maxTokens=1 để không tốn credit/quota đáng kể.
-      const payload = buildKiroPayload(
-        'hi',
-        kiroModelId,
-        'AI_EDITOR',
-        [],
-        [],
-        [],
-        [],
-        profileArn,
-        { maxTokens: 1 }
-      )
+      const payload = buildKiroPayload('hi', kiroModelId, 'AI_EDITOR', [], [], [], [], profileArn, {
+        maxTokens: 1
+      })
       await callKiroApi(acc, payload, signal)
-      return { modelId, tier, ok: true, latencyMs: Date.now() - startedAt, accountId: acc.id, checkedAt: Date.now() }
+      return {
+        modelId,
+        tier,
+        ok: true,
+        latencyMs: Date.now() - startedAt,
+        accountId: acc.id,
+        checkedAt: Date.now()
+      }
     } catch (error) {
       if (this.isAbortError(error, signal)) throw error
       const message = error instanceof Error ? error.message : String(error)
@@ -1684,7 +2430,9 @@ export class ProxyServer {
 
     // 防止并发刷新
     if (this.refreshingTokens.has(account.id)) {
-      console.log(`[ProxyServer] Token refresh already in progress for ${account.email || account.id}`)
+      console.log(
+        `[ProxyServer] Token refresh already in progress for ${account.email || account.id}`
+      )
       // 等待刷新完成
       await this.waitForRetry(1000, signal)
       return !this.isTokenExpiringSoon(this.accountPool.getAccount(account.id) || account)
@@ -1697,7 +2445,7 @@ export class ProxyServer {
       // 随机延迟 0-3 秒，避免多账号同时刷新被识别为批量操作
       const jitter = Math.floor(Math.random() * 3000)
       if (jitter > 0) await this.waitForRetry(jitter, signal)
-      
+
       const result = await this.abortable(this.events.onTokenRefresh(account), signal)
       if (result.success && result.accessToken) {
         // 更新账号池中的 Token
@@ -1716,7 +2464,9 @@ export class ProxyServer {
         console.log(`[ProxyServer] Token refreshed for ${account.email || account.id}`)
         return true
       } else {
-        console.error(`[ProxyServer] Token refresh failed for ${account.email || account.id}: ${result.error}`)
+        console.error(
+          `[ProxyServer] Token refresh failed for ${account.email || account.id}: ${result.error}`
+        )
         this.accountPool.markNeedsRefresh(account.id)
         return false
       }
@@ -1753,7 +2503,11 @@ export class ProxyServer {
     return true
   }
 
-  private getNextAccountForRequest(excludeIds: Set<string> = new Set(), apiKeyId?: string, modelId?: string): ProxyAccount | null {
+  private getNextAccountForRequest(
+    excludeIds: Set<string> = new Set(),
+    apiKeyId?: string,
+    modelId?: string
+  ): ProxyAccount | null {
     const excluded = new Set(excludeIds)
     const tierRoutingActive = this.isTierRoutingActive()
     for (const account of this.accountPool.getAllAccounts()) {
@@ -1777,15 +2531,21 @@ export class ProxyServer {
   private requiresModelCapabilitySelection(modelId?: string): boolean {
     if (!modelId) return false
     const normalized = normalizeKiroModelIdForCompare(modelId)
-    return normalized.startsWith('claude-opus-')
-      || normalized === 'claude-sonnet-4.6'
-      || normalized === 'deepseek-3.2'
-      || normalized === 'qwen3-coder-next'
-      || normalized === 'glm-5'
-      || normalized.startsWith('minimax-')
+    return (
+      normalized.startsWith('claude-opus-') ||
+      normalized === 'claude-sonnet-4.6' ||
+      normalized === 'deepseek-3.2' ||
+      normalized === 'qwen3-coder-next' ||
+      normalized === 'glm-5' ||
+      normalized.startsWith('minimax-')
+    )
   }
 
-  private async accountSupportsModel(account: ProxyAccount, modelId: string, _signal?: AbortSignal): Promise<boolean> {
+  private async accountSupportsModel(
+    account: ProxyAccount,
+    modelId: string,
+    _signal?: AbortSignal
+  ): Promise<boolean> {
     const normalizedModelId = normalizeKiroModelIdForCompare(modelId)
     const cached = this.accountModelCapabilityCache.get(account.id)
     if (cached && Date.now() - cached.timestamp < this.MODEL_CAPABILITY_CACHE_TTL) {
@@ -1822,21 +2582,33 @@ export class ProxyServer {
             models = await fetchKiroModels(currentAccount)
           }
         }
-        const modelIds = new Set(models.map(model => normalizeKiroModelIdForCompare(model.modelId)))
+        const modelIds = new Set(
+          models.map((model) => normalizeKiroModelIdForCompare(model.modelId))
+        )
         this.accountModelCapabilityCache.set(currentAccount.id, { timestamp: Date.now(), modelIds })
         for (const model of models) {
-          if (model.tokenLimits?.maxInputTokens) setModelContextWindow(model.modelId, model.tokenLimits.maxInputTokens)
+          if (model.tokenLimits?.maxInputTokens)
+            setModelContextWindow(model.modelId, model.tokenLimits.maxInputTokens)
           // Accumulate full metadata for every model any account exposes, keyed by
           // normalized id. This lets getAvailableModels surface models only a
           // higher-tier account has (e.g. an Enterprise account's gpt-5.6-*,
           // claude-sonnet-5) even when the base list was fetched from a free account.
-          this.poolModelCatalog.set(normalizeKiroModelIdForCompare(model.modelId), { model, timestamp: Date.now() })
+          this.poolModelCatalog.set(normalizeKiroModelIdForCompare(model.modelId), {
+            model,
+            timestamp: Date.now()
+          })
         }
       } catch (error) {
-        proxyLogger.warn('ProxyServer', `Failed to inspect models for ${account.email || account.id.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`)
+        proxyLogger.warn(
+          'ProxyServer',
+          `Failed to inspect models for ${account.email || account.id.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`
+        )
         // Cache an empty set so accountTier() reports a definite (non-'unknown')
         // result and we don't hot-loop warms; TTL expiry retries later.
-        this.accountModelCapabilityCache.set(account.id, { timestamp: Date.now(), modelIds: new Set() })
+        this.accountModelCapabilityCache.set(account.id, {
+          timestamp: Date.now(),
+          modelIds: new Set()
+        })
       } finally {
         this.capabilityWarmInFlight.delete(account.id)
       }
@@ -1846,7 +2618,8 @@ export class ProxyServer {
 
   private accountTier(account: ProxyAccount): AccountTier {
     const cached = this.accountModelCapabilityCache.get(account.id)
-    if (!cached || Date.now() - cached.timestamp >= this.MODEL_CAPABILITY_CACHE_TTL) return 'unknown'
+    if (!cached || Date.now() - cached.timestamp >= this.MODEL_CAPABILITY_CACHE_TTL)
+      return 'unknown'
     for (const id of cached.modelIds) {
       if (id.startsWith('claude-opus-')) return 'power'
     }
@@ -1865,9 +2638,16 @@ export class ProxyServer {
    *   with bounded concurrency, so the union reflects the true tier coverage of
    *   the whole pool (e.g. Opus shows up if any Pro account has it).
    */
-  private async getPoolCapabilityUnion(forceScan: boolean, signal?: AbortSignal): Promise<Set<string>> {
+  private async getPoolCapabilityUnion(
+    forceScan: boolean,
+    signal?: AbortSignal
+  ): Promise<Set<string>> {
     const now = Date.now()
-    if (!forceScan && this.poolCapabilityCache && now - this.poolCapabilityCache.timestamp < this.MODEL_CACHE_TTL) {
+    if (
+      !forceScan &&
+      this.poolCapabilityCache &&
+      now - this.poolCapabilityCache.timestamp < this.MODEL_CACHE_TTL
+    ) {
       return this.poolCapabilityCache.union
     }
 
@@ -1885,10 +2665,14 @@ export class ProxyServer {
         // warmAccountCapability populates accountModelCapabilityCache + poolModelCatalog
         // as a side effect (deduped); await the in-flight task so the union below sees
         // the filled cache. This is out-of-band (button-triggered), not the request path.
-        await Promise.all(batch.map((account) => {
-          this.warmAccountCapability(account)
-          return (this.capabilityWarmInFlight.get(account.id) ?? Promise.resolve()).catch(() => undefined)
-        }))
+        await Promise.all(
+          batch.map((account) => {
+            this.warmAccountCapability(account)
+            return (this.capabilityWarmInFlight.get(account.id) ?? Promise.resolve()).catch(
+              () => undefined
+            )
+          })
+        )
       }
     }
 
@@ -1918,7 +2702,10 @@ export class ProxyServer {
   }
 
   private async isEligibleForModel(
-    account: ProxyAccount, modelId: string | undefined, apiKeyId?: string, signal?: AbortSignal
+    account: ProxyAccount,
+    modelId: string | undefined,
+    apiKeyId?: string,
+    signal?: AbortSignal
   ): Promise<boolean> {
     if (!this.isAccountAllowedForRequest(account, apiKeyId)) return false
     // Tier-tag pre-filter guard (Requirements 1.4, 8.1, 8.2): when tier routing is active,
@@ -1942,12 +2729,18 @@ export class ProxyServer {
         return false
       }
     }
-    if (!await this.accountSupportsModel(account, modelId, signal)) return false
+    if (!(await this.accountSupportsModel(account, modelId, signal))) return false
     // strictTierRouting: với model Opus, chỉ chấp nhận Power_Account (tier suy ra
     // từ capability cache đã được accountSupportsModel làm ấm ở trên).
-    if (this.config.strictTierRouting && normalizeKiroModelIdForCompare(modelId).startsWith('claude-opus-')) {
+    if (
+      this.config.strictTierRouting &&
+      normalizeKiroModelIdForCompare(modelId).startsWith('claude-opus-')
+    ) {
       if (!this.isPowerAccount(account)) {
-        proxyLogger.info('ProxyServer', `strictTierRouting: skip ${account.email || account.id.slice(0, 8)} (not a power account) for ${modelId}`)
+        proxyLogger.info(
+          'ProxyServer',
+          `strictTierRouting: skip ${account.email || account.id.slice(0, 8)} (not a power account) for ${modelId}`
+        )
         return false
       }
     }
@@ -1955,7 +2748,9 @@ export class ProxyServer {
   }
 
   private async buildEligibleSet(
-    modelId: string | undefined, apiKeyId?: string, signal?: AbortSignal
+    modelId: string | undefined,
+    apiKeyId?: string,
+    signal?: AbortSignal
   ): Promise<ProxyAccount[]> {
     const out: ProxyAccount[] = []
     for (const account of this.accountPool.getAllAccounts()) {
@@ -1972,7 +2767,9 @@ export class ProxyServer {
    *   3. 否则 (尚有配额但都在 cooldown / 不可选) -> throttled (R6.3)
    */
   private async classifyNoAccountReason(
-    modelId: string | undefined, apiKeyId?: string, signal?: AbortSignal
+    modelId: string | undefined,
+    apiKeyId?: string,
+    signal?: AbortSignal
   ): Promise<NoAccountDiagnosis> {
     this.throwIfAborted(signal)
     const eligible = await this.buildEligibleSet(modelId, apiKeyId, signal)
@@ -2028,7 +2825,12 @@ export class ProxyServer {
     }
   }
 
-  private async getNextAccountForModel(excludeIds: Set<string> = new Set(), apiKeyId?: string, modelId?: string, signal?: AbortSignal): Promise<ProxyAccount | null> {
+  private async getNextAccountForModel(
+    excludeIds: Set<string> = new Set(),
+    apiKeyId?: string,
+    modelId?: string,
+    signal?: AbortSignal
+  ): Promise<ProxyAccount | null> {
     // Tier-routing phased selection (Requirements 6.1-6.7). When tier routing is active AND
     // multi-account selection is in play, drive a Free-first / Paid-fallback (or Paid-only for
     // premium) two-phase group loop for BOTH standard and premium models. This must run for
@@ -2043,7 +2845,9 @@ export class ProxyServer {
       const poolAccounts = this.accountPool.getAllAccounts()
       const groups = this.tierPreferenceGroups(modelId)
       const byTier = groupAccountsByTier(poolAccounts)
-      const excludedCount = poolAccounts.filter((account) => !this.isTagEligibleForModel(account, modelId)).length
+      const excludedCount = poolAccounts.filter(
+        (account) => !this.isTagEligibleForModel(account, modelId)
+      ).length
       this.logTierPrefilter(modelId, excludedCount, poolAccounts.length - excludedCount)
 
       const triedAcrossGroups = new Set(excludeIds)
@@ -2062,26 +2866,43 @@ export class ProxyServer {
         // rồi xác nhận capability. Bị loại thì thêm vào tried và thử tiếp — chỉ trong candidate set.
         while (candidateIds.size > 0) {
           this.throwIfAborted(signal)
-          const account = this.accountPool.getNextAccountFromCandidates(candidateIds, triedAcrossGroups)
+          const account = this.accountPool.getNextAccountFromCandidates(
+            candidateIds,
+            triedAcrossGroups
+          )
           if (!account) break
           candidateIds.delete(account.id)
           triedAcrossGroups.add(account.id)
           if (await this.isEligibleForModel(account, modelId, apiKeyId, signal)) {
             const selectedAccount = this.accountPool.getAccount(account.id) || account
-            proxyLogger.info('ProxyServer', `Selected ${selectedAccount.email || selectedAccount.id.slice(0, 8)} (${group} tier) for model ${modelId ?? '(default)'}`)
+            proxyLogger.info(
+              'ProxyServer',
+              `Selected ${selectedAccount.email || selectedAccount.id.slice(0, 8)} (${group} tier) for model ${modelId ?? '(default)'}`
+            )
             return selectedAccount
           }
-          proxyLogger.info('ProxyServer', `Skipping ${account.email || account.id.slice(0, 8)} because model ${modelId ?? '(default)'} is not available`)
+          proxyLogger.info(
+            'ProxyServer',
+            `Skipping ${account.email || account.id.slice(0, 8)} because model ${modelId ?? '(default)'} is not available`
+          )
         }
       }
 
       // Cooldown-wait fallback (chỉ với model cần capability). getCompatibleModelCooldownWaitMs
       // đã áp tag guard nên không probe account bị loại.
       if (modelId && this.requiresModelCapabilitySelection(modelId)) {
-        const cooldownWaitMs = await this.getCompatibleModelCooldownWaitMs(excludeIds, apiKeyId, modelId, signal)
+        const cooldownWaitMs = await this.getCompatibleModelCooldownWaitMs(
+          excludeIds,
+          apiKeyId,
+          modelId,
+          signal
+        )
         if (cooldownWaitMs !== null && cooldownWaitMs <= this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS) {
           const waitMs = Math.max(250, cooldownWaitMs + 100)
-          proxyLogger.info('ProxyServer', `Waiting ${waitMs}ms for a compatible ${modelId} account to leave cooldown`)
+          proxyLogger.info(
+            'ProxyServer',
+            `Waiting ${waitMs}ms for a compatible ${modelId} account to leave cooldown`
+          )
           await this.waitForRetry(waitMs, signal)
           return await this.getNextAccountForModel(excludeIds, apiKeyId, modelId, signal)
         }
@@ -2104,16 +2925,30 @@ export class ProxyServer {
       tried.add(account.id)
       if (await this.isEligibleForModel(account, modelId, apiKeyId, signal)) {
         const selectedAccount = this.accountPool.getAccount(account.id) || account
-        proxyLogger.info('ProxyServer', `Selected ${selectedAccount.email || selectedAccount.id.slice(0, 8)} for model ${modelId}`)
+        proxyLogger.info(
+          'ProxyServer',
+          `Selected ${selectedAccount.email || selectedAccount.id.slice(0, 8)} for model ${modelId}`
+        )
         return selectedAccount
       }
-      proxyLogger.info('ProxyServer', `Skipping ${account.email || account.id.slice(0, 8)} because model ${modelId} is not available`)
+      proxyLogger.info(
+        'ProxyServer',
+        `Skipping ${account.email || account.id.slice(0, 8)} because model ${modelId} is not available`
+      )
     }
 
-    const cooldownWaitMs = await this.getCompatibleModelCooldownWaitMs(excludeIds, apiKeyId, modelId, signal)
+    const cooldownWaitMs = await this.getCompatibleModelCooldownWaitMs(
+      excludeIds,
+      apiKeyId,
+      modelId,
+      signal
+    )
     if (cooldownWaitMs !== null && cooldownWaitMs <= this.MAX_COMPATIBLE_COOLDOWN_WAIT_MS) {
       const waitMs = Math.max(250, cooldownWaitMs + 100)
-      proxyLogger.info('ProxyServer', `Waiting ${waitMs}ms for a compatible ${modelId} account to leave cooldown`)
+      proxyLogger.info(
+        'ProxyServer',
+        `Waiting ${waitMs}ms for a compatible ${modelId} account to leave cooldown`
+      )
       await this.waitForRetry(waitMs, signal)
       return await this.getNextAccountForModel(excludeIds, apiKeyId, modelId, signal)
     }
@@ -2121,30 +2956,46 @@ export class ProxyServer {
     return null
   }
 
-  private async getCompatibleModelCooldownWaitMs(excludeIds: Set<string>, apiKeyId: string | undefined, modelId: string, signal?: AbortSignal): Promise<number | null> {
+  private async getCompatibleModelCooldownWaitMs(
+    excludeIds: Set<string>,
+    apiKeyId: string | undefined,
+    modelId: string,
+    signal?: AbortSignal
+  ): Promise<number | null> {
     const now = Date.now()
     let best: number | null = null
     for (const account of this.accountPool.getAllAccounts()) {
       this.throwIfAborted(signal)
       if (excludeIds.has(account.id)) continue
       if (!this.isAccountAllowedForRequest(account, apiKeyId)) continue
-      if (this.accountPool.isSuspended(account) || this.accountPool.isQuotaExhausted(account, now)) continue
+      if (this.accountPool.isSuspended(account) || this.accountPool.isQuotaExhausted(account, now))
+        continue
       if (!account.cooldownUntil || account.cooldownUntil <= now) continue
       if (account.isAvailable === false) continue
       // Tier-tag pre-filter guard (Requirements 8.1, 8.3): only compute cold-cache waits
       // over tag-eligible accounts so tag-excluded accounts are never network-probed here.
       if (this.isTierRoutingActive() && !this.isTagEligibleForModel(account, modelId)) continue
-      if (!await this.accountSupportsModel(account, modelId, signal)) continue
+      if (!(await this.accountSupportsModel(account, modelId, signal))) continue
       const waitMs = account.cooldownUntil - now
       best = best === null ? waitMs : Math.min(best, waitMs)
     }
     return best
   }
 
-  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string, modelId?: string): Promise<ProxyAccount | null> {
-    const isAllowed = (acc: ProxyAccount | null): boolean => this.isAccountAllowedForRequest(acc, apiKeyId)
+  private async getAvailableAccount(
+    signal?: AbortSignal,
+    sessionHint?: string,
+    apiKeyId?: string,
+    modelId?: string
+  ): Promise<ProxyAccount | null> {
+    const isAllowed = (acc: ProxyAccount | null): boolean =>
+      this.isAccountAllowedForRequest(acc, apiKeyId)
     const supportsRequestedModel = async (acc: ProxyAccount): Promise<boolean> => {
-      return !modelId || !this.requiresModelCapabilitySelection(modelId) || await this.accountSupportsModel(acc, modelId, signal)
+      return (
+        !modelId ||
+        !this.requiresModelCapabilitySelection(modelId) ||
+        (await this.accountSupportsModel(acc, modelId, signal))
+      )
     }
     this.throwIfAborted(signal)
     // 如果 pool 为空，触发懒加载回调尝试同步账号（冷启动场景）
@@ -2157,8 +3008,11 @@ export class ProxyServer {
     // P1-8 会话粘性：优先复用已绑定的账号（同时受 API Key 绑定过滤）
     if (this.isSessionAffinityActive() && sessionHint) {
       const sticky = this.pickAccountWithAffinity(sessionHint)
-      if (sticky && isAllowed(sticky) && await supportsRequestedModel(sticky)) {
-        proxyLogger.debug('ProxyServer', `Session affinity hit: ${sessionHint.slice(0, 16)} → ${sticky.email || sticky.id.slice(0, 8)}`)
+      if (sticky && isAllowed(sticky) && (await supportsRequestedModel(sticky))) {
+        proxyLogger.debug(
+          'ProxyServer',
+          `Session affinity hit: ${sessionHint.slice(0, 16)} → ${sticky.email || sticky.id.slice(0, 8)}`
+        )
         // 仍需检查 token 是否需要刷新
         if (this.isTokenExpiringSoon(sticky)) {
           const refreshed = await this.refreshToken(sticky, signal)
@@ -2178,7 +3032,9 @@ export class ProxyServer {
       if (!account) {
         const status = this.accountPool.getQuotaStatus()
         if (status.exhausted > 0 && status.available === 0) {
-          console.log(`[ProxyServer] All accounts quota exhausted (${status.exhausted}/${status.total}), no available accounts`)
+          console.log(
+            `[ProxyServer] All accounts quota exhausted (${status.exhausted}/${status.total}), no available accounts`
+          )
         }
       }
     } else {
@@ -2187,17 +3043,25 @@ export class ProxyServer {
         // 使用指定的第一个账号
         account = this.accountPool.getAccount(this.config.selectedAccountIds[0])
         // 检查指定账号是否配额耗尽，若是则尝试自动切换
-        if (account && this.accountPool.isQuotaExhausted(account) && this.config.autoSwitchOnQuotaExhausted) {
+        if (
+          account &&
+          this.accountPool.isQuotaExhausted(account) &&
+          this.config.autoSwitchOnQuotaExhausted
+        ) {
           const nextAccount = this.accountPool.getNextAvailableAccount(account.id)
           if (nextAccount) {
-            console.log(`[ProxyServer] Selected account ${account.email || account.id} quota exhausted, auto-switching to ${nextAccount.email || nextAccount.id}`)
+            console.log(
+              `[ProxyServer] Selected account ${account.email || account.id} quota exhausted, auto-switching to ${nextAccount.email || nextAccount.id}`
+            )
             this.config.selectedAccountIds = [nextAccount.id]
             this.events.onAccountUpdate?.(nextAccount)
             account = nextAccount
           }
         }
         if (!account) {
-          console.log(`[ProxyServer] Selected account ${this.config.selectedAccountIds[0]} not found, using first available`)
+          console.log(
+            `[ProxyServer] Selected account ${this.config.selectedAccountIds[0]} not found, using first available`
+          )
           const allAccounts = this.accountPool.getAllAccounts()
           account = allAccounts.length > 0 ? allAccounts[0] : null
         }
@@ -2207,7 +3071,7 @@ export class ProxyServer {
         account = allAccounts.length > 0 ? allAccounts[0] : null
       }
     }
-    
+
     if (!account) return null
 
     // 自动切换 K-Proxy 设备 ID（如果 K-Proxy 服务可用）
@@ -2243,7 +3107,7 @@ export class ProxyServer {
 
     // 尝试切换到账号绑定的设备 ID
     const switched = kproxyService.switchToAccount(account.id)
-    
+
     if (!switched) {
       // 账号没有绑定设备 ID，自动生成并绑定
       const newDeviceId = generateDeviceId()
@@ -2254,9 +3118,15 @@ export class ProxyServer {
         createdAt: Date.now()
       })
       kproxyService.setDeviceId(newDeviceId)
-      proxyLogger.info('ProxyServer', `Auto-generated device ID for account ${account.email || account.id.substring(0, 8)}`)
+      proxyLogger.info(
+        'ProxyServer',
+        `Auto-generated device ID for account ${account.email || account.id.substring(0, 8)}`
+      )
     } else {
-      proxyLogger.debug('ProxyServer', `Switched to device ID for account ${account.email || account.id.substring(0, 8)}`)
+      proxyLogger.debug(
+        'ProxyServer',
+        `Switched to device ID for account ${account.email || account.id.substring(0, 8)}`
+      )
     }
   }
 
@@ -2281,6 +3151,9 @@ export class ProxyServer {
     // retry (its token may simply be stale) before we cool it down and rotate.
     // Bounded to once per account so a persistently-throttled account can't loop.
     const refreshRetriedIds = new Set<string>()
+    // 401/403 分支同样需要护栏：刷新成功就 continue 回同一个账号，
+    // 没有上限时一次客户端请求会把整池账号打成 ~N 次上游 403 + ~N 次 SSO 刷新
+    const authRetriedIds = new Set<string>()
     /** 切到下一个可用账号；多账号模式带 triedIds 排除，单账号场景退化为旧逻辑 */
     const switchToNextAccount = async (): Promise<ProxyAccount | null> => {
       if (this.config.enableMultiAccount) {
@@ -2296,20 +3169,28 @@ export class ProxyServer {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       this.throwIfAborted(signal)
       try {
-        const result = await this.runWithModelPacing(currentAccount, modelId, signal, () => apiCall(currentAccount, 0))
+        const result = await this.runWithModelPacing(currentAccount, modelId, signal, () =>
+          apiCall(currentAccount, 0)
+        )
         return { result, account: currentAccount }
       } catch (error) {
         if (this.isAbortError(error, signal)) throw error
         lastError = error as Error
         const errMsg = lastError.message || ''
 
-        console.error(`[ProxyServer] API call failed (attempt ${attempt + 1}/${maxAttempts}, account=${currentAccount.email || currentAccount.id}): ${errMsg}`)
+        console.error(
+          `[ProxyServer] API call failed (attempt ${attempt + 1}/${maxAttempts}, account=${currentAccount.email || currentAccount.id}): ${errMsg}`
+        )
 
         // 优先检测账号被长期封禁（不是 token 问题，刷新也没用）
         // 特征：HTTP 403 + reason: "TEMPORARILY_SUSPENDED" 或 AccountSuspendedException / 423
         const suspendInfo = this.detectSuspendedError(errMsg)
         if (suspendInfo) {
-          const newlyMarked = this.accountPool.markSuspended(currentAccount.id, suspendInfo.reason, suspendInfo.message)
+          const newlyMarked = this.accountPool.markSuspended(
+            currentAccount.id,
+            suspendInfo.reason,
+            suspendInfo.message
+          )
           if (newlyMarked) {
             this.events.onAccountSuspended?.({
               accountId: currentAccount.id,
@@ -2335,7 +3216,9 @@ export class ProxyServer {
               }
             })
           }
-          console.warn(`[ProxyServer] Account ${currentAccount.email || currentAccount.id} SUSPENDED (${suspendInfo.reason}): ${suspendInfo.message || 'No details'} - switching to next available account`)
+          console.warn(
+            `[ProxyServer] Account ${currentAccount.email || currentAccount.id} SUSPENDED (${suspendInfo.reason}): ${suspendInfo.message || 'No details'} - switching to next available account`
+          )
           // 切到下个可用账号（跳过被 suspended 的 + 本请求已试过的）
           const nextAccount = await switchToNextAccount()
           if (nextAccount && !triedIds.has(nextAccount.id)) {
@@ -2359,17 +3242,22 @@ export class ProxyServer {
           // a single account where Krouter previously gave up.
           if (
             !refreshRetriedIds.has(currentAccount.id) &&
-            (currentAccount.refreshToken || this.accountPool.getAccount(currentAccount.id)?.refreshToken)
+            (currentAccount.refreshToken ||
+              this.accountPool.getAccount(currentAccount.id)?.refreshToken)
           ) {
             refreshRetriedIds.add(currentAccount.id)
-            console.log(`[ProxyServer] Throttle on ${currentAccount.email || currentAccount.id.slice(0, 8)}; refreshing token and retrying same account (Kiro-Go style)`)
+            console.log(
+              `[ProxyServer] Throttle on ${currentAccount.email || currentAccount.id.slice(0, 8)}; refreshing token and retrying same account (Kiro-Go style)`
+            )
             const refreshed = await this.refreshToken(currentAccount, signal)
             if (refreshed) {
               currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
               continue
             }
           }
-          console.log(`[ProxyServer] Throttle error on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
+          console.log(
+            `[ProxyServer] Throttle error on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`
+          )
           this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
           ;(lastError as ProxyAttemptError).proxyFailureRecorded = true
           const nextAccount = await switchToNextAccount()
@@ -2384,7 +3272,9 @@ export class ProxyServer {
         }
 
         if (isBillingOrQuotaError(errMsg)) {
-          console.log(`[ProxyServer] Billing/quota exhausted on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account immediately`)
+          console.log(
+            `[ProxyServer] Billing/quota exhausted on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account immediately`
+          )
           this.markAccountQuotaExhausted(currentAccount, errMsg)
           ;(lastError as ProxyAttemptError).proxyFailureRecorded = true
           const nextAccount = await switchToNextAccount()
@@ -2402,7 +3292,9 @@ export class ProxyServer {
 
         // 401/403: 尝试刷新 Token
         if (this.isInvalidModelForAccountError(errMsg)) {
-          console.log(`[ProxyServer] Model not available on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
+          console.log(
+            `[ProxyServer] Model not available on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`
+          )
           const nextAccount = await switchToNextAccount()
           if (nextAccount && !triedIds.has(nextAccount.id)) {
             currentAccount = nextAccount
@@ -2413,13 +3305,27 @@ export class ProxyServer {
         }
 
         if (errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('Auth')) {
-          console.log('[ProxyServer] Auth error, attempting token refresh')
-          const refreshed = await this.refreshToken(currentAccount, signal)
-          if (refreshed) {
-            currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
-            continue
+          // 每个账号每请求只允许一次"刷新 token 再重试同账号"，用完就直接轮换账号
+          if (!authRetriedIds.has(currentAccount.id)) {
+            authRetriedIds.add(currentAccount.id)
+            console.log('[ProxyServer] Auth error, attempting token refresh')
+            const refreshed = await this.refreshToken(currentAccount, signal)
+            if (refreshed) {
+              currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+              continue
+            }
           }
-          // 刷新失败 → 切到没试过的下个账号
+          // Ghi nhận lỗi TRƯỚC khi rotate. Thiếu bước này thì một account 401/403 vĩnh viễn
+          // giữ nguyên errorCount 0 / cooldownUntil chưa set, nên vẫn "available" và được
+          // chọn lại ở request kế tiếp — mỗi vòng đốt thêm một lần SSO refresh thật.
+          // Mọi nhánh anh em (429, billing, 5xx) đều đã recordError, chỉ nhánh này thiếu.
+          this.accountPool.recordError(
+            currentAccount.id,
+            ErrorType.RECOVERABLE,
+            errMsg.includes('403') ? 403 : 401
+          )
+          ;(lastError as ProxyAttemptError).proxyFailureRecorded = true
+          // 刷新失败或刷新机会已用完 → 切到没试过的下个账号
           const nextAccount = await switchToNextAccount()
           if (nextAccount && !triedIds.has(nextAccount.id)) {
             currentAccount = nextAccount
@@ -2429,14 +3335,21 @@ export class ProxyServer {
         }
 
         // 5xx: 同账号短退避重试一次；再次 5xx 直接 fallback 到没试过的账号（瞬时故障跨账号绕过）
-        if (errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504')) {
+        if (
+          errMsg.includes('500') ||
+          errMsg.includes('502') ||
+          errMsg.includes('503') ||
+          errMsg.includes('504')
+        ) {
           console.log('[ProxyServer] Server error, retrying')
           // 第二次及以后的 5xx → 切换账号（旧逻辑会同账号撞死）
           if (attempt > 0) {
             const nextAccount = await switchToNextAccount()
             if (nextAccount && !triedIds.has(nextAccount.id)) {
               this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 503)
-              console.log(`[ProxyServer] Persistent 5xx on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
+              console.log(
+                `[ProxyServer] Persistent 5xx on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`
+              )
               currentAccount = nextAccount
               triedIds.add(nextAccount.id)
               continue
@@ -2473,7 +3386,9 @@ export class ProxyServer {
     }
     this.accountPool.recordError(
       account.id,
-      statusCode && statusCode >= 500 ? ErrorType.RECOVERABLE : classifyError(statusCode || 500, message),
+      statusCode && statusCode >= 500
+        ? ErrorType.RECOVERABLE
+        : classifyError(statusCode || 500, message),
       statusCode
     )
   }
@@ -2512,6 +3427,35 @@ export class ProxyServer {
     return account
   }
 
+  /**
+   * 按模型累计 requests/tokens。
+   * Kiro 与 Bedrock 两条链路共用同一个实现，避免 stats.modelStats 只有 Bedrock 流量。
+   */
+  private accumulateModelStats(
+    model: string | undefined,
+    inputTokens: number,
+    outputTokens: number
+  ): void {
+    if (!model) return
+    const modelStat = this.stats.modelStats.get(model) || { model, requests: 0, tokens: 0 }
+    modelStat.requests++
+    modelStat.tokens += inputTokens + outputTokens
+    this.stats.modelStats.set(model, modelStat)
+    // Khoá là chuỗi model do client gửi, không qua allowlist nào: mapModelId cố ý fallback
+    // về MODEL_ID_MAP.default cho id lạ nên chuỗi tuỳ ý vẫn đi tới nhánh thành công.
+    // Không chặn thì map này phình vô hạn (usageHistory ngay bên cạnh đã có cap 100).
+    ProxyServer.evictOldestEntries(this.stats.modelStats, MAX_TRACKED_MODELS)
+  }
+
+  /** Xoá các khoá cũ nhất (Map giữ thứ tự chèn) cho tới khi Map về đúng giới hạn. */
+  private static evictOldestEntries(map: Map<string, unknown>, limit: number): void {
+    if (map.size <= limit) return
+    for (const key of map.keys()) {
+      if (map.size <= limit) break
+      map.delete(key)
+    }
+  }
+
   private recordSuccessfulUsage(input: {
     path: string
     model?: string
@@ -2530,12 +3474,14 @@ export class ProxyServer {
     const { path, model, account, usage, startTime, apiKeyId, simulatedCacheUsage } = input
     const inputTokens = usage.inputTokens || 0
     const outputTokens = usage.outputTokens || 0
-    const cacheReadTokens = usage.cacheReadTokens && usage.cacheReadTokens > 0
-      ? usage.cacheReadTokens
-      : simulatedCacheUsage?.cacheReadInputTokens || 0
-    const cacheWriteTokens = usage.cacheWriteTokens && usage.cacheWriteTokens > 0
-      ? usage.cacheWriteTokens
-      : simulatedCacheUsage?.cacheCreationInputTokens || 0
+    const cacheReadTokens =
+      usage.cacheReadTokens && usage.cacheReadTokens > 0
+        ? usage.cacheReadTokens
+        : simulatedCacheUsage?.cacheReadInputTokens || 0
+    const cacheWriteTokens =
+      usage.cacheWriteTokens && usage.cacheWriteTokens > 0
+        ? usage.cacheWriteTokens
+        : simulatedCacheUsage?.cacheCreationInputTokens || 0
     const reasoningTokens = usage.reasoningTokens || 0
     const credits = usage.credits || 0
     const responseTime = Date.now() - startTime
@@ -2548,6 +3494,8 @@ export class ProxyServer {
     this.stats.cacheWriteTokens += cacheWriteTokens
     this.stats.reasoningTokens += reasoningTokens
     this.stats.totalCredits += credits
+    // 之前只有 Bedrock 链路写 modelStats，Kiro 流量的按模型统计一直是空的
+    this.accumulateModelStats(model, inputTokens, outputTokens)
     this.events.onCreditsUpdate?.(this.stats.totalCredits)
     this.notifyUsageStatsUpdate()
     this.recordAccountSuccess(account, usage)
@@ -2567,7 +3515,12 @@ export class ProxyServer {
       accountEmail: account.email
     })
     endpointMetrics.record({
-      path, status: 200, responseTime, inputTokens, outputTokens, cacheReadTokens
+      path,
+      status: 200,
+      responseTime,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens
     })
     this.recordRequest({
       path,
@@ -2612,7 +3565,14 @@ export class ProxyServer {
   private async callStreamWithFailover(
     initialAccount: ProxyAccount,
     payload: KiroPayload,
-    onChunk: (account: ProxyAccount, text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void,
+    onChunk: (
+      account: ProxyAccount,
+      text: string,
+      toolUse?: KiroToolUse,
+      isThinking?: boolean,
+      reasoningSignature?: string,
+      redactedContent?: string
+    ) => void,
     onComplete: (account: ProxyAccount, usage: KiroUsage) => void,
     onError: (account: ProxyAccount, error: Error) => void,
     path: string,
@@ -2635,34 +3595,51 @@ export class ProxyServer {
     // (mirrors the non-stream path). A throttled account gets ONE token refresh +
     // same-account retry before we cool it down and rotate. Bounded to once.
     const refreshRetriedIds = new Set<string>()
+    // 与 429 分支同样的护栏，但用于 401/403：每个账号每请求只做一次刷新-重试，
+    // 否则刷新成功就 continue 回同一个账号，会把整池放大成 ~N 次 403 + ~N 次 SSO 刷新
+    const authRetriedIds = new Set<string>()
     let currentAccount = initialAccount
     let streamCommitted = false
     // "Committed to client" — the point of no return. With a buffer-first handler
     // this is commitState.clientFlushed; without one it degrades to streamCommitted
     // (any upstream chunk received), preserving the old contract.
-    const isCommittedToClient = (): boolean => commitState ? commitState.clientFlushed : streamCommitted
+    const isCommittedToClient = (): boolean =>
+      commitState ? commitState.clientFlushed : streamCommitted
     let lastError = new Error('Unknown stream error')
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       this.throwIfAborted(signal)
-      const outcome = await this.runWithModelPacing(currentAccount, modelId, signal, () => new Promise<{ completed: boolean; error?: Error }>((resolve) => {
-        callKiroApiStream(
-          currentAccount,
-          payload,
-          (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
-            streamCommitted = true
-            onChunk(currentAccount, text, toolUse, isThinking, reasoningSignature, redactedContent)
-          },
-          (usage) => {
-            streamCommitted = true
-            onComplete(currentAccount, usage)
-            resolve({ completed: true })
-          },
-          (error) => resolve({ completed: false, error }),
-          signal,
-          this.config.preferredEndpoint
-        ).catch((error) => resolve({ completed: false, error: error as Error }))
-      }))
+      const outcome = await this.runWithModelPacing(
+        currentAccount,
+        modelId,
+        signal,
+        () =>
+          new Promise<{ completed: boolean; error?: Error }>((resolve) => {
+            callKiroApiStream(
+              currentAccount,
+              payload,
+              (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
+                streamCommitted = true
+                onChunk(
+                  currentAccount,
+                  text,
+                  toolUse,
+                  isThinking,
+                  reasoningSignature,
+                  redactedContent
+                )
+              },
+              (usage) => {
+                streamCommitted = true
+                onComplete(currentAccount, usage)
+                resolve({ completed: true })
+              },
+              (error) => resolve({ completed: false, error }),
+              signal,
+              this.config.preferredEndpoint
+            ).catch((error) => resolve({ completed: false, error: error as Error }))
+          })
+      )
 
       if (outcome.completed) return
       if (this.isAbortError(outcome.error, signal)) throw outcome.error
@@ -2685,7 +3662,11 @@ export class ProxyServer {
       const toolInputIntegrityError = isKiroToolInputIntegrityError(lastError)
       const suspendInfo = this.detectSuspendedError(message)
       if (suspendInfo) {
-        const newlyMarked = this.accountPool.markSuspended(currentAccount.id, suspendInfo.reason, suspendInfo.message)
+        const newlyMarked = this.accountPool.markSuspended(
+          currentAccount.id,
+          suspendInfo.reason,
+          suspendInfo.message
+        )
         if (newlyMarked) {
           this.events.onAccountSuspended?.({
             accountId: currentAccount.id,
@@ -2694,28 +3675,49 @@ export class ProxyServer {
             message: suspendInfo.message
           })
         }
-      } else if (isThrottleError(message) && !refreshRetriedIds.has(currentAccount.id) && currentAccount.refreshToken) {
+      } else if (
+        isThrottleError(message) &&
+        !refreshRetriedIds.has(currentAccount.id) &&
+        currentAccount.refreshToken
+      ) {
         // 429 "suspicious activity" on this account: mirror Kiro-Go — try ONE token
         // refresh and retry the SAME account (a stale token is a common cause) before
         // cooling it down and rotating. Bounded to once per account per request.
         refreshRetriedIds.add(currentAccount.id)
-        proxyLogger.info('ProxyServer', `Streaming throttle on ${currentAccount.email || currentAccount.id.slice(0, 8)}; refreshing token and retrying same account`)
+        proxyLogger.info(
+          'ProxyServer',
+          `Streaming throttle on ${currentAccount.email || currentAccount.id.slice(0, 8)}; refreshing token and retrying same account`
+        )
         const refreshed = await this.refreshToken(currentAccount, signal)
         if (refreshed) {
           currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
           continue
         }
         this.recordAccountFailure(currentAccount, lastError)
-      } else if (isBillingOrQuotaError(message) || isThrottleError(message) || /\b5\d\d\b/.test(message)) {
+      } else if (
+        isBillingOrQuotaError(message) ||
+        isThrottleError(message) ||
+        /\b5\d\d\b/.test(message)
+      ) {
         this.recordAccountFailure(currentAccount, lastError)
       } else if (message.includes('401') || message.includes('403') || message.includes('Auth')) {
-        const refreshed = await this.refreshToken(currentAccount, signal)
-        if (refreshed) {
-          currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
-          continue
+        // 护栏命中时不再刷新，直接落到下面的可重试判断去轮换账号
+        if (!authRetriedIds.has(currentAccount.id)) {
+          authRetriedIds.add(currentAccount.id)
+          const refreshed = await this.refreshToken(currentAccount, signal)
+          if (refreshed) {
+            currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+            continue
+          }
         }
+        // Refresh không cứu được account này -> phải ghi nhận lỗi như mọi nhánh khác,
+        // nếu không nó vẫn "khoẻ" trong pool và được chọn lại ngay ở request kế tiếp.
+        this.recordAccountFailure(currentAccount, lastError)
       } else if (invalidModelError) {
-        proxyLogger.info('ProxyServer', `Streaming model not available on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
+        proxyLogger.info(
+          'ProxyServer',
+          `Streaming model not available on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`
+        )
       } else if (toolInputIntegrityError) {
         proxyLogger.warn(
           'ProxyServer',
@@ -2728,16 +3730,17 @@ export class ProxyServer {
       // Stream stalls (first-byte / idle timeout) are transient upstream issues:
       // treat as retryable so a pre-flush timeout rotates to another account.
       const streamTimeoutError = /stream (first-byte|idle) timeout/i.test(message)
-      const retryable = Boolean(suspendInfo)
-        || toolInputIntegrityError
-        || isBillingOrQuotaError(message)
-        || isThrottleError(message)
-        || message.includes('401')
-        || message.includes('403')
-        || message.includes('Auth')
-        || invalidModelError
-        || streamTimeoutError
-        || /\b5\d\d\b/.test(message)
+      const retryable =
+        Boolean(suspendInfo) ||
+        toolInputIntegrityError ||
+        isBillingOrQuotaError(message) ||
+        isThrottleError(message) ||
+        message.includes('401') ||
+        message.includes('403') ||
+        message.includes('Auth') ||
+        invalidModelError ||
+        streamTimeoutError ||
+        /\b5\d\d\b/.test(message)
       if (!retryable) break
 
       const nextAccount = await this.getNextAccountForModel(triedIds, apiKeyId, modelId, signal)
@@ -2786,7 +3789,11 @@ export class ProxyServer {
     const bb = Buffer.from(b, 'utf8')
     if (ab.length !== bb.length) {
       // 仍执行一次比较保证常数时间（用 a 自身比，结果不影响）
-      try { crypto.timingSafeEqual(ab, ab) } catch { /* ignore */ }
+      try {
+        crypto.timingSafeEqual(ab, ab)
+      } catch {
+        /* ignore */
+      }
       return false
     }
     try {
@@ -2798,7 +3805,11 @@ export class ProxyServer {
 
   // 验证 API Key 并返回匹配的 Key（用于统计）
   // P0-3 使用 timingSafeEqual 防止时序攻击逐字猜 Key
-  private validateApiKey(req: http.IncomingMessage): { valid: boolean; apiKey?: import('./types').ApiKey; reason?: string } {
+  private validateApiKey(req: http.IncomingMessage): {
+    valid: boolean
+    apiKey?: import('./types').ApiKey
+    reason?: string
+  } {
     // 如果没有配置任何 API Key，则跳过验证
     const hasApiKeys = this.config.apiKeys && this.config.apiKeys.length > 0
     const hasLegacyKey = !!this.config.apiKey
@@ -2915,8 +3926,8 @@ export class ProxyServer {
   }
 
   private ipv4ToInt(ip: string): number {
-    const parts = ip.split('.').map(p => parseInt(p, 10))
-    if (parts.length !== 4 || parts.some(p => !Number.isFinite(p) || p < 0 || p > 255)) return -1
+    const parts = ip.split('.').map((p) => parseInt(p, 10))
+    if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p) || p < 0 || p > 255)) return -1
     return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
   }
 
@@ -2956,14 +3967,21 @@ export class ProxyServer {
   }
 
   // 记录 API Key 用量
-  recordApiKeyUsage(apiKeyId: string, credits: number, inputTokens: number, outputTokens: number, model?: string, path?: string): void {
+  recordApiKeyUsage(
+    apiKeyId: string,
+    credits: number,
+    inputTokens: number,
+    outputTokens: number,
+    model?: string,
+    path?: string
+  ): void {
     if (!this.config.apiKeys) return
-    const apiKey = this.config.apiKeys.find(k => k.id === apiKeyId)
+    const apiKey = this.config.apiKeys.find((k) => k.id === apiKeyId)
     if (!apiKey) return
 
     const today = new Date().toISOString().split('T')[0]
     const now = Date.now()
-    
+
     // 更新总计
     apiKey.usage.totalRequests++
     apiKey.usage.totalCredits += credits
@@ -2992,6 +4010,14 @@ export class ProxyServer {
       apiKey.usage.byModel[model].credits += credits
       apiKey.usage.byModel[model].inputTokens += inputTokens
       apiKey.usage.byModel[model].outputTokens += outputTokens
+      // byModel được ghi vào store.json sau MỖI request và khoá là chuỗi model thô từ client,
+      // nên phải chặn trên giống usageHistory ngay bên dưới (cap 100).
+      const modelKeys = Object.keys(apiKey.usage.byModel)
+      if (modelKeys.length > MAX_TRACKED_MODELS) {
+        for (const key of modelKeys.slice(0, modelKeys.length - MAX_TRACKED_MODELS)) {
+          delete apiKey.usage.byModel[key]
+        }
+      }
     }
 
     // 添加用量历史记录（保留最近 100 条）
@@ -3015,7 +4041,12 @@ export class ProxyServer {
   }
 
   // 应用模型映射
-  private pickWeightedRoundRobinModel(rule: NonNullable<ProxyConfig['modelMappings']>[number], targets: string[], requestedModel: string, apiKeyId?: string): string {
+  private pickWeightedRoundRobinModel(
+    rule: NonNullable<ProxyConfig['modelMappings']>[number],
+    targets: string[],
+    requestedModel: string,
+    apiKeyId?: string
+  ): string {
     const weights = targets.map((_, index) => {
       const raw = rule.weights?.[index]
       return Number.isFinite(raw) && raw && raw > 0 ? Math.min(50, Math.floor(raw)) : 1
@@ -3041,6 +4072,31 @@ export class ProxyServer {
     return target
   }
 
+  /**
+   * 编译并缓存模型映射的通配符正则。
+   * 先转义全部正则元字符再把 \* 还原成通配符，避免配置里的 `claude-(opus`
+   * 抛出未捕获的 SyntaxError（会让之后每个请求都 500），也避免 `gpt-4.1` 误配 `gpt-4X1`。
+   * 非法 pattern 返回 null 由调用方跳过该规则，而不是让整个请求失败。
+   */
+  private getModelMappingRegex(sourceModel: string): RegExp | null {
+    const cached = this.modelMappingRegexCache.get(sourceModel)
+    if (cached) return cached
+    const sourcePattern = sourceModel
+      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      .replace(/\\\*/g, '[^]*')
+    try {
+      const regex = new RegExp(`^${sourcePattern}$`, 'i')
+      this.modelMappingRegexCache.set(sourceModel, regex)
+      return regex
+    } catch (error) {
+      console.warn(
+        `[ProxyServer] Skipping model mapping rule with invalid sourceModel "${sourceModel}":`,
+        error instanceof Error ? error.message : error
+      )
+      return null
+    }
+  }
+
   private applyModelMapping(requestedModel: string, apiKeyId?: string): string {
     const mappings = this.config.modelMappings
     if (!mappings || mappings.length === 0) return requestedModel
@@ -3057,13 +4113,12 @@ export class ProxyServer {
         if (!rule.apiKeyIds.includes(apiKeyId)) continue
       }
 
-      // 检查源模型是否匹配（支持通配符 *）
-      const sourcePattern = rule.sourceModel.replace(/\*/g, '.*')
-      const regex = new RegExp(`^${sourcePattern}$`, 'i')
-      if (!regex.test(requestedModel)) continue
+      // 检查源模型是否匹配（支持通配符 *），非法规则会被 getModelMappingRegex 跳过
+      const regex = this.getModelMappingRegex(rule.sourceModel)
+      if (!regex || !regex.test(requestedModel)) continue
 
       // 匹配成功，根据类型选择目标模型
-      const validTargets = rule.targetModels.filter(t => t.trim())
+      const validTargets = rule.targetModels.filter((t) => t.trim())
       if (validTargets.length === 0) continue
 
       let targetModel: string
@@ -3076,7 +4131,10 @@ export class ProxyServer {
         targetModel = validTargets[0]
       }
 
-      proxyLogger.info('ProxyServer', `Model mapping applied: ${requestedModel} -> ${targetModel} (rule: ${rule.name}, type: ${rule.type})`)
+      proxyLogger.info(
+        'ProxyServer',
+        `Model mapping applied: ${requestedModel} -> ${targetModel} (rule: ${rule.name}, type: ${rule.type})`
+      )
       return targetModel
     }
 
@@ -3089,10 +4147,12 @@ export class ProxyServer {
     const method = req.method || 'GET'
     const clientIP = this.getClientIP(req)
     const controller = new AbortController()
-    const abortRequest = () => {
+    const abortRequest = (): void => {
       if (!this.isStopping && res.writableEnded) return
       if (!controller.signal.aborted) {
-        controller.abort(new Error(this.isStopping ? 'Proxy server stopped' : 'Client disconnected'))
+        controller.abort(
+          new Error(this.isStopping ? 'Proxy server stopped' : 'Client disconnected')
+        )
       }
     }
     this.activeRequests.add(controller)
@@ -3129,12 +4189,17 @@ export class ProxyServer {
           const errorMsg = authResult.reason || 'Invalid or missing API key'
           const statusCode = authResult.reason === 'Credits limit exceeded' ? 429 : 401
           // 401 不返回 reason 详情（防止指纹爬取）
-          this.sendError(res, statusCode, statusCode === 401 ? 'Unauthorized' : errorMsg,
-            this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+          this.sendError(
+            res,
+            statusCode,
+            statusCode === 401 ? 'Unauthorized' : errorMsg,
+            this.isAnthropicPath(path) ? 'anthropic' : 'openai'
+          )
           return
         }
         // 将匹配的 API Key 存储到请求对象中，用于后续统计
-        ;(req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey = authResult.apiKey
+        ;(req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey =
+          authResult.apiKey
 
         // P1-7 按 API Key（或匿名时按 IP）请求限流
         const rateLimitId = authResult.apiKey?.id || `ip:${clientIP || 'unknown'}`
@@ -3143,8 +4208,12 @@ export class ProxyServer {
           res.setHeader('Retry-After', String(Math.ceil(rl.retryAfterMs / 1000)))
           res.setHeader('X-RateLimit-Limit', String(this.config.rateLimitPerKeyPerMinute || 0))
           res.setHeader('X-RateLimit-Remaining', '0')
-          this.sendError(res, 429, 'Rate limit exceeded',
-            this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+          this.sendError(
+            res,
+            429,
+            'Rate limit exceeded',
+            this.isAnthropicPath(path) ? 'anthropic' : 'openai'
+          )
           return
         }
       }
@@ -3156,16 +4225,26 @@ export class ProxyServer {
 
       // 路由（移除查询参数）
       const pathWithoutQuery = path.split('?')[0]
-      
+
       if (pathWithoutQuery === '/v1/models' || pathWithoutQuery === '/models') {
         await this.handleModels(res, controller.signal)
-      } else if (pathWithoutQuery === '/v1/chat/completions' || pathWithoutQuery === '/chat/completions') {
+      } else if (
+        pathWithoutQuery === '/v1/chat/completions' ||
+        pathWithoutQuery === '/chat/completions'
+      ) {
         await this.handleOpenAIChat(req, res, controller.signal)
       } else if (pathWithoutQuery === '/v1/responses' || pathWithoutQuery === '/responses') {
         await this.handleOpenAIResponses(req, res, controller.signal)
-      } else if (pathWithoutQuery === '/v1/messages' || pathWithoutQuery === '/messages' || pathWithoutQuery === '/anthropic/v1/messages') {
+      } else if (
+        pathWithoutQuery === '/v1/messages' ||
+        pathWithoutQuery === '/messages' ||
+        pathWithoutQuery === '/anthropic/v1/messages'
+      ) {
         await this.handleClaudeMessages(req, res, controller.signal)
-      } else if (pathWithoutQuery === '/v1/messages/count_tokens' || pathWithoutQuery === '/messages/count_tokens') {
+      } else if (
+        pathWithoutQuery === '/v1/messages/count_tokens' ||
+        pathWithoutQuery === '/messages/count_tokens'
+      ) {
         // Claude Code token 计数端点 - 返回模拟响应
         await this.handleCountTokens(req, res, controller.signal)
       } else if (pathWithoutQuery === '/api/event_logging/batch') {
@@ -3178,9 +4257,16 @@ export class ProxyServer {
       } else if (pathWithoutQuery === '/v1beta/models') {
         // Gemini 模型列表
         await this.handleGeminiModels(res, controller.signal)
-      } else if (pathWithoutQuery.startsWith('/skills/') || pathWithoutQuery === '/api/skills/list' || pathWithoutQuery === '/api/skills/content') {
+      } else if (
+        pathWithoutQuery.startsWith('/skills/') ||
+        pathWithoutQuery === '/api/skills/list' ||
+        pathWithoutQuery === '/api/skills/content'
+      ) {
         this.handleSkills(res, pathWithoutQuery, req.url || '/')
-      } else if (pathWithoutQuery === '/v1/images/generations' || pathWithoutQuery === '/images/generations') {
+      } else if (
+        pathWithoutQuery === '/v1/images/generations' ||
+        pathWithoutQuery === '/images/generations'
+      ) {
         await this.handleImageGeneration(req, res, controller.signal)
       } else if (pathWithoutQuery.startsWith('/v1/images/') && method === 'GET') {
         this.handleServeImage(res, pathWithoutQuery)
@@ -3198,7 +4284,7 @@ export class ProxyServer {
         await this.handleAdminApi(req, res, pathWithoutQuery, controller.signal)
       } else if (pathWithoutQuery.startsWith('/mcp/') || pathWithoutQuery === '/mcp') {
         // MCP Server endpoint
-        await this.handleMcpRequest(req, res, pathWithoutQuery)
+        await this.handleMcpRequest(req, res)
       } else {
         // 记录未知路径以便调试
         console.log(`[ProxyServer] Unknown path: ${path} (method: ${method})`)
@@ -3211,14 +4297,26 @@ export class ProxyServer {
       }
       // P0-1 body 超限 → 413
       if (error instanceof BodyTooLargeError) {
-        proxyLogger.warn('ProxyServer', `Body too large from ${clientIP}: ${error.received}/${error.limit} bytes (${path})`)
-        this.sendError(res, 413, `Request body too large (max ${error.limit} bytes)`,
-          this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+        proxyLogger.warn(
+          'ProxyServer',
+          `Body too large from ${clientIP}: ${error.received}/${error.limit} bytes (${path})`
+        )
+        this.sendError(
+          res,
+          413,
+          `Request body too large (max ${error.limit} bytes)`,
+          this.isAnthropicPath(path) ? 'anthropic' : 'openai'
+        )
         return
       }
       // P0-5 错误响应 sanitize：500 类不吐内部 message
       console.error('[ProxyServer] Request error:', error)
-      this.sendError(res, 500, 'Internal server error', this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+      this.sendError(
+        res,
+        500,
+        'Internal server error',
+        this.isAnthropicPath(path) ? 'anthropic' : 'openai'
+      )
       this.events.onError?.(error as Error)
     } finally {
       req.off('aborted', abortRequest)
@@ -3227,15 +4325,48 @@ export class ProxyServer {
     }
   }
 
+  /** 请求是否来自本机回环地址（未配置 adminApiKey 时 admin API 的信任边界） */
+  private isLoopbackRequest(req: http.IncomingMessage): boolean {
+    const remote = (req.socket.remoteAddress || '').trim().toLowerCase()
+    return remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1'
+  }
+
   // 管理 API 端点
-  private async handleAdminApi(req: http.IncomingMessage, res: http.ServerResponse, path: string, signal?: AbortSignal): Promise<void> {
+  private async handleAdminApi(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    path: string,
+    signal?: AbortSignal
+  ): Promise<void> {
     const method = req.method || 'GET'
 
-    // 管理 API 需要 API Key 验证
-    const authResult = this.validateApiKey(req)
-    if (!authResult.valid) {
-      this.sendError(res, 401, 'Admin API requires authentication')
-      return
+    // 管理 API 鉴权：任何租户的推理 Key 都不再等同于管理员，且"未配置任何 Key"时不能默认放行
+    // - 配了 adminApiKey：必须带 x-admin-key 或 Bearer，且常数时间比对通过（允许远程访问）
+    // - 没配 adminApiKey：只信任回环请求，并且仍要通过原有的 validateApiKey
+    const adminApiKey = (this.config as ProxyConfig & { adminApiKey?: string }).adminApiKey
+    if (adminApiKey) {
+      const headerKey = (req.headers['x-admin-key'] as string) || ''
+      const authHeader = req.headers['authorization'] || ''
+      const bearerKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : ''
+      const providedAdminKey = headerKey || bearerKey
+      if (!providedAdminKey || !this.safeStringEq(adminApiKey, providedAdminKey)) {
+        this.sendError(res, 401, 'Admin API requires a valid admin key')
+        return
+      }
+    } else {
+      if (!this.isLoopbackRequest(req)) {
+        this.sendError(
+          res,
+          403,
+          'Admin API is restricted to loopback unless adminApiKey is configured'
+        )
+        return
+      }
+      const authResult = this.validateApiKey(req)
+      if (!authResult.valid) {
+        this.sendError(res, 401, 'Admin API requires authentication')
+        return
+      }
     }
 
     if (path === '/admin/stats' && method === 'GET') {
@@ -3254,7 +4385,9 @@ export class ProxyServer {
       // 更新配置（P1-9 schema 白名单校验，防止任意字段注入）
       const body = await this.readBody(req, signal)
       let parsed: Record<string, unknown>
-      try { parsed = JSON.parse(body) } catch {
+      try {
+        parsed = JSON.parse(body)
+      } catch {
         this.sendError(res, 400, 'Invalid JSON body')
         return
       }
@@ -3262,7 +4395,13 @@ export class ProxyServer {
       this.updateConfig(safeUpdate)
       this.appendAuditLog('config_updated', { fields: Object.keys(safeUpdate) })
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ success: true, applied: Object.keys(safeUpdate), config: this.handleAdminConfigPayload() }))
+      res.end(
+        JSON.stringify({
+          success: true,
+          applied: Object.keys(safeUpdate),
+          config: this.handleAdminConfigPayload()
+        })
+      )
     } else if (path === '/admin/audit' && method === 'GET') {
       // P2-17 审计日志
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -3272,11 +4411,14 @@ export class ProxyServer {
       this.handleAdminLogs(res)
     } else if (path === '/admin/cache/clear' && method === 'POST') {
       // 清除内存缓存（conversationId 映射、模型缓存、prompt cache）
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ để tránh phụ thuộc vòng proxyServer <-> kiroApi
       const { clearAllCaches } = require('./kiroApi')
       const cleared = clearAllCaches()
       const promptCacheCleared = promptCacheTracker.clear()
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ success: true, cleared: { ...cleared, promptCache: promptCacheCleared } }))
+      res.end(
+        JSON.stringify({ success: true, cleared: { ...cleared, promptCache: promptCacheCleared } })
+      )
     } else if (path === '/admin/endpoint-metrics' && method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ endpoints: endpointMetrics.getAll() }))
@@ -3287,7 +4429,7 @@ export class ProxyServer {
     } else if (path === '/admin/account-health' && method === 'GET') {
       // Phase 8: Account health dashboard data
       const accounts = this.accountPool.getAllAccounts()
-      const healthData = accounts.map(a => ({
+      const healthData = accounts.map((a) => ({
         id: a.id,
         email: a.email,
         tier: a.subscriptionType,
@@ -3312,7 +4454,10 @@ export class ProxyServer {
   }
 
   // Phase 14: MCP Server endpoint handler
-  private async handleMcpRequest(req: http.IncomingMessage, res: http.ServerResponse, path: string): Promise<void> {
+  private async handleMcpRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse
+  ): Promise<void> {
     await this.mcpServer.handleMcpHttpRequest(req, res)
   }
 
@@ -3320,25 +4465,32 @@ export class ProxyServer {
   private handleAdminStats(res: http.ServerResponse): void {
     const stats = this.getStats()
     const accountStats: Record<string, unknown> = {}
-    stats.accountStats.forEach((v, k) => { accountStats[k] = v })
+    stats.accountStats.forEach((v, k) => {
+      accountStats[k] = v
+    })
 
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({
-      totalRequests: stats.totalRequests,
-      successRequests: stats.successRequests,
-      failedRequests: stats.failedRequests,
-      totalTokens: stats.totalTokens,
-      inputTokens: stats.inputTokens,
-      outputTokens: stats.outputTokens,
-      uptime: Date.now() - stats.startTime,
-      startTime: stats.startTime,
-      accountStats,
-      recentRequests: stats.recentRequests.slice(-50)
-    }))
+    res.end(
+      JSON.stringify({
+        totalRequests: stats.totalRequests,
+        successRequests: stats.successRequests,
+        failedRequests: stats.failedRequests,
+        totalTokens: stats.totalTokens,
+        inputTokens: stats.inputTokens,
+        outputTokens: stats.outputTokens,
+        uptime: Date.now() - stats.startTime,
+        startTime: stats.startTime,
+        accountStats,
+        recentRequests: stats.recentRequests.slice(-50)
+      })
+    )
   }
 
   // 管理 API - 测试 Bedrock 连接
-  private async handleAdminBedrockTest(res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+  private async handleAdminBedrockTest(
+    res: http.ServerResponse,
+    signal?: AbortSignal
+  ): Promise<void> {
     if (!this.config.bedrock?.enabled) {
       res.writeHead(400, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ ok: false, error: 'Bedrock is not enabled in config' }))
@@ -3349,10 +4501,10 @@ export class ProxyServer {
       const { testBedrockCredentials } = await import('./bedrock')
       const result = await testBedrockCredentials(this.config.bedrock, signal)
       this.throwIfResponseClosed(res, signal)
-      
+
       // Clear cached error on successful test
       if (result.ok) this.bedrockLastError = null
-      
+
       res.writeHead(result.ok ? 200 : 502, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result))
     } catch (error) {
@@ -3360,13 +4512,20 @@ export class ProxyServer {
       const message = error instanceof Error ? error.message : String(error)
       this.bedrockLastError = { message, timestamp: Date.now() }
       res.writeHead(500, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ ok: false, error: message, region: this.config.bedrock?.region || 'us-east-1', models: [] }))
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: message,
+          region: this.config.bedrock?.region || 'us-east-1',
+          models: []
+        })
+      )
     }
   }
 
   // 管理 API - 账号列表
   private handleAdminAccounts(res: http.ServerResponse): void {
-    const accounts = this.accountPool.getAllAccounts().map(acc => ({
+    const accounts = this.accountPool.getAllAccounts().map((acc) => ({
       id: acc.id,
       email: acc.email,
       isAvailable: acc.isAvailable !== false,
@@ -3380,11 +4539,13 @@ export class ProxyServer {
     }))
 
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({
-      total: accounts.length,
-      available: accounts.filter(a => a.isAvailable).length,
-      accounts
-    }))
+    res.end(
+      JSON.stringify({
+        total: accounts.length,
+        available: accounts.filter((a) => a.isAvailable).length,
+        accounts
+      })
+    )
   }
 
   /**
@@ -3401,8 +4562,14 @@ export class ProxyServer {
     return {
       ...config,
       apiKey: maskKey(config.apiKey),
-      apiKeys: config.apiKeys?.map(k => ({ ...k, key: maskKey(k.key) || '***' })),
-      tls: config.tls ? { enabled: config.tls.enabled, hasCert: !!(config.tls.cert || config.tls.certPath), hasKey: !!(config.tls.key || config.tls.keyPath) } : undefined
+      apiKeys: config.apiKeys?.map((k) => ({ ...k, key: maskKey(k.key) || '***' })),
+      tls: config.tls
+        ? {
+            enabled: config.tls.enabled,
+            hasCert: !!(config.tls.cert || config.tls.certPath),
+            hasKey: !!(config.tls.key || config.tls.keyPath)
+          }
+        : undefined
     }
   }
 
@@ -3418,52 +4585,168 @@ export class ProxyServer {
    */
   private filterAdminConfigUpdate(input: Record<string, unknown>): Partial<ProxyConfig> {
     const allowed: Array<keyof ProxyConfig> = [
-      'enabled', 'enableMultiAccount', 'logRequests', 'logStreamEvents',
-      'maxConcurrent', 'maxRetries', 'retryDelayMs', 'preferredEndpoint',
-      'tokenRefreshBeforeExpiry', 'autoStart', 'clientDrivenToolExecution',
-      'disableTools', 'payloadSizeLimitKB', 'enableTokenBufferReserve',
-      'tokenBufferReserve', 'autoSwitchOnQuotaExhausted', 'accountSelectionStrategy',
-      'multiAccountSelectionMode', 'multiAccountGroupIds', 'modelMappings',
-      'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
-      'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
-      'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
-      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'strictTierRouting',
-      'tierRoutingEnabled', 'customModels'
+      'enabled',
+      'enableMultiAccount',
+      'logRequests',
+      'logStreamEvents',
+      'maxConcurrent',
+      'maxRetries',
+      'retryDelayMs',
+      'preferredEndpoint',
+      'tokenRefreshBeforeExpiry',
+      'autoStart',
+      'clientDrivenToolExecution',
+      'disableTools',
+      'payloadSizeLimitKB',
+      'enableTokenBufferReserve',
+      'tokenBufferReserve',
+      'autoSwitchOnQuotaExhausted',
+      'accountSelectionStrategy',
+      'multiAccountSelectionMode',
+      'multiAccountGroupIds',
+      'modelMappings',
+      'maxRequestBodyBytes',
+      'allowedIPs',
+      'deniedIPs',
+      'rateLimitPerKeyPerMinute',
+      'sessionAffinityEnabled',
+      'keepAliveTimeoutMs',
+      'headersTimeoutMs',
+      'recentRequestsLimit',
+      'enableMetrics',
+      'apiKeyGroupBindings',
+      'enableAuditLog',
+      'strictTierRouting',
+      'tierRoutingEnabled',
+      'customModels'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
     ]
+    // 名字白名单之外还必须校验值类型：某些字段当前值可能是 undefined，无法从 this.config 推断，
+    // 这里显式声明它们的形状（数组 / 普通对象）
+    // Phải liệt kê ĐỦ mọi field có thể đang là undefined trên bản cài mới; nếu bỏ sót thì
+    // nhánh suy luận cuối cùng chấp nhận mọi kiểu primitive, ví dụ {"maxRequestBodyBytes": -1}
+    // lọt qua và readBody kẹp còn 1KB → mọi request từ 1KB trở lên bị 413 (tự DoS).
+    const declaredKinds: Record<string, 'array' | 'object' | 'number' | 'boolean' | 'string'> = {
+      allowedIPs: 'array',
+      deniedIPs: 'array',
+      multiAccountGroupIds: 'array',
+      modelMappings: 'array',
+      customModels: 'array',
+      apiKeyGroupBindings: 'object',
+      maxRequestBodyBytes: 'number',
+      payloadSizeLimitKB: 'number',
+      tokenBufferReserve: 'number',
+      rateLimitPerKeyPerMinute: 'number',
+      keepAliveTimeoutMs: 'number',
+      headersTimeoutMs: 'number',
+      recentRequestsLimit: 'number',
+      maxRetries: 'number',
+      requestTimeout: 'number',
+      maxConcurrent: 'number',
+      enableTokenBufferReserve: 'boolean',
+      autoSwitchOnQuotaExhausted: 'boolean',
+      sessionAffinityEnabled: 'boolean',
+      strictTierRouting: 'boolean',
+      tierRoutingEnabled: 'boolean',
+      disableTools: 'boolean',
+      enableMetrics: 'boolean',
+      enableAuditLog: 'boolean',
+      logStreamEvents: 'boolean',
+      enableLogging: 'boolean',
+      preferredEndpoint: 'string',
+      accountSelectionStrategy: 'string',
+      multiAccountSelectionMode: 'string'
+    }
+    const currentConfig = this.config as unknown as Record<string, unknown>
     const out: Partial<ProxyConfig> = {}
     for (const key of allowed) {
-      if (key in input) {
-        (out as Record<string, unknown>)[key] = input[key as string]
+      if (!(key in input)) continue
+      const incoming = input[key as string]
+      if (
+        !this.isAdminConfigValueAcceptable(
+          currentConfig[key as string],
+          incoming,
+          declaredKinds[key as string]
+        )
+      ) {
+        console.warn(
+          `[ProxyServer] /admin/config dropped field "${String(key)}": unexpected value type`
+        )
+        continue
       }
+      ;(out as Record<string, unknown>)[key] = incoming
     }
     return out
+  }
+
+  /**
+   * 校验 /admin/config 单个字段的值类型。
+   * 只按字段名放行会让 {"deniedIPs":"0.0.0.0/0"} 把数组字段写成字符串，
+   * 下一个请求就 .find is not a function，之后所有请求 500 直到重启。
+   * 优先使用显式声明的形状，否则从 this.config 里的当前值推断。
+   */
+  private isAdminConfigValueAcceptable(
+    current: unknown,
+    incoming: unknown,
+    declaredKind?: 'array' | 'object' | 'number' | 'boolean' | 'string'
+  ): boolean {
+    if (declaredKind === 'array' || Array.isArray(current)) return Array.isArray(incoming)
+    if (declaredKind === 'object')
+      return typeof incoming === 'object' && incoming !== null && !Array.isArray(incoming)
+    if (declaredKind === 'number')
+      return typeof incoming === 'number' && Number.isFinite(incoming) && incoming >= 0
+    if (declaredKind === 'boolean') return typeof incoming === 'boolean'
+    if (declaredKind === 'string') return typeof incoming === 'string'
+    if (typeof current === 'number')
+      return typeof incoming === 'number' && Number.isFinite(incoming) && incoming >= 0
+    if (typeof current === 'boolean') return typeof incoming === 'boolean'
+    if (typeof current === 'string') return typeof incoming === 'string'
+    if (typeof current === 'object' && current !== null) {
+      return typeof incoming === 'object' && incoming !== null && !Array.isArray(incoming)
+    }
+    // 当前值是 undefined/null 且没有显式声明：只接受基本类型或数组，拒绝任意对象注入
+    return (
+      Array.isArray(incoming) ||
+      typeof incoming === 'string' ||
+      typeof incoming === 'boolean' ||
+      (typeof incoming === 'number' && Number.isFinite(incoming))
+    )
   }
 
   // 管理 API - 日志
   private handleAdminLogs(res: http.ServerResponse): void {
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({
-      recentRequests: this.stats.recentRequests.slice(-100)
-    }))
+    res.end(
+      JSON.stringify({
+        recentRequests: this.stats.recentRequests.slice(-100)
+      })
+    )
   }
 
   // 设置 CORS 头
   private setCorsHeaders(res: http.ServerResponse): void {
     res.setHeader('Access-Control-Allow-Origin', '*')
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch')
-    res.setHeader('Access-Control-Expose-Headers', 'x-request-id, x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens, x-ratelimit-reset-requests, x-ratelimit-reset-tokens')
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch'
+    )
+    res.setHeader(
+      'Access-Control-Expose-Headers',
+      'x-request-id, x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens, x-ratelimit-reset-requests, x-ratelimit-reset-tokens'
+    )
   }
 
   private isAnthropicPath(path: string): boolean {
     const pathWithoutQuery = path.split('?')[0]
-    return pathWithoutQuery === '/v1/messages'
-      || pathWithoutQuery === '/messages'
-      || pathWithoutQuery === '/anthropic/v1/messages'
-      || pathWithoutQuery === '/v1/messages/count_tokens'
-      || pathWithoutQuery === '/messages/count_tokens'
+    return (
+      pathWithoutQuery === '/v1/messages' ||
+      pathWithoutQuery === '/messages' ||
+      pathWithoutQuery === '/anthropic/v1/messages' ||
+      pathWithoutQuery === '/v1/messages/count_tokens' ||
+      pathWithoutQuery === '/messages/count_tokens'
+    )
   }
 
   private getAnthropicErrorType(status: number): string {
@@ -3476,9 +4759,19 @@ export class ProxyServer {
   }
 
   private buildClaudeUsage(
-    usage: { inputTokens: number; outputTokens: number; cacheWriteTokens?: number; cacheReadTokens?: number },
+    usage: {
+      inputTokens: number
+      outputTokens: number
+      cacheWriteTokens?: number
+      cacheReadTokens?: number
+    },
     simulatedCache?: { cacheCreationInputTokens: number; cacheReadInputTokens: number }
-  ): { input_tokens?: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } {
+  ): {
+    input_tokens?: number
+    output_tokens: number
+    cache_creation_input_tokens?: number
+    cache_read_input_tokens?: number
+  } {
     // 优先使用 Kiro 后端返回的真实 cache tokens，否则用模拟器的值
     const cacheWrite = usage.cacheWriteTokens || simulatedCache?.cacheCreationInputTokens || 0
     const cacheRead = usage.cacheReadTokens || simulatedCache?.cacheReadInputTokens || 0
@@ -3502,39 +4795,69 @@ export class ProxyServer {
     }
     if (typeof value !== 'object') return 0
     const record = value as Record<string, unknown>
-    if (record.type === 'text' || record.type === 'input_text' || record.type === 'output_text') return this.estimateTokenCount(record.text) + 4
-    if (record.type === 'thinking') return this.estimateTokenCount(record.thinking) + this.estimateTokenCount(record.signature) + 4
+    if (record.type === 'text' || record.type === 'input_text' || record.type === 'output_text')
+      return this.estimateTokenCount(record.text) + 4
+    if (record.type === 'thinking')
+      return (
+        this.estimateTokenCount(record.thinking) + this.estimateTokenCount(record.signature) + 4
+      )
     if (record.type === 'redacted_thinking') return 8
     if (record.type === 'image' || record.type === 'input_image') return 170
-    if (record.type === 'document' || record.type === 'input_file') return this.estimateTokenCount(record.title) + this.estimateTokenCount(record.name) + this.estimateTokenCount(record.filename) + this.estimateTokenCount(record.source) + this.estimateTokenCount(record.file_data) + 120
-    if (record.type === 'tool_use') return this.estimateTokenCount(record.name) + this.estimateTokenCount(record.input) + 12
+    if (record.type === 'document' || record.type === 'input_file')
+      return (
+        this.estimateTokenCount(record.title) +
+        this.estimateTokenCount(record.name) +
+        this.estimateTokenCount(record.filename) +
+        this.estimateTokenCount(record.source) +
+        this.estimateTokenCount(record.file_data) +
+        120
+      )
+    if (record.type === 'tool_use')
+      return this.estimateTokenCount(record.name) + this.estimateTokenCount(record.input) + 12
     if (record.type === 'tool_result') return this.estimateTokenCount(record.content) + 8
-    if (typeof record.role === 'string' && 'content' in record) return this.estimateTokenCount(record.content) + 4
-    if (typeof record.name === 'string' && 'input_schema' in record) return this.estimateTokenCount(record.name) + this.estimateTokenCount(record.description) + this.estimateTokenCount(record.input_schema) + 32
-    return Object.entries(record).reduce<number>((total, [key, item]) => key === 'cache_control' ? total : total + this.estimateTokenCount(item), 0)
+    if (typeof record.role === 'string' && 'content' in record)
+      return this.estimateTokenCount(record.content) + 4
+    if (typeof record.name === 'string' && 'input_schema' in record)
+      return (
+        this.estimateTokenCount(record.name) +
+        this.estimateTokenCount(record.description) +
+        this.estimateTokenCount(record.input_schema) +
+        32
+      )
+    return Object.entries(record).reduce<number>(
+      (total, [key, item]) =>
+        key === 'cache_control' ? total : total + this.estimateTokenCount(item),
+      0
+    )
   }
 
   // 健康检查
   private handleHealth(res: http.ServerResponse): void {
     const stats = this.getStats()
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({
-      status: 'ok',
-      version: '1.0.0',
-      accounts: this.accountPool.size,
-      availableAccounts: this.accountPool.availableCount,
-      stats: {
-        totalRequests: stats.totalRequests,
-        successRequests: stats.successRequests,
-        failedRequests: stats.failedRequests,
-        totalTokens: stats.totalTokens,
-        uptime: Date.now() - stats.startTime
-      }
-    }))
+    res.end(
+      JSON.stringify({
+        status: 'ok',
+        version: '1.0.0',
+        accounts: this.accountPool.size,
+        availableAccounts: this.accountPool.availableCount,
+        stats: {
+          totalRequests: stats.totalRequests,
+          successRequests: stats.successRequests,
+          failedRequests: stats.failedRequests,
+          totalTokens: stats.totalTokens,
+          uptime: Date.now() - stats.startTime
+        }
+      })
+    )
   }
 
   // Claude Code token 计数（模拟响应）
-  private async handleCountTokens(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+  private async handleCountTokens(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    signal?: AbortSignal
+  ): Promise<void> {
     try {
       this.throwIfAborted(signal)
       const body = await this.readBody(req, signal)
@@ -3543,20 +4866,30 @@ export class ProxyServer {
       if (!Array.isArray(request.messages)) {
         throw new Error('count_tokens requires messages')
       }
-      const estimatedTokens = Math.max(1, this.estimateTokenCount(request.system) + this.estimateTokenCount(request.messages) + this.estimateTokenCount(request.tools))
-      
+      const estimatedTokens = Math.max(
+        1,
+        this.estimateTokenCount(request.system) +
+          this.estimateTokenCount(request.messages) +
+          this.estimateTokenCount(request.tools)
+      )
+
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ input_tokens: estimatedTokens }))
     } catch (error) {
       if (this.isAbortError(error, signal)) return
-      this.sendError(res, 400, error instanceof Error ? error.message : 'Invalid request body', 'anthropic')
+      this.sendError(
+        res,
+        400,
+        error instanceof Error ? error.message : 'Invalid request body',
+        'anthropic'
+      )
     }
   }
 
   // Gemini v1beta 模型列表
   private async handleGeminiModels(res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
     const result = await this.getAvailableModels(signal)
-    const geminiModels = result.models.map(m => ({
+    const geminiModels = result.models.map((m) => ({
       name: `models/${m.id}`,
       version: '001',
       displayName: m.name || m.id,
@@ -3571,11 +4904,30 @@ export class ProxyServer {
   }
 
   // Gemini v1beta generateContent / streamGenerateContent
-  private async handleGeminiRequest(req: http.IncomingMessage, res: http.ServerResponse, path: string, signal?: AbortSignal): Promise<void> {
+  private async handleGeminiRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    path: string,
+    signal?: AbortSignal
+  ): Promise<void> {
     const body = await this.readBody(req, signal)
     this.throwIfAborted(signal)
-    const geminiReq = JSON.parse(body)
-    const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
+    // 请求体被截断或不是合法 JSON 属于客户端错误：必须回 400，
+    // 否则异常会冒泡到 handleRequest 变成 500 并误触发 events.onError
+    type GeminiPart = { text?: string }
+    let geminiReq: {
+      systemInstruction?: { parts?: GeminiPart[] }
+      contents?: Array<{ role?: string; parts?: GeminiPart[] }>
+      generationConfig?: { temperature?: number; topP?: number; maxOutputTokens?: number }
+    }
+    try {
+      geminiReq = JSON.parse(body)
+    } catch {
+      this.sendError(res, 400, 'Invalid JSON body')
+      return
+    }
+    const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey })
+      .matchedApiKey
 
     // 解析路径: /v1beta/models/{model}:{method}
     const match = path.match(/\/v1beta\/models\/([^:]+):(\w+)/)
@@ -3589,7 +4941,9 @@ export class ProxyServer {
     // 将 Gemini 请求转为 OpenAI 格式
     const messages: OpenAIMessage[] = []
     if (geminiReq.systemInstruction?.parts) {
-      const sysText = geminiReq.systemInstruction.parts.map((p: { text?: string }) => p.text || '').join('\n')
+      const sysText = geminiReq.systemInstruction.parts
+        .map((p: { text?: string }) => p.text || '')
+        .join('\n')
       if (sysText) messages.push({ role: 'system', content: sysText })
     }
     for (const content of geminiReq.contents || []) {
@@ -3628,16 +4982,25 @@ export class ProxyServer {
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
-      const kiroPayload = openaiToKiro(openaiRequest, account.profileArn, toolNameRegistry, this.cacheOptions())
+      const kiroPayload = openaiToKiro(
+        openaiRequest,
+        account.profileArn,
+        toolNameRegistry,
+        this.cacheOptions()
+      )
 
       if (isStream) {
         let streamStarted = false
         const ensureStreamStarted = (): void => {
           if (streamStarted) return
-          res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive'
+          })
           streamStarted = true
         }
-        return new Promise<void>((resolve) => {
+        return await new Promise<void>((resolve) => {
           this.callStreamWithFailover(
             account,
             kiroPayload,
@@ -3645,19 +5008,19 @@ export class ProxyServer {
               if (signal?.aborted || this.isResponseClosed(res)) return
               if (text) {
                 ensureStreamStarted()
-                const chunk = { candidates: [{ content: { parts: [{ text }], role: 'model' }, finishReason: null }] }
+                const chunk = {
+                  candidates: [
+                    { content: { parts: [{ text }], role: 'model' }, finishReason: null }
+                  ]
+                }
                 res.write(`data: ${JSON.stringify(chunk)}\n\n`)
               }
             },
             (usedAccount, usage) => {
-              if (signal?.aborted || this.isResponseClosed(res)) {
-                resolve()
-                return
-              }
-              ensureStreamStarted()
-              const finalChunk = { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: usage.inputTokens, candidatesTokenCount: usage.outputTokens, totalTokenCount: usage.inputTokens + usage.outputTokens } }
-              res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
-              res.end()
+              // 上游已经完成并且已经计费：无论客户端是否还在都必须记账，否则额度已耗尽的账号
+              // 在池子里看起来仍然有余量。handleOpenAIStream / handleClaudeStream 早已按这个
+              // 顺序修复过，Gemini 这条路径此前漏了 —— 客户端在 agent 循环里主动 abort 时
+              // 整个用量都不会被记录。
               this.recordSuccessfulUsage({
                 path: '/v1beta',
                 model: modelId,
@@ -3666,6 +5029,24 @@ export class ProxyServer {
                 startTime,
                 apiKeyId: matchedApiKey?.id
               })
+              // 客户端已断开时，只跳过面向客户端的写操作
+              if (signal?.aborted || this.isResponseClosed(res)) {
+                resolve()
+                return
+              }
+              ensureStreamStarted()
+              const finalChunk = {
+                candidates: [
+                  { content: { parts: [{ text: '' }], role: 'model' }, finishReason: 'STOP' }
+                ],
+                usageMetadata: {
+                  promptTokenCount: usage.inputTokens,
+                  candidatesTokenCount: usage.outputTokens,
+                  totalTokenCount: usage.inputTokens + usage.outputTokens
+                }
+              }
+              res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
+              res.end()
               resolve()
             },
             (_usedAccount, error) => {
@@ -3683,7 +5064,7 @@ export class ProxyServer {
             signal,
             matchedApiKey?.id,
             modelId
-          ).catch(error => {
+          ).catch((error) => {
             if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
               res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
               res.end()
@@ -3695,7 +5076,12 @@ export class ProxyServer {
       } else {
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
-          async (acc) => callKiroApi(acc, openaiToKiro(openaiRequest, acc.profileArn, toolNameRegistry, this.cacheOptions()), signal),
+          async (acc) =>
+            await callKiroApi(
+              acc,
+              openaiToKiro(openaiRequest, acc.profileArn, toolNameRegistry, this.cacheOptions()),
+              signal
+            ),
           '/v1beta',
           signal,
           matchedApiKey?.id,
@@ -3711,10 +5097,21 @@ export class ProxyServer {
           apiKeyId: matchedApiKey?.id
         })
         res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({
-          candidates: [{ content: { parts: [{ text: result.content }], role: 'model' }, finishReason: 'STOP' }],
-          usageMetadata: { promptTokenCount: result.usage.inputTokens, candidatesTokenCount: result.usage.outputTokens, totalTokenCount: result.usage.inputTokens + result.usage.outputTokens }
-        }))
+        res.end(
+          JSON.stringify({
+            candidates: [
+              {
+                content: { parts: [{ text: result.content }], role: 'model' },
+                finishReason: 'STOP'
+              }
+            ],
+            usageMetadata: {
+              promptTokenCount: result.usage.inputTokens,
+              candidatesTokenCount: result.usage.outputTokens,
+              totalTokenCount: result.usage.inputTokens + result.usage.outputTokens
+            }
+          })
+        )
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1beta', modelId, startTime, signal)
@@ -3742,35 +5139,106 @@ export class ProxyServer {
   // 模型列表
   private async handleModels(res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
     const now = Date.now()
-    
+
     // Kiro 官方模型（与 UI 保持一致）
     const kiroOfficialModels = [
-      ...KIRO_PROXY_MODEL_PRESETS.map(model => buildKiroPresetClientModel(model, now)),
-      buildClientModel({ id: 'auto', created: now, ownedBy: 'kiro-api', description: 'Auto select best model' })
+      ...KIRO_PROXY_MODEL_PRESETS.map((model) => buildKiroPresetClientModel(model, now)),
+      buildClientModel({
+        id: 'auto',
+        created: now,
+        ownedBy: 'kiro-api',
+        description: 'Auto select best model'
+      })
     ]
 
     // 隐藏模型（未在官方 ListAvailableModels 中返回，但后端可能支持）
     const hiddenModels = [
-      buildClientModel({ id: 'claude-3.7-sonnet', created: now, ownedBy: 'kiro-api', description: 'Claude 3.7 Sonnet (hidden)', modelName: 'Claude 3.7 Sonnet', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 }),
-      buildClientModel({ id: 'simple-task', created: now, ownedBy: 'kiro-api', description: 'Kiro fast model for intent classification and lightweight tasks (routes to Haiku)', modelName: 'Simple Task', supportedInputTypes: ['TEXT'], maxInputTokens: 200000, maxOutputTokens: 4096 }),
-      buildClientModel({ id: 'CLAUDE_SONNET_4_20250514_V1_0', created: now, ownedBy: 'kiro-api', description: 'Claude Sonnet 4 (CodeWhisperer internal ID)', modelName: 'Claude Sonnet 4 (CW)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 }),
-      buildClientModel({ id: 'CLAUDE_HAIKU_4_5_20251001_V1_0', created: now, ownedBy: 'kiro-api', description: 'Claude Haiku 4.5 (CodeWhisperer internal ID)', modelName: 'Claude Haiku 4.5 (CW)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 }),
-      buildClientModel({ id: 'CLAUDE_3_7_SONNET_20250219_V1_0', created: now, ownedBy: 'kiro-api', description: 'Claude 3.7 Sonnet (CodeWhisperer internal ID)', modelName: 'Claude 3.7 Sonnet (CW)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 })
+      buildClientModel({
+        id: 'claude-3.7-sonnet',
+        created: now,
+        ownedBy: 'kiro-api',
+        description: 'Claude 3.7 Sonnet (hidden)',
+        modelName: 'Claude 3.7 Sonnet',
+        supportedInputTypes: ['TEXT', 'IMAGE'],
+        maxInputTokens: 200000,
+        maxOutputTokens: 64000
+      }),
+      buildClientModel({
+        id: 'simple-task',
+        created: now,
+        ownedBy: 'kiro-api',
+        description:
+          'Kiro fast model for intent classification and lightweight tasks (routes to Haiku)',
+        modelName: 'Simple Task',
+        supportedInputTypes: ['TEXT'],
+        maxInputTokens: 200000,
+        maxOutputTokens: 4096
+      }),
+      buildClientModel({
+        id: 'CLAUDE_SONNET_4_20250514_V1_0',
+        created: now,
+        ownedBy: 'kiro-api',
+        description: 'Claude Sonnet 4 (CodeWhisperer internal ID)',
+        modelName: 'Claude Sonnet 4 (CW)',
+        supportedInputTypes: ['TEXT', 'IMAGE'],
+        maxInputTokens: 200000,
+        maxOutputTokens: 64000
+      }),
+      buildClientModel({
+        id: 'CLAUDE_HAIKU_4_5_20251001_V1_0',
+        created: now,
+        ownedBy: 'kiro-api',
+        description: 'Claude Haiku 4.5 (CodeWhisperer internal ID)',
+        modelName: 'Claude Haiku 4.5 (CW)',
+        supportedInputTypes: ['TEXT', 'IMAGE'],
+        maxInputTokens: 200000,
+        maxOutputTokens: 64000
+      }),
+      buildClientModel({
+        id: 'CLAUDE_3_7_SONNET_20250219_V1_0',
+        created: now,
+        ownedBy: 'kiro-api',
+        description: 'Claude 3.7 Sonnet (CodeWhisperer internal ID)',
+        modelName: 'Claude 3.7 Sonnet (CW)',
+        supportedInputTypes: ['TEXT', 'IMAGE'],
+        maxInputTokens: 200000,
+        maxOutputTokens: 64000
+      })
     ]
 
     // 预设模型（GPT 兼容别名）
     const presetModels = [
-      buildClientModel({ id: 'gpt-4o', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' }),
-      buildClientModel({ id: 'gpt-4', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' }),
-      buildClientModel({ id: 'gpt-4-turbo', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' }),
-      buildClientModel({ id: 'gpt-3.5-turbo', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' })
+      buildClientModel({
+        id: 'gpt-4o',
+        created: now,
+        ownedBy: 'kiro-proxy',
+        description: 'GPT-compatible alias for Kiro'
+      }),
+      buildClientModel({
+        id: 'gpt-4',
+        created: now,
+        ownedBy: 'kiro-proxy',
+        description: 'GPT-compatible alias for Kiro'
+      }),
+      buildClientModel({
+        id: 'gpt-4-turbo',
+        created: now,
+        ownedBy: 'kiro-proxy',
+        description: 'GPT-compatible alias for Kiro'
+      }),
+      buildClientModel({
+        id: 'gpt-3.5-turbo',
+        created: now,
+        ownedBy: 'kiro-proxy',
+        description: 'GPT-compatible alias for Kiro'
+      })
     ]
 
     // 尝试从 Kiro API 获取动态模型
     let kiroModels: KiroModel[] = []
-    
+
     // 检查缓存
-    if (this.modelCache && (now - this.modelCache.timestamp) < this.MODEL_CACHE_TTL) {
+    if (this.modelCache && now - this.modelCache.timestamp < this.MODEL_CACHE_TTL) {
       kiroModels = this.modelCache.models
     } else {
       // 获取一个可用账号来请求模型列表
@@ -3796,26 +5264,28 @@ export class ProxyServer {
     }
 
     // 转换 Kiro 模型为 OpenAI 格式（保持原始 modelId）
-    const dynamicModels = kiroModels.map(m => buildClientModel({
-      id: m.modelId,
-      created: now,
-      ownedBy: 'kiro-api',
-      description: m.description,
-      modelName: m.modelName,
-      supportedInputTypes: m.supportedInputTypes,
-      maxInputTokens: m.tokenLimits?.maxInputTokens,
-      maxOutputTokens: m.tokenLimits?.maxOutputTokens,
-      rateMultiplier: m.rateMultiplier,
-      rateUnit: m.rateUnit,
-      promptCaching: m.promptCaching,
-      additionalModelRequestFieldsSchema: m.additionalModelRequestFieldsSchema,
-      modelProvider: m.modelProvider
-    }))
+    const dynamicModels = kiroModels.map((m) =>
+      buildClientModel({
+        id: m.modelId,
+        created: now,
+        ownedBy: 'kiro-api',
+        description: m.description,
+        modelName: m.modelName,
+        supportedInputTypes: m.supportedInputTypes,
+        maxInputTokens: m.tokenLimits?.maxInputTokens,
+        maxOutputTokens: m.tokenLimits?.maxOutputTokens,
+        rateMultiplier: m.rateMultiplier,
+        rateUnit: m.rateUnit,
+        promptCaching: m.promptCaching,
+        additionalModelRequestFieldsSchema: m.additionalModelRequestFieldsSchema,
+        modelProvider: m.modelProvider
+      })
+    )
 
     // 合并模型列表，去重
     const modelIds = new Set<string>()
     const allModels: ClientModel[] = []
-    
+
     // 1. 优先添加动态模型（从 API 获取的，包含真实 token limit / input types）
     for (const m of dynamicModels) {
       if (!modelIds.has(m.id)) {
@@ -3823,7 +5293,7 @@ export class ProxyServer {
         allModels.push(m)
       }
     }
-    
+
     // 2. 添加隐藏模型（未在官方 ListAvailableModels 中返回，但后端可能支持）
     for (const m of hiddenModels) {
       if (!modelIds.has(m.id)) {
@@ -3831,7 +5301,7 @@ export class ProxyServer {
         allModels.push(m)
       }
     }
-    
+
     // 3. 动态模型缺失时才添加静态兜底
     for (const m of [...kiroOfficialModels, ...presetModels]) {
       if (!modelIds.has(m.id)) {
@@ -3847,7 +5317,14 @@ export class ProxyServer {
         for (const bm of bedrockModels) {
           if (!modelIds.has(bm.id)) {
             modelIds.add(bm.id)
-            allModels.push(buildClientModel({ id: bm.id, created: bm.created, ownedBy: bm.owned_by, description: 'AWS Bedrock model' }))
+            allModels.push(
+              buildClientModel({
+                id: bm.id,
+                created: bm.created,
+                ownedBy: bm.owned_by,
+                description: 'AWS Bedrock model'
+              })
+            )
           }
         }
         proxyLogger.info('ProxyServer', `Bedrock: Loaded ${bedrockModels.length} models`)
@@ -3859,17 +5336,70 @@ export class ProxyServer {
       }
     }
 
+    // Experimental ChatGPT/Codex provider. Catalog entries start unverified and
+    // are updated only by real requests or an explicit refresh.
+    if (this.chatgptCodexConfig.enabled) {
+      for (const model of listChatGPTCodexModels(this.chatgptCodexConfig)) {
+        const id = `chatgpt/${model.id}`
+        if (!modelIds.has(id)) {
+          modelIds.add(id)
+          allModels.push(
+            buildClientModel({
+              id,
+              created: now,
+              ownedBy: 'chatgpt-codex-experimental',
+              description: `${model.name} via ChatGPT/Codex (Experimental)`,
+              modelName: model.name,
+              supportedInputTypes: model.capabilities.includes('image')
+                ? ['TEXT', 'IMAGE']
+                : ['TEXT'],
+              maxInputTokens: 200000,
+              maxOutputTokens: 64000,
+              modelProvider: 'chatgpt'
+            })
+          )
+        }
+      }
+    }
+
+    // Custom OpenAI/Anthropic-compatible providers.
+    for (const customModel of await this.getCustomApiModels(signal)) {
+      if (!modelIds.has(customModel.id)) {
+        modelIds.add(customModel.id)
+        allModels.push(
+          buildClientModel({
+            id: customModel.id,
+            created: Math.floor(Date.now() / 1000),
+            ownedBy: customModel.modelProvider || 'custom-api',
+            description: customModel.description
+          })
+        )
+      }
+    }
+
     this.throwIfResponseClosed(res, signal)
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ object: 'list', data: allModels, models: allModels }))
   }
 
   // 处理 OpenAI Chat Completions 请求
-  private async handleOpenAIChat(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+  private async handleOpenAIChat(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    signal?: AbortSignal
+  ): Promise<void> {
     const body = await this.readBody(req, signal)
     this.throwIfAborted(signal)
-    const request: OpenAIChatRequest = JSON.parse(body)
-    const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
+    // 非法 JSON 属于客户端错误：回 400，避免冒泡成 500 并误触发 events.onError
+    let request: OpenAIChatRequest
+    try {
+      request = JSON.parse(body)
+    } catch {
+      this.sendError(res, 400, 'Invalid JSON body')
+      return
+    }
+    const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey })
+      .matchedApiKey
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
     const rawHintChat = ProxyServer.extractSessionHint(req, request)
@@ -3887,9 +5417,26 @@ export class ProxyServer {
     this.recordNewRequest()
     this.events.onRequest?.({ path: '/v1/chat/completions', method: 'POST' })
 
-    // Xpixi upstream: route matching models to Xpixi API
-    if (isXpixiModel(request.model, this.config.xpixi)) {
-      await this.handleXpixiOpenAIChat(res, request, startTime, matchedApiKey, signal)
+    if (isChatGPTCodexModel(request.model, this.chatgptCodexConfig)) {
+      await this.handleChatGPTCodexChat(res, request, startTime, matchedApiKey, signal)
+      return
+    }
+
+    const customRoute = findCustomProvider(
+      request.model,
+      this.config.customApiProviders,
+      this.config.xpixi
+    )
+    if (customRoute) {
+      await this.handleCustomOpenAIChat(
+        res,
+        request,
+        customRoute.provider,
+        customRoute.upstreamModelId,
+        startTime,
+        matchedApiKey,
+        signal
+      )
       return
     }
 
@@ -3902,7 +5449,10 @@ export class ProxyServer {
     {
       const bedrockOnly = await this.resolveBedrockOnlyRoute(request.model, signal)
       if (bedrockOnly) {
-        proxyLogger.info('ProxyServer', `No Kiro account supports ${request.model}; routing to Bedrock ${bedrockOnly}`)
+        proxyLogger.info(
+          'ProxyServer',
+          `No Kiro account supports ${request.model}; routing to Bedrock ${bedrockOnly}`
+        )
         request.model = bedrockOnly
         await this.handleBedrockOpenAIChat(res, request, startTime, matchedApiKey, signal)
         return
@@ -3911,27 +5461,63 @@ export class ProxyServer {
 
     let processedRequest: OpenAIChatRequest
     try {
-      processedRequest = await this.resolveOpenAIHttpImages(this.prepareOpenAIRequest(request), signal)
+      processedRequest = await this.resolveOpenAIHttpImages(
+        this.prepareOpenAIRequest(request),
+        signal
+      )
     } catch (error) {
       if (this.isAbortError(error, signal)) return
       this.recordRequestFailed()
       const message = error instanceof Error ? error.message : 'Invalid request'
       this.sendError(res, 400, message)
-      this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 400, error: message })
-      this.recordRequest({ path: '/v1/chat/completions', model: request.model, responseTime: Date.now() - startTime, success: false, error: message })
+      this.events.onResponse?.({
+        path: '/v1/chat/completions',
+        model: request.model,
+        status: 400,
+        error: message
+      })
+      this.recordRequest({
+        path: '/v1/chat/completions',
+        model: request.model,
+        responseTime: Date.now() - startTime,
+        success: false,
+        error: message
+      })
       return
     }
 
     // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHintChat, matchedApiKey?.id, request.model)
+    const account = await this.getAvailableAccount(
+      signal,
+      affinityHintChat,
+      matchedApiKey?.id,
+      request.model
+    )
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
       const diag = await this.classifyNoAccountReason(request.model, matchedApiKey?.id, signal)
-      this.sendNoEligibleAccountError(res, 503, diag, request.model, 'openai', '/v1/chat/completions')
-      this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 503, error: diag.reason })
-      this.recordRequest({ path: '/v1/chat/completions', model: request.model, success: false, error: diag.reason })
+      this.sendNoEligibleAccountError(
+        res,
+        503,
+        diag,
+        request.model,
+        'openai',
+        '/v1/chat/completions'
+      )
+      this.events.onResponse?.({
+        path: '/v1/chat/completions',
+        model: request.model,
+        status: 503,
+        error: diag.reason
+      })
+      this.recordRequest({
+        path: '/v1/chat/completions',
+        model: request.model,
+        success: false,
+        error: diag.reason
+      })
       return
     }
 
@@ -3941,7 +5527,12 @@ export class ProxyServer {
       const toolNameRegistry = new ToolNameRegistry()
 
       // 转换为 Kiro 格式
-      const kiroPayload = openaiToKiro(processedRequest, account.profileArn, toolNameRegistry, this.cacheOptions())
+      const kiroPayload = openaiToKiro(
+        processedRequest,
+        account.profileArn,
+        toolNameRegistry,
+        this.cacheOptions()
+      )
 
       // 记录请求详情到日志
       if (this.config.logRequests) {
@@ -3950,7 +5541,7 @@ export class ProxyServer {
         const toolsCount = userInput?.userInputMessageContext?.tools?.length || 0
         const historyLength = kiroPayload.conversationState.history?.length || 0
         const hasImages = (userInput?.images?.length || 0) > 0
-        
+
         proxyLogger.info('ProxyServer', `OpenAI API: ${request.model}`, {
           model: request.model,
           stream: request.stream,
@@ -3964,21 +5555,45 @@ export class ProxyServer {
 
       if (request.stream) {
         // 流式响应（流式不使用重试机制，错误由流处理）
-        await this.handleOpenAIStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, matchedApiKey, toolNameRegistry, signal)
+        await this.handleOpenAIStream(
+          res,
+          account,
+          kiroPayload,
+          request.model,
+          startTime,
+          0,
+          undefined,
+          false,
+          matchedApiKey,
+          toolNameRegistry,
+          signal
+        )
       } else {
         // 非流式响应（带重试机制）
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
-            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.cacheOptions())
-            return callKiroApi(acc, retryPayload, signal)
+            const retryPayload = openaiToKiro(
+              processedRequest,
+              acc.profileArn,
+              toolNameRegistry,
+              this.cacheOptions()
+            )
+            return await callKiroApi(acc, retryPayload, signal)
           },
           '/v1/chat/completions',
           signal,
           matchedApiKey?.id,
           request.model
         )
-        const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
+        const response = kiroToOpenaiResponse(
+          result.content,
+          result.toolUses,
+          result.usage,
+          request.model,
+          toolNameRegistry,
+          result.reasoningContent
+        )
 
         this.throwIfResponseClosed(res, signal)
         res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -3993,14 +5608,448 @@ export class ProxyServer {
         })
       }
     } catch (error) {
-      this.handleApiError(res, account, error as Error, '/v1/chat/completions', request.model, startTime, signal)
+      this.handleApiError(
+        res,
+        account,
+        error as Error,
+        '/v1/chat/completions',
+        request.model,
+        startTime,
+        signal
+      )
     }
   }
 
-  private async handleOpenAIResponses(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+  private chatGPTQuotaAvailable(account: ChatGPTAccountState): boolean {
+    const now = Date.now()
+    return !(account.quotaWindows || []).some(
+      (window) => window.remainingPercent === 0 && (!window.resetAt || window.resetAt > now)
+    )
+  }
+
+  private async ensureChatGPTToken(
+    account: ChatGPTAccountState,
+    force = false
+  ): Promise<ChatGPTAccountState> {
+    if (!force && isTokenValid(account)) return account
+    const existing = this.chatgptRefreshLocks.get(account.id)
+    if (existing) return await existing
+
+    const refresh = (async (): Promise<ChatGPTAccountState> => {
+      try {
+        const tokens = await refreshAccessToken(account.refreshToken, DEFAULT_CHATGPT_OAUTH_CONFIG)
+        account.accessToken = tokens.accessToken
+        account.refreshToken = tokens.refreshToken
+        account.expiresAt = tokens.expiresAt
+        account.lastRefreshAt = Date.now()
+        account.updatedAt = Date.now()
+        account.lastError = undefined
+        this.persistChatGPTAccounts()
+        return account
+      } catch (error) {
+        account.lastError = this.sanitizeOAuthError(error)
+        account.updatedAt = Date.now()
+        this.persistChatGPTAccounts()
+        throw error
+      } finally {
+        this.chatgptRefreshLocks.delete(account.id)
+      }
+    })()
+    this.chatgptRefreshLocks.set(account.id, refresh)
+    return await refresh
+  }
+
+  private getChatGPTCodexAccounts(): ChatGPTAccountState[] {
+    return this.getChatGPTAccounts()
+      .filter(
+        (account) =>
+          account.accessToken &&
+          account.refreshToken &&
+          account.consecutiveFailures < 5 &&
+          this.chatGPTQuotaAvailable(account)
+      )
+      .sort(
+        (a, b) =>
+          a.consecutiveFailures - b.consecutiveFailures ||
+          (a.localUsage?.requests || 0) - (b.localUsage?.requests || 0) ||
+          a.updatedAt - b.updatedAt
+      )
+  }
+
+  private markChatGPTModelAvailability(
+    account: ChatGPTAccountState,
+    model: string,
+    availability: 'available' | 'unavailable',
+    error?: string
+  ): void {
+    account.modelAvailability = {
+      ...(account.modelAvailability || {}),
+      [stripChatGPTPrefix(model)]: availability
+    }
+    account.lastError = error
+    account.updatedAt = Date.now()
+  }
+
+  private async requestChatGPTWithFallback(
+    payload: object,
+    model: string,
+    signal?: AbortSignal
+  ): Promise<{ account: ChatGPTAccountState; response: Response }> {
+    const accounts = this.getChatGPTCodexAccounts()
+    if (!accounts.length) {
+      throw new Error(
+        'No ChatGPT/Codex account is registration-ready. Connect or refresh an account in Routing Control Room.'
+      )
+    }
+
+    let lastError: Error | undefined
+    for (const candidate of accounts) {
+      try {
+        const account = await this.ensureChatGPTToken(candidate)
+        let response = await requestChatGPTCodex(account, payload, this.chatgptCodexConfig, signal)
+        if (response.status === 401) {
+          await response.text()
+          await this.ensureChatGPTToken(account, true)
+          response = await requestChatGPTCodex(account, payload, this.chatgptCodexConfig, signal)
+        }
+        if (response.ok) {
+          account.consecutiveFailures = 0
+          this.markChatGPTModelAvailability(account, model, 'available')
+          this.persistChatGPTAccounts()
+          return { account, response }
+        }
+
+        const upstreamError = extractChatGPTCodexError(response.status, await response.text())
+        lastError = upstreamError
+        account.consecutiveFailures += 1
+        this.markChatGPTModelAvailability(
+          account,
+          model,
+          response.status === 400 || response.status === 404 ? 'unavailable' : 'available',
+          upstreamError.message
+        )
+        this.persistChatGPTAccounts()
+        if (!upstreamError.retryable) break
+      } catch (error) {
+        if (this.isAbortError(error, signal)) throw error
+        lastError = error instanceof Error ? error : new Error(String(error))
+        candidate.consecutiveFailures += 1
+        candidate.lastError = this.sanitizeOAuthError(lastError)
+        candidate.updatedAt = Date.now()
+        this.persistChatGPTAccounts()
+      }
+    }
+    throw lastError || new Error('All ChatGPT/Codex accounts failed')
+  }
+
+  private recordChatGPTCodexUsage(
+    path: string,
+    model: string,
+    account: ChatGPTAccountState,
+    usage: { input_tokens?: number; output_tokens?: number; total_tokens?: number } | undefined,
+    startTime: number,
+    apiKeyId?: string
+  ): void {
+    const inputTokens = usage?.input_tokens || 0
+    const outputTokens = usage?.output_tokens || 0
+    account.localUsage = {
+      requests: (account.localUsage?.requests || 0) + 1,
+      inputTokens: (account.localUsage?.inputTokens || 0) + inputTokens,
+      outputTokens: (account.localUsage?.outputTokens || 0) + outputTokens,
+      lastRequestAt: Date.now()
+    }
+    account.updatedAt = Date.now()
+    this.persistChatGPTAccounts()
+
+    this.recordRequestSuccess()
+    this.stats.totalTokens += usage?.total_tokens || inputTokens + outputTokens
+    this.stats.inputTokens += inputTokens
+    this.stats.outputTokens += outputTokens
+    this.notifyUsageStatsUpdate()
+    const responseTime = Date.now() - startTime
+    endpointMetrics.record({ path, status: 200, responseTime, inputTokens, outputTokens })
+    this.events.onResponse?.({
+      path,
+      model,
+      status: 200,
+      tokens: inputTokens + outputTokens,
+      inputTokens,
+      outputTokens,
+      responseTime,
+      accountId: account.id,
+      accountEmail: account.email
+    })
+    this.recordRequest({
+      path,
+      model,
+      accountId: account.id,
+      inputTokens,
+      outputTokens,
+      responseTime,
+      success: true
+    })
+    if (apiKeyId) this.recordApiKeyUsage(apiKeyId, 0, inputTokens, outputTokens, model, path)
+  }
+
+  private async handleChatGPTCodexChat(
+    res: http.ServerResponse,
+    request: OpenAIChatRequest,
+    startTime: number,
+    matchedApiKey?: import('./types').ApiKey,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const model = request.model
+    try {
+      const payload = buildCodexPayloadFromChat(request, this.chatgptCodexConfig.reasoningEffort)
+      const { account, response } = await this.requestChatGPTWithFallback(payload, model, signal)
+      if (!response.body) throw new Error('ChatGPT/Codex returned an empty stream')
+
+      const id = `chatcmpl-${uuidv4()}`
+      let content = ''
+      let reasoning = ''
+      let usage:
+        | { input_tokens?: number; output_tokens?: number; total_tokens?: number }
+        | undefined
+      const toolCalls = new Map<
+        string,
+        { id: string; name: string; arguments: string; index: number }
+      >()
+
+      if (request.stream) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive'
+        })
+        res.write(
+          `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })}\n\n`
+        )
+      }
+
+      for await (const event of iterateCodexSse(
+        response.body as unknown as AsyncIterable<Uint8Array>
+      )) {
+        const value = event.value
+        if (!value) continue
+        const type = String(value.type || event.event || '')
+        if (type === 'response.output_text.delta' && typeof value.delta === 'string') {
+          content += value.delta
+          if (request.stream) {
+            res.write(
+              `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: value.delta }, finish_reason: null }] })}\n\n`
+            )
+          }
+        } else if (
+          (type === 'response.reasoning_text.delta' ||
+            type === 'response.reasoning_summary_text.delta') &&
+          typeof value.delta === 'string'
+        ) {
+          reasoning += value.delta
+          if (request.stream) {
+            res.write(
+              `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { reasoning_content: value.delta }, finish_reason: null }] })}\n\n`
+            )
+          }
+        } else if (type === 'response.output_item.added') {
+          const item = value.item as Record<string, unknown> | undefined
+          if (item?.type === 'function_call') {
+            const callId = String(item.call_id || item.id || uuidv4())
+            const call = {
+              id: callId,
+              name: String(item.name || ''),
+              arguments: '',
+              index: toolCalls.size
+            }
+            toolCalls.set(callId, call)
+            if (request.stream) {
+              res.write(
+                `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { tool_calls: [{ index: call.index, id: call.id, type: 'function', function: { name: call.name, arguments: '' } }] }, finish_reason: null }] })}\n\n`
+              )
+            }
+          }
+        } else if (type === 'response.function_call_arguments.delta') {
+          const callId = String(value.call_id || value.item_id || '')
+          const call = toolCalls.get(callId) || Array.from(toolCalls.values()).at(-1)
+          if (call && typeof value.delta === 'string') {
+            call.arguments += value.delta
+            if (request.stream) {
+              res.write(
+                `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { tool_calls: [{ index: call.index, function: { arguments: value.delta } }] }, finish_reason: null }] })}\n\n`
+              )
+            }
+          }
+        } else if (type === 'response.completed') {
+          const completed = value.response as { usage?: typeof usage } | undefined
+          usage = completed?.usage
+        }
+      }
+
+      const finishReason = toolCalls.size ? 'tool_calls' : 'stop'
+      if (request.stream) {
+        res.write(
+          `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })}\n\n`
+        )
+        res.write('data: [DONE]\n\n')
+        res.end()
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            id,
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: content || null,
+                  ...(reasoning ? { reasoning_content: reasoning } : {}),
+                  ...(toolCalls.size
+                    ? {
+                        tool_calls: Array.from(toolCalls.values()).map((call) => ({
+                          id: call.id,
+                          type: 'function',
+                          function: { name: call.name, arguments: call.arguments }
+                        }))
+                      }
+                    : {})
+                },
+                finish_reason: finishReason
+              }
+            ],
+            usage: {
+              prompt_tokens: usage?.input_tokens || 0,
+              completion_tokens: usage?.output_tokens || 0,
+              total_tokens:
+                usage?.total_tokens || (usage?.input_tokens || 0) + (usage?.output_tokens || 0)
+            }
+          })
+        )
+      }
+      this.recordChatGPTCodexUsage(
+        '/v1/chat/completions',
+        model,
+        account,
+        usage,
+        startTime,
+        matchedApiKey?.id
+      )
+    } catch (error) {
+      if (this.isAbortError(error, signal)) return
+      this.recordRequestFailed()
+      const message = this.sanitizeOAuthError(error)
+      const status =
+        typeof (error as { status?: unknown })?.status === 'number'
+          ? (error as { status: number }).status
+          : 503
+      this.sendError(res, status, message)
+      this.events.onResponse?.({ path: '/v1/chat/completions', model, status, error: message })
+      this.recordRequest({
+        path: '/v1/chat/completions',
+        model,
+        responseTime: Date.now() - startTime,
+        success: false,
+        error: message
+      })
+    }
+  }
+
+  private async handleChatGPTCodexResponses(
+    res: http.ServerResponse,
+    request: OpenAIResponsesRequest,
+    routedModel: string,
+    startTime: number,
+    matchedApiKey?: import('./types').ApiKey,
+    signal?: AbortSignal
+  ): Promise<void> {
+    try {
+      const payload = buildCodexPayloadFromResponses(
+        { ...request, model: routedModel },
+        this.chatgptCodexConfig.reasoningEffort
+      )
+      const { account, response } = await this.requestChatGPTWithFallback(
+        payload,
+        routedModel,
+        signal
+      )
+      if (!response.body) throw new Error('ChatGPT/Codex returned an empty stream')
+      let completedResponse: Record<string, unknown> | undefined
+      let usage:
+        | { input_tokens?: number; output_tokens?: number; total_tokens?: number }
+        | undefined
+
+      if (request.stream) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive'
+        })
+      }
+
+      for await (const event of iterateCodexSse(
+        response.body as unknown as AsyncIterable<Uint8Array>
+      )) {
+        if (event.value?.type === 'response.completed') {
+          completedResponse = event.value.response as Record<string, unknown> | undefined
+          usage = completedResponse?.usage as typeof usage
+        }
+        if (request.stream) {
+          const eventName = event.event || String(event.value?.type || 'message')
+          res.write(`event: ${eventName}\ndata: ${event.data}\n\n`)
+        }
+      }
+
+      if (request.stream) {
+        res.end()
+      } else {
+        if (!completedResponse) throw new Error('ChatGPT/Codex stream completed without a response')
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ...completedResponse, model: routedModel }))
+      }
+      this.recordChatGPTCodexUsage(
+        '/v1/responses',
+        routedModel,
+        account,
+        usage,
+        startTime,
+        matchedApiKey?.id
+      )
+    } catch (error) {
+      if (this.isAbortError(error, signal)) return
+      this.recordRequestFailed()
+      const message = this.sanitizeOAuthError(error)
+      const status =
+        typeof (error as { status?: unknown })?.status === 'number'
+          ? (error as { status: number }).status
+          : 503
+      this.sendError(res, status, message)
+      this.events.onResponse?.({
+        path: '/v1/responses',
+        model: routedModel,
+        status,
+        error: message
+      })
+      this.recordRequest({
+        path: '/v1/responses',
+        model: routedModel,
+        responseTime: Date.now() - startTime,
+        success: false,
+        error: message
+      })
+    }
+  }
+
+  private async handleOpenAIResponses(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    signal?: AbortSignal
+  ): Promise<void> {
     const body = await this.readBody(req, signal)
     this.throwIfAborted(signal)
-    const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
+    const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey })
+      .matchedApiKey
     const startTime = Date.now()
 
     this.recordNewRequest()
@@ -4020,57 +6069,131 @@ export class ProxyServer {
         affinityHintResp = `${keyPrefix}:${rawHintResp}`
       }
       chatRequest.model = this.applyModelMapping(chatRequest.model, matchedApiKey?.id)
-      processedRequest = await this.resolveOpenAIHttpImages(this.prepareOpenAIRequest(chatRequest), signal)
+      processedRequest = await this.resolveOpenAIHttpImages(
+        this.prepareOpenAIRequest(chatRequest),
+        signal
+      )
     } catch (error) {
       if (this.isAbortError(error, signal)) return
       this.recordRequestFailed()
       const message = error instanceof Error ? error.message : 'Invalid request'
       this.sendError(res, 400, message)
       this.events.onResponse?.({ path: '/v1/responses', status: 400, error: message })
-      this.recordRequest({ path: '/v1/responses', responseTime: Date.now() - startTime, success: false, error: message })
+      this.recordRequest({
+        path: '/v1/responses',
+        responseTime: Date.now() - startTime,
+        success: false,
+        error: message
+      })
       return
     }
 
-    // Xpixi upstream: explicit Xpixi model prefix
-    if (isXpixiModel(chatRequest.model, this.config.xpixi)) {
-      // Convert responses -> chat/completions internally
-      await this.handleXpixiOpenAIChat(res, chatRequest, startTime, matchedApiKey, signal)
+    if (isChatGPTCodexModel(chatRequest.model, this.chatgptCodexConfig)) {
+      await this.handleChatGPTCodexResponses(
+        res,
+        responseRequest,
+        chatRequest.model,
+        startTime,
+        matchedApiKey,
+        signal
+      )
+      return
+    }
+
+    const customRoute = findCustomProvider(
+      chatRequest.model,
+      this.config.customApiProviders,
+      this.config.xpixi
+    )
+    if (customRoute) {
+      await this.handleCustomResponses(
+        res,
+        chatRequest,
+        responseRequest,
+        customRoute.provider,
+        customRoute.upstreamModelId,
+        startTime,
+        matchedApiKey,
+        signal
+      )
       return
     }
 
     // Bedrock upstream: explicit Bedrock id.
     if (isBedrockModel(chatRequest.model, this.config.bedrock)) {
-      await this.handleBedrockResponses(res, chatRequest, responseRequest, startTime, matchedApiKey, signal)
+      await this.handleBedrockResponses(
+        res,
+        chatRequest,
+        responseRequest,
+        startTime,
+        matchedApiKey,
+        signal
+      )
       return
     }
     // Bedrock-only routing: if no Kiro account supports this model, go straight to Bedrock.
     {
       const bedrockOnly = await this.resolveBedrockOnlyRoute(chatRequest.model, signal)
       if (bedrockOnly) {
-        proxyLogger.info('ProxyServer', `No Kiro account supports ${chatRequest.model}; routing /v1/responses to Bedrock ${bedrockOnly}`)
+        proxyLogger.info(
+          'ProxyServer',
+          `No Kiro account supports ${chatRequest.model}; routing /v1/responses to Bedrock ${bedrockOnly}`
+        )
         chatRequest.model = bedrockOnly
-        await this.handleBedrockResponses(res, chatRequest, responseRequest, startTime, matchedApiKey, signal)
+        await this.handleBedrockResponses(
+          res,
+          chatRequest,
+          responseRequest,
+          startTime,
+          matchedApiKey,
+          signal
+        )
         return
       }
     }
 
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHintResp, matchedApiKey?.id, chatRequest.model)
+    const account = await this.getAvailableAccount(
+      signal,
+      affinityHintResp,
+      matchedApiKey?.id,
+      chatRequest.model
+    )
     this.throwIfAborted(signal)
     if (!account) {
       // Last-chance Bedrock fallback (exact id or friendly Claude match).
       const bedrockFallback = await this.resolveBedrockFallbackModel(chatRequest.model, signal)
       if (bedrockFallback) {
-        proxyLogger.info('ProxyServer', `Kiro pool cannot serve ${chatRequest.model}; routing /v1/responses to Bedrock ${bedrockFallback}`)
+        proxyLogger.info(
+          'ProxyServer',
+          `Kiro pool cannot serve ${chatRequest.model}; routing /v1/responses to Bedrock ${bedrockFallback}`
+        )
         chatRequest.model = bedrockFallback
-        await this.handleBedrockResponses(res, chatRequest, responseRequest, startTime, matchedApiKey, signal)
+        await this.handleBedrockResponses(
+          res,
+          chatRequest,
+          responseRequest,
+          startTime,
+          matchedApiKey,
+          signal
+        )
         return
       }
       this.recordRequestFailed()
       const diag = await this.classifyNoAccountReason(chatRequest.model, matchedApiKey?.id, signal)
       this.sendNoEligibleAccountError(res, 503, diag, chatRequest.model, 'openai', '/v1/responses')
-      this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 503, error: diag.reason })
-      this.recordRequest({ path: '/v1/responses', model: chatRequest.model, success: false, error: diag.reason })
+      this.events.onResponse?.({
+        path: '/v1/responses',
+        model: chatRequest.model,
+        status: 503,
+        error: diag.reason
+      })
+      this.recordRequest({
+        path: '/v1/responses',
+        model: chatRequest.model,
+        success: false,
+        error: diag.reason
+      })
       return
     }
 
@@ -4082,49 +6205,84 @@ export class ProxyServer {
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
-            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.cacheOptions())
-            return callKiroApi(acc, retryPayload, signal)
+            const retryPayload = openaiToKiro(
+              processedRequest,
+              acc.profileArn,
+              toolNameRegistry,
+              this.cacheOptions()
+            )
+            return await callKiroApi(acc, retryPayload, signal)
           },
           '/v1/responses',
           signal,
           matchedApiKey?.id,
           chatRequest.model
         )
-        const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
+        const chatResponse = kiroToOpenaiResponse(
+          result.content,
+          result.toolUses,
+          result.usage,
+          chatRequest.model,
+          toolNameRegistry,
+          result.reasoningContent
+        )
         this.throwIfResponseClosed(res, signal)
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive'
+          Connection: 'keep-alive'
         })
         const responseId = `resp_${uuidv4()}`
-        res.write(`event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: responseId, object: 'response', created_at: Math.floor(Date.now() / 1000), model: chatRequest.model, output: [] } })}\n\n`)
-        const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
+        res.write(
+          `event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: responseId, object: 'response', created_at: Math.floor(Date.now() / 1000), model: chatRequest.model, output: [] } })}\n\n`
+        )
+        const response = openAIChatToResponsesResponse(
+          chatResponse,
+          responseRequest.previous_response_id
+        )
         const streamedResponse = { ...response, id: responseId }
         streamedResponse.output.forEach((item, outputIndex) => {
           this.throwIfResponseClosed(res, signal)
-          res.write(`event: response.output_item.added\ndata: ${JSON.stringify({ type: 'response.output_item.added', output_index: outputIndex, item })}\n\n`)
+          res.write(
+            `event: response.output_item.added\ndata: ${JSON.stringify({ type: 'response.output_item.added', output_index: outputIndex, item })}\n\n`
+          )
           if (item.type === 'message') {
             item.content.forEach((part, contentIndex) => {
               this.throwIfResponseClosed(res, signal)
-              res.write(`event: response.content_part.added\ndata: ${JSON.stringify({ type: 'response.content_part.added', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part: { type: part.type, text: '' } })}\n\n`)
+              res.write(
+                `event: response.content_part.added\ndata: ${JSON.stringify({ type: 'response.content_part.added', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part: { type: part.type, text: '' } })}\n\n`
+              )
               if (part.text) {
-                res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', item_id: item.id, output_index: outputIndex, content_index: contentIndex, delta: part.text })}\n\n`)
+                res.write(
+                  `event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', item_id: item.id, output_index: outputIndex, content_index: contentIndex, delta: part.text })}\n\n`
+                )
               }
-              res.write(`event: response.output_text.done\ndata: ${JSON.stringify({ type: 'response.output_text.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, text: part.text })}\n\n`)
-              res.write(`event: response.content_part.done\ndata: ${JSON.stringify({ type: 'response.content_part.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part })}\n\n`)
+              res.write(
+                `event: response.output_text.done\ndata: ${JSON.stringify({ type: 'response.output_text.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, text: part.text })}\n\n`
+              )
+              res.write(
+                `event: response.content_part.done\ndata: ${JSON.stringify({ type: 'response.content_part.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part })}\n\n`
+              )
             })
           } else {
             if (item.arguments) {
-              res.write(`event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: item.id, output_index: outputIndex, delta: item.arguments })}\n\n`)
+              res.write(
+                `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: item.id, output_index: outputIndex, delta: item.arguments })}\n\n`
+              )
             }
-            res.write(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.done', item_id: item.id, output_index: outputIndex, arguments: item.arguments })}\n\n`)
+            res.write(
+              `event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.done', item_id: item.id, output_index: outputIndex, arguments: item.arguments })}\n\n`
+            )
           }
           this.throwIfResponseClosed(res, signal)
-          res.write(`event: response.output_item.done\ndata: ${JSON.stringify({ type: 'response.output_item.done', output_index: outputIndex, item })}\n\n`)
+          res.write(
+            `event: response.output_item.done\ndata: ${JSON.stringify({ type: 'response.output_item.done', output_index: outputIndex, item })}\n\n`
+          )
         })
         this.throwIfResponseClosed(res, signal)
-        res.write(`event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: streamedResponse })}\n\n`)
+        res.write(
+          `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: streamedResponse })}\n\n`
+        )
         res.end()
         this.recordSuccessfulUsage({
           path: '/v1/responses',
@@ -4140,17 +6298,32 @@ export class ProxyServer {
       const { result, account: usedAccount } = await this.callWithRetry(
         account,
         async (acc) => {
-          const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.cacheOptions())
-          return callKiroApi(acc, retryPayload, signal)
+          const retryPayload = openaiToKiro(
+            processedRequest,
+            acc.profileArn,
+            toolNameRegistry,
+            this.cacheOptions()
+          )
+          return await callKiroApi(acc, retryPayload, signal)
         },
         '/v1/responses',
         signal,
         matchedApiKey?.id,
         chatRequest.model
       )
-      const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
+      const chatResponse = kiroToOpenaiResponse(
+        result.content,
+        result.toolUses,
+        result.usage,
+        chatRequest.model,
+        toolNameRegistry,
+        result.reasoningContent
+      )
       this.throwIfResponseClosed(res, signal)
-      const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
+      const response = openAIChatToResponsesResponse(
+        chatResponse,
+        responseRequest.previous_response_id
+      )
 
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(response))
@@ -4163,7 +6336,15 @@ export class ProxyServer {
         apiKeyId: matchedApiKey?.id
       })
     } catch (error) {
-      this.handleApiError(res, account, error as Error, '/v1/responses', chatRequest.model, startTime, signal)
+      this.handleApiError(
+        res,
+        account,
+        error as Error,
+        '/v1/responses',
+        chatRequest.model,
+        startTime,
+        signal
+      )
     }
   }
 
@@ -4183,10 +6364,12 @@ export class ProxyServer {
   ): Promise<void> {
     const id = streamId || `chatcmpl-${uuidv4()}`
     let toolCallIndex = 0
-    const pendingToolCalls: Map<string, { index: number; name: string; arguments: string }> = new Map()
-    let collectedContent = ''
+    const pendingToolCalls: Map<string, { index: number; name: string; arguments: string }> =
+      new Map()
     let bufferedContent = ''
-    const shouldBufferContentForToolTurn = (kiroPayload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools?.length ?? 0) > 0
+    const shouldBufferContentForToolTurn =
+      (kiroPayload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools
+        ?.length ?? 0) > 0
 
     // ---- Buffer-first + heartbeat state ----
     // Headers go out immediately so we can heartbeat while waiting for the first
@@ -4205,69 +6388,121 @@ export class ProxyServer {
     let heartbeatTimer: ReturnType<typeof setInterval> | undefined
 
     const stopHeartbeat = (): void => {
-      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = undefined }
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer)
+        heartbeatTimer = undefined
+      }
     }
     const startTransport = (): void => {
       if (transportStarted) return
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no'
       })
       transportStarted = true
+      res.flushHeaders?.()
+      // Establish the SSE transport without committing semantic response data,
+      // so pre-content account failover remains safe.
+      res.write(': krouter-stream-open\n\n')
       if (heartbeatMs > 0) {
         heartbeatTimer = setInterval(() => {
-          if (commitState.clientFlushed || this.isResponseClosed(res)) { stopHeartbeat(); return }
-          try { res.write(': ping\n\n') } catch { stopHeartbeat() }
+          if (this.isResponseClosed(res)) {
+            stopHeartbeat()
+            return
+          }
+          try {
+            res.write(': ping\n\n')
+          } catch {
+            stopHeartbeat()
+          }
         }, heartbeatMs)
+        heartbeatTimer.unref?.()
       }
     }
     const flushQueue = (): void => {
+      // 响应已经结束就直接返回：否则残留的 150ms flushTimer 会在 res.end() 之后 write，
+      // 触发 response 的 'error' 事件并变成未捕获异常
+      if (this.isResponseClosed(res) || res.writableEnded) {
+        if (flushTimer) {
+          clearTimeout(flushTimer)
+          flushTimer = undefined
+        }
+        return
+      }
       startTransport()
-      if (flushTimer) { clearTimeout(flushTimer); flushTimer = undefined }
+      if (flushTimer) {
+        clearTimeout(flushTimer)
+        flushTimer = undefined
+      }
       if (!roleSent && currentRound === 0) {
-        res.write(`data: ${JSON.stringify(createOpenaiStreamChunk(id, model, { role: 'assistant' }))}\n\n`)
+        res.write(
+          `data: ${JSON.stringify(createOpenaiStreamChunk(id, model, { role: 'assistant' }))}\n\n`
+        )
         roleSent = true
       }
       for (const frame of queue) res.write(frame)
       queue = []
       queuedBytes = 0
       commitState.clientFlushed = true
-      stopHeartbeat()
     }
     // Queue a content/tool frame; flush once we cross the byte or time threshold.
     const emit = (frame: string): void => {
-      if (commitState.clientFlushed) { res.write(frame); return }
+      if (commitState.clientFlushed) {
+        res.write(frame)
+        return
+      }
       queue.push(frame)
       queuedBytes += frame.length
-      if (queuedBytes >= bufferBytesLimit) { flushQueue(); return }
+      if (queuedBytes >= bufferBytesLimit) {
+        flushQueue()
+        return
+      }
       if (!flushTimer) flushTimer = setTimeout(() => flushQueue(), bufferMsLimit)
     }
     // Drop buffered-but-unflushed frames so the next account replays cleanly.
     const dropQueue = (): void => {
-      if (flushTimer) { clearTimeout(flushTimer); flushTimer = undefined }
+      if (flushTimer) {
+        clearTimeout(flushTimer)
+        flushTimer = undefined
+      }
       queue = []
       queuedBytes = 0
+      // 切换到其它账号重放时，本次尝试的累加器也必须一起清空，
+      // 否则失败那次的文本会被重复输出，tool_call 的 index 也会错位／悬空
+      bufferedContent = ''
+      toolCallIndex = 0
+      pendingToolCalls.clear()
+      roleSent = headersSent
     }
     startTransport()
 
-    return new Promise((resolve) => {
+    return await new Promise((resolve) => {
       this.callStreamWithFailover(
         account,
         kiroPayload,
         (_usedAccount, text, toolUse, isThinking) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
-          if (text && text.trim()) {
+          // Chỉ cần truthy, KHÔNG dùng .trim(): một mảnh toàn khoảng trắng ('\n' hay thụt đầu
+          // dòng) là nội dung thật mà kiroApi đã chuyển tiếp nguyên văn. Lọc bằng trim() làm
+          // streaming lệch với non-streaming (`content += text`) và với đường Gemini
+          // (`if (text)`), tức mất định dạng trong code block / markdown. Sentinel
+          // onChunk('', toolUse) vẫn bị loại vì chuỗi rỗng là falsy.
+          if (text) {
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 reasoning_content
-              emit(`data: ${JSON.stringify(createOpenaiStreamChunk(id, model, { reasoning_content: text }))}\n\n`)
+              emit(
+                `data: ${JSON.stringify(createOpenaiStreamChunk(id, model, { reasoning_content: text }))}\n\n`
+              )
             } else {
               // 普通文本内容
-              collectedContent += text
               if (shouldBufferContentForToolTurn) {
                 bufferedContent += text
               } else {
-                emit(`data: ${JSON.stringify(createOpenaiStreamChunk(id, model, { content: text }))}\n\n`)
+                emit(
+                  `data: ${JSON.stringify(createOpenaiStreamChunk(id, model, { content: text }))}\n\n`
+                )
               }
             }
           }
@@ -4280,24 +6515,24 @@ export class ProxyServer {
               arguments: JSON.stringify(toolUse.input)
             })
             const toolChunk = createOpenaiStreamChunk(id, model, {
-              tool_calls: [{
-                index: idx,
-                id: toolUse.toolUseId,
-                type: 'function',
-                function: {
-                  name: restoredToolUse.name,
-                  arguments: JSON.stringify(toolUse.input)
+              tool_calls: [
+                {
+                  index: idx,
+                  id: toolUse.toolUseId,
+                  type: 'function',
+                  function: {
+                    name: restoredToolUse.name,
+                    arguments: JSON.stringify(toolUse.input)
+                  }
                 }
-              }]
+              ]
             })
             emit(`data: ${JSON.stringify(toolChunk)}\n\n`)
           }
         },
         async (usedAccount, usage) => {
-          if (signal?.aborted || this.isResponseClosed(res)) {
-            resolve()
-            return
-          }
+          // 上游已经完成并且已经计费：无论客户端是否还在都必须记账，
+          // 否则额度已耗尽的账号在池子里看起来仍然有余量
           this.recordSuccessfulUsage({
             path: '/v1/chat/completions',
             model,
@@ -4306,13 +6541,23 @@ export class ProxyServer {
             startTime,
             apiKeyId: matchedApiKey?.id
           })
+          // 客户端已断开时，只跳过面向客户端的写操作
+          if (signal?.aborted || this.isResponseClosed(res)) {
+            resolve()
+            return
+          }
 
           // 发送结束 chunk（包含完整 usage 信息）
           const hasToolCalls = pendingToolCalls.size > 0
           if (shouldBufferContentForToolTurn && bufferedContent && !hasToolCalls) {
-            emit(`data: ${JSON.stringify(createOpenaiStreamChunk(id, model, { content: bufferedContent }))}\n\n`)
+            emit(
+              `data: ${JSON.stringify(createOpenaiStreamChunk(id, model, { content: bufferedContent }))}\n\n`
+            )
           } else if (shouldBufferContentForToolTurn && bufferedContent && hasToolCalls) {
-            proxyLogger.debug('ProxyServer', `Suppressed ${bufferedContent.length} buffered assistant chars before tool_calls`)
+            proxyLogger.debug(
+              'ProxyServer',
+              `Suppressed ${bufferedContent.length} buffered assistant chars before tool_calls`
+            )
           }
           // Completion is the final flush point: drain any buffered frames, then
           // write the terminal chunk + [DONE].
@@ -4345,6 +6590,8 @@ export class ProxyServer {
         },
         (usedAccount, error) => {
           stopHeartbeat()
+          // 终止路径必须先取消 flushTimer，否则它会在下面的 res.end() 之后再 write
+          dropQueue()
           if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
             resolve()
             return
@@ -4358,8 +6605,20 @@ export class ProxyServer {
           res.end()
 
           this.recordRequestFailed()
-          this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 500, error: error.message })
-          this.recordRequest({ path: '/v1/chat/completions', model, accountId: usedAccount.id, responseTime: Date.now() - startTime, success: false, error: error.message })
+          this.events.onResponse?.({
+            path: '/v1/chat/completions',
+            model,
+            status: 500,
+            error: error.message
+          })
+          this.recordRequest({
+            path: '/v1/chat/completions',
+            model,
+            accountId: usedAccount.id,
+            responseTime: Date.now() - startTime,
+            success: false,
+            error: error.message
+          })
           resolve()
         },
         '/v1/chat/completions',
@@ -4368,8 +6627,10 @@ export class ProxyServer {
         model,
         commitState,
         dropQueue
-      ).catch(error => {
+      ).catch((error) => {
         stopHeartbeat()
+        // 同上：终止路径先取消 flushTimer，避免 res.end() 之后再触发 write
+        dropQueue()
         if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
           startTransport()
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
@@ -4383,11 +6644,23 @@ export class ProxyServer {
   }
 
   // 处理 Claude Messages 请求
-  private async handleClaudeMessages(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+  private async handleClaudeMessages(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    signal?: AbortSignal
+  ): Promise<void> {
     const body = await this.readBody(req, signal)
     this.throwIfAborted(signal)
-    const request: ClaudeRequest = JSON.parse(body)
-    const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
+    // 非法 JSON 属于客户端错误：回 400（anthropic 错误信封），避免冒泡成 500
+    let request: ClaudeRequest
+    try {
+      request = JSON.parse(body)
+    } catch {
+      this.sendError(res, 400, 'Invalid JSON body', 'anthropic')
+      return
+    }
+    const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey })
+      .matchedApiKey
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
     const rawHint = ProxyServer.extractSessionHint(req, request)
@@ -4406,6 +6679,24 @@ export class ProxyServer {
     this.recordNewRequest()
     this.events.onRequest?.({ path: '/v1/messages', method: 'POST' })
 
+    const customRoute = findCustomProvider(
+      request.model,
+      this.config.customApiProviders,
+      this.config.xpixi
+    )
+    if (customRoute) {
+      await this.handleCustomClaudeMessages(
+        res,
+        request,
+        customRoute.provider,
+        customRoute.upstreamModelId,
+        startTime,
+        matchedApiKey,
+        signal
+      )
+      return
+    }
+
     // Bedrock upstream: route matching models to AWS Bedrock instead of the Kiro pool
     if (isBedrockModel(request.model, this.config.bedrock)) {
       await this.handleBedrockClaudeMessages(res, request, startTime, matchedApiKey, signal)
@@ -4415,7 +6706,10 @@ export class ProxyServer {
     {
       const bedrockOnly = await this.resolveBedrockOnlyRoute(request.model, signal)
       if (bedrockOnly) {
-        proxyLogger.info('ProxyServer', `No Kiro account supports ${request.model}; routing to Bedrock ${bedrockOnly}`)
+        proxyLogger.info(
+          'ProxyServer',
+          `No Kiro account supports ${request.model}; routing to Bedrock ${bedrockOnly}`
+        )
         request.model = bedrockOnly
         await this.handleBedrockClaudeMessages(res, request, startTime, matchedApiKey, signal)
         return
@@ -4424,27 +6718,56 @@ export class ProxyServer {
 
     let processedRequest: ClaudeRequest
     try {
-      processedRequest = await this.resolveClaudeHttpImages(this.prepareClaudeRequest(request), signal)
+      processedRequest = await this.resolveClaudeHttpImages(
+        this.prepareClaudeRequest(request),
+        signal
+      )
     } catch (error) {
       if (this.isAbortError(error, signal)) return
       this.recordRequestFailed()
       const message = error instanceof Error ? error.message : 'Invalid request'
       this.sendError(res, 400, message, 'anthropic')
-      this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 400, error: message })
-      this.recordRequest({ path: '/v1/messages', model: request.model, responseTime: Date.now() - startTime, success: false, error: message })
+      this.events.onResponse?.({
+        path: '/v1/messages',
+        model: request.model,
+        status: 400,
+        error: message
+      })
+      this.recordRequest({
+        path: '/v1/messages',
+        model: request.model,
+        responseTime: Date.now() - startTime,
+        success: false,
+        error: message
+      })
       return
     }
 
     // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, request.model)
+    const account = await this.getAvailableAccount(
+      signal,
+      affinityHint,
+      matchedApiKey?.id,
+      request.model
+    )
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
       const diag = await this.classifyNoAccountReason(request.model, matchedApiKey?.id, signal)
       this.sendNoEligibleAccountError(res, 503, diag, request.model, 'anthropic', '/v1/messages')
-      this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 503, error: diag.reason })
-      this.recordRequest({ path: '/v1/messages', model: request.model, success: false, error: diag.reason })
+      this.events.onResponse?.({
+        path: '/v1/messages',
+        model: request.model,
+        status: 503,
+        error: diag.reason
+      })
+      this.recordRequest({
+        path: '/v1/messages',
+        model: request.model,
+        success: false,
+        error: diag.reason
+      })
       return
     }
 
@@ -4467,7 +6790,10 @@ export class ProxyServer {
       const cacheUsage = promptCacheTracker.compute(account.id, cacheProfile)
 
       if (cacheProfile) {
-        proxyLogger.info('ProxyServer', `Prompt cache: ${cacheProfile.breakpoints.length} breakpoints, creation=${cacheUsage.cacheCreationInputTokens}, read=${cacheUsage.cacheReadInputTokens}`)
+        proxyLogger.info(
+          'ProxyServer',
+          `Prompt cache: ${cacheProfile.breakpoints.length} breakpoints, creation=${cacheUsage.cacheCreationInputTokens}, read=${cacheUsage.cacheReadInputTokens}`
+        )
       }
 
       // 记录请求详情到日志
@@ -4477,7 +6803,7 @@ export class ProxyServer {
         const toolsCount = userInput?.userInputMessageContext?.tools?.length || 0
         const historyLength = kiroPayload.conversationState.history?.length || 0
         const hasImages = (userInput?.images?.length || 0) > 0
-        
+
         proxyLogger.info('ProxyServer', `Claude API: ${request.model}`, {
           model: request.model,
           stream: request.stream,
@@ -4491,27 +6817,49 @@ export class ProxyServer {
 
       if (request.stream) {
         // 流式响应（流式不使用重试机制，错误由流处理）
-        await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal,
-          cacheProfile ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined)
+        await this.handleClaudeStream(
+          res,
+          account,
+          kiroPayload,
+          request.model,
+          startTime,
+          0,
+          undefined,
+          false,
+          0,
+          matchedApiKey,
+          toolNameRegistry,
+          signal,
+          cacheProfile ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined
+        )
       } else {
         // 非流式响应（带重试机制）
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
             const retryPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry)
-            return callKiroApi(acc, retryPayload, signal)
+            return await callKiroApi(acc, retryPayload, signal)
           },
           '/v1/messages',
           signal,
           matchedApiKey?.id,
           request.model
         )
-        const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
+        const response = kiroToClaudeResponse(
+          result.content,
+          result.toolUses,
+          result.usage,
+          request.model,
+          toolNameRegistry,
+          result.reasoningContent
+        )
 
         // 用缓存模拟的 usage 覆盖（如果有 cache profile）
         if (cacheProfile && cacheUsage) {
-          if (cacheUsage.cacheCreationInputTokens > 0) response.usage.cache_creation_input_tokens = cacheUsage.cacheCreationInputTokens
-          if (cacheUsage.cacheReadInputTokens > 0) response.usage.cache_read_input_tokens = cacheUsage.cacheReadInputTokens
+          if (cacheUsage.cacheCreationInputTokens > 0)
+            response.usage.cache_creation_input_tokens = cacheUsage.cacheCreationInputTokens
+          if (cacheUsage.cacheReadInputTokens > 0)
+            response.usage.cache_read_input_tokens = cacheUsage.cacheReadInputTokens
           promptCacheTracker.update(usedAccount.id, cacheProfile)
         }
 
@@ -4529,7 +6877,15 @@ export class ProxyServer {
         })
       }
     } catch (error) {
-      this.handleApiError(res, account, error as Error, '/v1/messages', request.model, startTime, signal)
+      this.handleApiError(
+        res,
+        account,
+        error as Error,
+        '/v1/messages',
+        request.model,
+        startTime,
+        signal
+      )
     }
   }
 
@@ -4547,19 +6903,26 @@ export class ProxyServer {
     matchedApiKey?: import('./types').ApiKey,
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
     signal?: AbortSignal,
-    simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string }
+    simulatedCacheUsage?: {
+      cacheCreationInputTokens: number
+      cacheReadInputTokens: number
+      cacheProfile?: CacheProfile
+      accountId?: string
+    }
   ): Promise<void> {
     const id = msgId || `msg_${uuidv4()}`
     let currentBlockIndex = contentBlockIndex
     let hasStartedTextBlock = false
     let hasStartedThinkingBlock = false
     let pendingThinkingSignature: string | undefined
-    let collectedContent = ''
     let bufferedContent = ''
-    const shouldBufferContentForToolTurn = (kiroPayload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools?.length ?? 0) > 0
-    const pendingToolCalls: Map<string, { name: string; input: Record<string, unknown> }> = new Map()
+    const shouldBufferContentForToolTurn =
+      (kiroPayload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools
+        ?.length ?? 0) > 0
+    const pendingToolCalls: Map<string, { name: string; input: Record<string, unknown> }> =
+      new Map()
 
-    const flushThinkingSignature = () => {
+    const flushThinkingSignature = (): void => {
       if (!pendingThinkingSignature) return
       const signatureDelta = createClaudeStreamEvent('content_block_delta', {
         index: currentBlockIndex,
@@ -4577,7 +6940,7 @@ export class ProxyServer {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
+        Connection: 'keep-alive'
       })
       if (currentRound === 0) {
         const messageStart = createClaudeStreamEvent('message_start', {
@@ -4597,7 +6960,7 @@ export class ProxyServer {
       streamStarted = true
     }
 
-    return new Promise((resolve) => {
+    return await new Promise((resolve) => {
       this.callStreamWithFailover(
         account,
         kiroPayload,
@@ -4607,14 +6970,18 @@ export class ProxyServer {
           // 优先处理 redacted_thinking（加密的 thinking 块，需单独 content_block）
           if (redactedContent) {
             if (hasStartedTextBlock) {
-              const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+              const blockStop = createClaudeStreamEvent('content_block_stop', {
+                index: currentBlockIndex
+              })
               res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
               currentBlockIndex++
               hasStartedTextBlock = false
             }
             if (hasStartedThinkingBlock) {
               flushThinkingSignature()
-              const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+              const blockStop = createClaudeStreamEvent('content_block_stop', {
+                index: currentBlockIndex
+              })
               res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
               currentBlockIndex++
               hasStartedThinkingBlock = false
@@ -4624,16 +6991,21 @@ export class ProxyServer {
               content_block: { type: 'redacted_thinking', data: redactedContent }
             })
             res.write(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`)
-            const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+            const blockStop = createClaudeStreamEvent('content_block_stop', {
+              index: currentBlockIndex
+            })
             res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
             currentBlockIndex++
             return
           }
-          if (text && text.trim()) {
+          // Xem chú thích ở handleOpenAIStream: chỉ kiểm tra truthy, không trim.
+          if (text) {
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 Anthropic thinking block
               if (hasStartedTextBlock) {
-                const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+                const blockStop = createClaudeStreamEvent('content_block_stop', {
+                  index: currentBlockIndex
+                })
                 res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
                 currentBlockIndex++
                 hasStartedTextBlock = false
@@ -4658,12 +7030,13 @@ export class ProxyServer {
               // 普通文本内容
               if (hasStartedThinkingBlock) {
                 flushThinkingSignature()
-                const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+                const blockStop = createClaudeStreamEvent('content_block_stop', {
+                  index: currentBlockIndex
+                })
                 res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
                 currentBlockIndex++
                 hasStartedThinkingBlock = false
               }
-              collectedContent += text
               if (shouldBufferContentForToolTurn) {
                 bufferedContent += text
               } else {
@@ -4697,14 +7070,18 @@ export class ProxyServer {
             const restoredToolUse = toolNameRegistry.restoreToolUse(toolUse)
             if (hasStartedThinkingBlock) {
               flushThinkingSignature()
-              const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+              const blockStop = createClaudeStreamEvent('content_block_stop', {
+                index: currentBlockIndex
+              })
               res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
               currentBlockIndex++
               hasStartedThinkingBlock = false
             }
             // 结束之前的文本块
             if (hasStartedTextBlock) {
-              const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+              const blockStop = createClaudeStreamEvent('content_block_stop', {
+                index: currentBlockIndex
+              })
               res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
               currentBlockIndex++
               hasStartedTextBlock = false
@@ -4714,22 +7091,49 @@ export class ProxyServer {
             // 开始工具块
             const toolBlockStart = createClaudeStreamEvent('content_block_start', {
               index: currentBlockIndex,
-              content_block: { type: 'tool_use', id: toolUse.toolUseId, name: restoredToolUse.name, input: {} }
+              content_block: {
+                type: 'tool_use',
+                id: toolUse.toolUseId,
+                name: restoredToolUse.name,
+                input: {}
+              }
             })
             res.write(`event: content_block_start\ndata: ${JSON.stringify(toolBlockStart)}\n\n`)
             // 发送工具输入
             const toolDelta = createClaudeStreamEvent('content_block_delta', {
               index: currentBlockIndex,
-              delta: { type: 'input_json_delta', partial_json: JSON.stringify(toolUse.input) } as any
+              delta: {
+                type: 'input_json_delta',
+                partial_json: JSON.stringify(toolUse.input)
+              }
             })
             res.write(`event: content_block_delta\ndata: ${JSON.stringify(toolDelta)}\n\n`)
             // 结束工具块
-            const toolBlockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+            const toolBlockStop = createClaudeStreamEvent('content_block_stop', {
+              index: currentBlockIndex
+            })
             res.write(`event: content_block_stop\ndata: ${JSON.stringify(toolBlockStop)}\n\n`)
             currentBlockIndex++
           }
         },
         async (usedAccount, usage) => {
+          // 上游已经完成并且已经计费：无论客户端是否还在都必须记账，
+          // 否则额度已耗尽的账号在池子里看起来仍然有余量
+          this.recordSuccessfulUsage({
+            path: '/v1/messages',
+            model,
+            account: usedAccount,
+            usage,
+            startTime,
+            apiKeyId: matchedApiKey?.id,
+            simulatedCacheUsage
+          })
+
+          // 成功后更新 prompt cache tracker
+          if (simulatedCacheUsage?.cacheProfile) {
+            promptCacheTracker.update(usedAccount.id, simulatedCacheUsage.cacheProfile)
+          }
+          // 客户端已断开时，只跳过面向客户端的写操作
           if (signal?.aborted || this.isResponseClosed(res)) {
             resolve()
             return
@@ -4737,7 +7141,9 @@ export class ProxyServer {
           ensureStreamStarted()
           if (hasStartedThinkingBlock) {
             flushThinkingSignature()
-            const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+            const blockStop = createClaudeStreamEvent('content_block_stop', {
+              index: currentBlockIndex
+            })
             res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
             currentBlockIndex++
             hasStartedThinkingBlock = false
@@ -4745,7 +7151,9 @@ export class ProxyServer {
 
           // 结束最后的文本块
           if (hasStartedTextBlock) {
-            const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+            const blockStop = createClaudeStreamEvent('content_block_stop', {
+              index: currentBlockIndex
+            })
             res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
             currentBlockIndex++
           }
@@ -4762,31 +7170,23 @@ export class ProxyServer {
               delta: { type: 'text_delta', text: bufferedContent }
             })
             res.write(`event: content_block_delta\ndata: ${JSON.stringify(delta)}\n\n`)
-            const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+            const blockStop = createClaudeStreamEvent('content_block_stop', {
+              index: currentBlockIndex
+            })
             res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
             currentBlockIndex++
           } else if (shouldBufferContentForToolTurn && bufferedContent && hasToolCalls) {
-            proxyLogger.debug('ProxyServer', `Suppressed ${bufferedContent.length} buffered Claude assistant chars before tool_use`)
+            proxyLogger.debug(
+              'ProxyServer',
+              `Suppressed ${bufferedContent.length} buffered Claude assistant chars before tool_use`
+            )
           }
 
-          this.recordSuccessfulUsage({
-            path: '/v1/messages',
-            model,
-            account: usedAccount,
-            usage,
-            startTime,
-            apiKeyId: matchedApiKey?.id,
-            simulatedCacheUsage
-          })
-
-          // 成功后更新 prompt cache tracker
-          if (simulatedCacheUsage?.cacheProfile) {
-            promptCacheTracker.update(usedAccount.id, simulatedCacheUsage.cacheProfile as any)
-          }
+          // 记账与 prompt cache tracker 已在本回调开头完成（客户端断开时也要记）
           // 发送 message_delta（包含完整 usage 信息）
           const stopReason = hasToolCalls ? 'tool_use' : 'end_turn'
           const messageDelta = createClaudeStreamEvent('message_delta', {
-            delta: { stop_reason: stopReason, stop_sequence: null } as any,
+            delta: { stop_reason: stopReason, stop_sequence: null },
             usage: this.buildClaudeUsage(usage, simulatedCacheUsage)
           })
           res.write(`event: message_delta\ndata: ${JSON.stringify(messageDelta)}\n\n`)
@@ -4810,15 +7210,27 @@ export class ProxyServer {
           res.end()
 
           this.recordRequestFailed()
-          this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
-          this.recordRequest({ path: '/v1/messages', model, accountId: usedAccount.id, responseTime: Date.now() - startTime, success: false, error: error.message })
+          this.events.onResponse?.({
+            path: '/v1/messages',
+            model,
+            status: 500,
+            error: error.message
+          })
+          this.recordRequest({
+            path: '/v1/messages',
+            model,
+            accountId: usedAccount.id,
+            responseTime: Date.now() - startTime,
+            success: false,
+            error: error.message
+          })
           resolve()
         },
         '/v1/messages',
         signal,
         matchedApiKey?.id,
         model
-      ).catch(error => {
+      ).catch((error) => {
         if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
           const errorEvent = createClaudeStreamEvent('error', {
             error: { type: 'api_error', message: error.message }
@@ -4833,16 +7245,42 @@ export class ProxyServer {
   }
 
   // 处理 API 错误
-  private handleApiError(res: http.ServerResponse, account: ProxyAccount, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
+  private handleApiError(
+    res: http.ServerResponse,
+    account: ProxyAccount,
+    error: Error,
+    path: string,
+    model?: string,
+    startTime?: number,
+    signal?: AbortSignal
+  ): void {
     if (this.isAbortError(error, signal) || this.isResponseClosed(res)) return
     this.recordRequestFailed()
     const attemptError = error as ProxyAttemptError
     const failedAccount = attemptError.proxyAccountId
       ? this.accountPool.getAccount(attemptError.proxyAccountId) || account
       : account
-    const errCode = error.message.match(/(\d{3})/)?.[1]
-    const parsedCode = errCode ? parseInt(errCode) : 500
-    const isAuthError = error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth')
+    // 优先用错误对象上的结构化 status；退回正则时必须带词边界并夹到 400..599。
+    // 否则 "Stream first-byte timeout after 120000ms" 会解析出 120，
+    // Node 会真的发出 "HTTP/1.1 120"，规范客户端会把它当成 1xx 中间响应从而永远挂住。
+    const structuredStatus = (error as Error & { status?: number }).status
+    let parsedCode: number
+    if (
+      typeof structuredStatus === 'number' &&
+      structuredStatus >= 400 &&
+      structuredStatus <= 599
+    ) {
+      parsedCode = structuredStatus
+    } else {
+      const errCode = error.message.match(/\b(\d{3})\b/)?.[1]
+      const candidate = errCode ? parseInt(errCode, 10) : NaN
+      parsedCode =
+        Number.isFinite(candidate) && candidate >= 400 && candidate <= 599 ? candidate : 502
+    }
+    const isAuthError =
+      error.message.includes('401') ||
+      error.message.includes('403') ||
+      error.message.includes('Auth')
 
     if (!attemptError.proxyFailureRecorded) this.recordAccountFailure(failedAccount, error)
 
@@ -4857,20 +7295,41 @@ export class ProxyServer {
     if (res.headersSent) {
       if (!this.isResponseClosed(res)) {
         if (path === '/v1/responses' || path === '/responses') {
-          res.write(`event: response.failed\ndata: ${JSON.stringify({ type: 'response.failed', error: { type: 'api_error', message: error.message } })}\n\n`)
+          res.write(
+            `event: response.failed\ndata: ${JSON.stringify({ type: 'response.failed', error: { type: 'api_error', message: error.message } })}\n\n`
+          )
         }
         res.end()
       }
       this.events.onResponse?.({ path, status: statusCode, error: error.message })
       endpointMetrics.record({ path, status: statusCode, responseTime, errorCategory })
-      this.recordRequest({ path, model, accountId: failedAccount.id, responseTime, success: false, error: error.message })
+      this.recordRequest({
+        path,
+        model,
+        accountId: failedAccount.id,
+        responseTime,
+        success: false,
+        error: error.message
+      })
       return
     }
 
-    this.sendError(res, statusCode, error.message, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+    this.sendError(
+      res,
+      statusCode,
+      error.message,
+      this.isAnthropicPath(path) ? 'anthropic' : 'openai'
+    )
     this.events.onResponse?.({ path, status: statusCode, error: error.message })
     endpointMetrics.record({ path, status: statusCode, responseTime, errorCategory })
-    this.recordRequest({ path, model, accountId: failedAccount.id, responseTime, success: false, error: error.message })
+    this.recordRequest({
+      path,
+      model,
+      accountId: failedAccount.id,
+      responseTime,
+      success: false,
+      error: error.message
+    })
   }
 
   // 读取请求体
@@ -4892,36 +7351,40 @@ export class ProxyServer {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = []
       let total = 0
-      const cleanup = () => {
+      const cleanup = (): void => {
         req.off('data', onData)
         req.off('end', onEnd)
         req.off('error', onError)
         req.off('aborted', onAborted)
         signal?.removeEventListener('abort', onAbort)
       }
-      const onData = (chunk: Buffer) => {
+      const onData = (chunk: Buffer): void => {
         total += chunk.length
         if (total > maxBytes) {
           cleanup()
-          try { req.destroy() } catch { /* ignore */ }
+          try {
+            req.destroy()
+          } catch {
+            /* ignore */
+          }
           reject(new BodyTooLargeError(total, maxBytes))
           return
         }
         chunks.push(chunk)
       }
-      const onEnd = () => {
+      const onEnd = (): void => {
         cleanup()
         resolve(Buffer.concat(chunks, total).toString('utf8'))
       }
-      const onError = (error: Error) => {
+      const onError = (error: Error): void => {
         cleanup()
         reject(error)
       }
-      const onAborted = () => {
+      const onAborted = (): void => {
         cleanup()
         reject(new Error('Client disconnected'))
       }
-      const onAbort = () => {
+      const onAbort = (): void => {
         cleanup()
         reject(this.getAbortError(signal))
       }
@@ -4939,25 +7402,57 @@ export class ProxyServer {
 
   // 发送错误响应
   // P0-5 自动 sanitize：500 类不吐 message 详情；4xx 客户端错误正常返回
-  private sendError(res: http.ServerResponse, status: number, message: string, format: 'openai' | 'anthropic' = 'openai'): void {
+  private sendError(
+    res: http.ServerResponse,
+    status: number,
+    message: string,
+    format: 'openai' | 'anthropic' = 'openai'
+  ): void {
     if (res.writableEnded || res.destroyed) return
     // 500-599 强制使用通用消息（防止泄露内部信息）
-    const safeMessage = status >= 500 && status < 600
-      ? this.sanitizeErrorMessage(message) || 'Internal server error'
-      : message
+    const safeMessage =
+      status >= 500 && status < 600
+        ? this.sanitizeErrorMessage(message) || 'Internal server error'
+        : message
     // P1-6 503 → 触发 webhook（已有 5 分钟去重）
     if (status === 503) {
       this.notifyAllAccountsExhausted('unknown')
     }
+    // 响应头已经发出（典型是 SSE 流已开）时不能再 writeHead，否则 Node 抛 ERR_HTTP_HEADERS_SENT。
+    // 这里补一个终止用的 SSE 错误帧再关闭，而不是把错误静默丢掉让客户端一直挂着。
+    // Khung phải đúng theo giao thức: SDK của Anthropic chỉ phản ứng với sự kiện có tên
+    // (event: error) và không hiểu [DONE], nên gửi khung kiểu OpenAI vào stream Anthropic
+    // sẽ bị bỏ qua im lặng và client báo "stream ended without producing a Message".
+    if (res.headersSent) {
+      try {
+        if (format === 'anthropic') {
+          res.write(
+            `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: safeMessage } })}\n\n`
+          )
+          res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`)
+        } else {
+          res.write(
+            `data: ${JSON.stringify({ error: { message: safeMessage, type: 'error' } })}\n\n`
+          )
+          res.write('data: [DONE]\n\n')
+        }
+        res.end()
+      } catch {
+        /* ignore */
+      }
+      return
+    }
     res.writeHead(status, { 'Content-Type': 'application/json' })
     if (format === 'anthropic') {
-      res.end(JSON.stringify({
-        type: 'error',
-        error: {
-          type: this.getAnthropicErrorType(status),
-          message: safeMessage
-        }
-      }))
+      res.end(
+        JSON.stringify({
+          type: 'error',
+          error: {
+            type: this.getAnthropicErrorType(status),
+            message: safeMessage
+          }
+        })
+      )
       return
     }
     res.end(JSON.stringify({ error: { message: safeMessage, type: 'error', code: status } }))
@@ -4984,38 +7479,46 @@ export class ProxyServer {
     // Observability (Requirement 7.3): every No_Eligible_Account_Error records the requested
     // model and the reason category. Centralized here so all protocol handlers
     // (/v1/chat/completions, /v1/responses, /v1/messages, /v1beta) emit it uniformly.
-    proxyLogger.warn('ProxyServer', `No eligible account for model ${model ?? '(default)'}: ${diag.reason}`)
+    proxyLogger.warn(
+      'ProxyServer',
+      `No eligible account for model ${model ?? '(default)'}: ${diag.reason}`
+    )
     if (res.writableEnded || res.destroyed) return
     // 与 sendError 一致：500-599 强制脱敏
-    const safeMessage = status >= 500 && status < 600
-      ? this.sanitizeErrorMessage(diag.message) || 'No eligible account'
-      : diag.message
+    const safeMessage =
+      status >= 500 && status < 600
+        ? this.sanitizeErrorMessage(diag.message) || 'No eligible account'
+        : diag.message
     // P1-6 503 → 触发 webhook（保留 sendError 的副作用，含 5 分钟去重）
     if (status === 503) {
       this.notifyAllAccountsExhausted(path, model)
     }
     res.writeHead(status, { 'Content-Type': 'application/json' })
     if (format === 'anthropic') {
-      res.end(JSON.stringify({
-        type: 'error',
-        error: {
-          type: this.getAnthropicErrorType(status),
-          message: safeMessage,
-          code: 'no_eligible_account',
-          reason: diag.reason,
-          model: model ?? null
-        }
-      }))
+      res.end(
+        JSON.stringify({
+          type: 'error',
+          error: {
+            type: this.getAnthropicErrorType(status),
+            message: safeMessage,
+            code: 'no_eligible_account',
+            reason: diag.reason,
+            model: model ?? null
+          }
+        })
+      )
       return
     }
-    res.end(JSON.stringify({
-      error: {
-        type: 'no_eligible_account',
-        code: diag.reason,
-        message: safeMessage,
-        model: model ?? null
-      }
-    }))
+    res.end(
+      JSON.stringify({
+        error: {
+          type: 'no_eligible_account',
+          code: diag.reason,
+          message: safeMessage,
+          model: model ?? null
+        }
+      })
+    )
   }
 
   /**
@@ -5024,18 +7527,23 @@ export class ProxyServer {
    */
   private sanitizeErrorMessage(msg: string): string {
     if (!msg) return ''
-    return msg
-      // Bearer xxxx → Bearer ***
-      .replace(/Bearer\s+[A-Za-z0-9\-_.~+/]+=*/gi, 'Bearer ***')
-      // access_token / refresh_token / api_key / x-api-key 字段值
-      .replace(/(access[_-]?token|refresh[_-]?token|api[_-]?key|x-api-key)["'\s:=]+[^"',\s}]+/gi, '$1=***')
-      // 长 base64/JWT（>= 40 chars）替换为占位
-      .replace(/eyJ[A-Za-z0-9\-_]{20,}/g, 'eyJ***')
-      // Windows 用户路径
-      .replace(/C:\\Users\\[^\\/\s]+/gi, 'C:\\Users\\***')
-      // Linux/Mac home 路径
-      .replace(/\/home\/[^\s/]+/g, '/home/***')
-      .replace(/\/Users\/[^\s/]+/g, '/Users/***')
+    return (
+      msg
+        // Bearer xxxx → Bearer ***
+        .replace(/Bearer\s+[A-Za-z0-9\-_.~+/]+=*/gi, 'Bearer ***')
+        // access_token / refresh_token / api_key / x-api-key 字段值
+        .replace(
+          /(access[_-]?token|refresh[_-]?token|api[_-]?key|x-api-key)["'\s:=]+[^"',\s}]+/gi,
+          '$1=***'
+        )
+        // 长 base64/JWT（>= 40 chars）替换为占位
+        .replace(/eyJ[A-Za-z0-9\-_]{20,}/g, 'eyJ***')
+        // Windows 用户路径
+        .replace(/C:\\Users\\[^\\/\s]+/gi, 'C:\\Users\\***')
+        // Linux/Mac home 路径
+        .replace(/\/home\/[^\s/]+/g, '/home/***')
+        .replace(/\/Users\/[^\s/]+/g, '/Users/***')
+    )
   }
 
   /**
@@ -5091,7 +7599,10 @@ export class ProxyServer {
         if (account.quotaLimit && account.quotaLimit > 0) {
           const usageRatio = (account.quotaUsed || 0) / account.quotaLimit
           if (usageRatio > 0.85) {
-            proxyLogger.debug('ProxyServer', `Affinity unstick (quota ${Math.round(usageRatio * 100)}%): ${sessionHint.slice(0, 16)} × ${account.email || account.id.slice(0, 8)}`)
+            proxyLogger.debug(
+              'ProxyServer',
+              `Affinity unstick (quota ${Math.round(usageRatio * 100)}%): ${sessionHint.slice(0, 16)} × ${account.email || account.id.slice(0, 8)}`
+            )
             this.sessionAffinity.delete(sessionHint)
             return null
           }
@@ -5135,9 +7646,11 @@ export class ProxyServer {
   private triggerWebhook(event: string, payload: Record<string, unknown>): void {
     const now = Date.now()
     const last = this.lastWebhookByEvent.get(event) || 0
-    if (now - last < 5 * 60_000) return  // 同事件 5 分钟内不重复推
+    if (now - last < 5 * 60_000) return // 同事件 5 分钟内不重复推
     this.lastWebhookByEvent.set(event, now)
-    try { this.webhookTrigger?.(event, payload) } catch (err) {
+    try {
+      this.webhookTrigger?.(event, payload)
+    } catch (err) {
       proxyLogger.warn('ProxyServer', `Webhook trigger failed: ${(err as Error).message}`)
     }
   }
@@ -5150,7 +7663,14 @@ export class ProxyServer {
       title: '反代账号全部不可用',
       message: `所有账号配额耗尽或冷却中（exhausted=${quota.exhausted}/${quota.total}，cooldown=${quota.cooldown}）`,
       level: 'error',
-      fields: { 端点: path, 模型: model || '-', 总账号: quota.total, 配额耗尽: quota.exhausted, 冷却中: quota.cooldown, 可用: quota.available }
+      fields: {
+        端点: path,
+        模型: model || '-',
+        总账号: quota.total,
+        配额耗尽: quota.exhausted,
+        冷却中: quota.cooldown,
+        可用: quota.available
+      }
     })
   }
 
@@ -5170,7 +7690,12 @@ export class ProxyServer {
         title: '反代账号池即将枯竭',
         message: `可用账号仅剩 ${quota.available}/${quota.total}（配额耗尽=${quota.exhausted}，冷却中=${quota.cooldown}），请及时补充`,
         level: 'warning',
-        fields: { 可用: quota.available, 总账号: quota.total, 配额耗尽: quota.exhausted, 冷却中: quota.cooldown }
+        fields: {
+          可用: quota.available,
+          总账号: quota.total,
+          配额耗尽: quota.exhausted,
+          冷却中: quota.cooldown
+        }
       })
     }
   }
@@ -5220,11 +7745,14 @@ export class ProxyServer {
     lines.push('# HELP kiro_proxy_endpoint_error_rate Error rate per endpoint')
     lines.push('# TYPE kiro_proxy_endpoint_error_rate gauge')
     for (const ep of endpointMetrics.getAll()) {
-      const label = ep.path.replace(/\//g, '_').replace(/^_/, '')
       lines.push(`kiro_proxy_endpoint_requests_total{path="${ep.path}"} ${ep.totalRequests}`)
-      lines.push(`kiro_proxy_endpoint_latency_avg{path="${ep.path}"} ${Math.round(ep.avgResponseTime)}`)
-      lines.push(`kiro_proxy_endpoint_latency_p95{path="${ep.path}"} ${Math.round(ep.p95ResponseTime)}`)
-      const errRate = ep.totalRequests > 0 ? (ep.errorCount / ep.totalRequests) : 0
+      lines.push(
+        `kiro_proxy_endpoint_latency_avg{path="${ep.path}"} ${Math.round(ep.avgResponseTime)}`
+      )
+      lines.push(
+        `kiro_proxy_endpoint_latency_p95{path="${ep.path}"} ${Math.round(ep.p95ResponseTime)}`
+      )
+      const errRate = ep.totalRequests > 0 ? ep.errorCount / ep.totalRequests : 0
       lines.push(`kiro_proxy_endpoint_error_rate{path="${ep.path}"} ${errRate.toFixed(4)}`)
     }
 
@@ -5235,14 +7763,17 @@ export class ProxyServer {
       const health = ap.getAccountHealth(account.id)
       if (health) {
         const label = (account.email || account.id.slice(0, 8)).replace(/"/g, '')
-        lines.push(`kiro_proxy_account_health{account="${label}"} ${health.overallScore.toFixed(3)}`)
+        lines.push(
+          `kiro_proxy_account_health{account="${label}"} ${health.overallScore.toFixed(3)}`
+        )
       }
     }
 
     // Phase 10: Cache hit rate
     lines.push('# HELP kiro_proxy_cache_hit_rate Prompt cache hit rate')
     lines.push('# TYPE kiro_proxy_cache_hit_rate gauge')
-    const cacheRate = s.totalRequests > 0 ? (s.cacheReadTokens / Math.max(1, s.inputTokens + s.cacheReadTokens)) : 0
+    const cacheRate =
+      s.totalRequests > 0 ? s.cacheReadTokens / Math.max(1, s.inputTokens + s.cacheReadTokens) : 0
     lines.push(`kiro_proxy_cache_hit_rate ${cacheRate.toFixed(4)}`)
 
     return lines.join('\n') + '\n'
@@ -5296,7 +7827,10 @@ export class ProxyServer {
   private async getBedrockAvailableModelIds(signal?: AbortSignal): Promise<string[]> {
     if (!isBedrockConfigured(this.config.bedrock)) return []
     const now = Date.now()
-    if (this.bedrockModelIdCache && now - this.bedrockModelIdCache.timestamp < this.BEDROCK_MODEL_ID_CACHE_TTL) {
+    if (
+      this.bedrockModelIdCache &&
+      now - this.bedrockModelIdCache.timestamp < this.BEDROCK_MODEL_ID_CACHE_TTL
+    ) {
       return this.bedrockModelIdCache.ids
     }
     try {
@@ -5308,7 +7842,10 @@ export class ProxyServer {
       this.bedrockModelIdCache = { ids, timestamp: now }
       return ids
     } catch (error) {
-      console.error('[ProxyServer] Bedrock available-id list failed:', error instanceof Error ? error.message : error)
+      console.error(
+        '[ProxyServer] Bedrock available-id list failed:',
+        error instanceof Error ? error.message : error
+      )
       return this.bedrockModelIdCache?.ids || []
     }
   }
@@ -5319,7 +7856,10 @@ export class ProxyServer {
    * null to keep the original (Kiro) error. Only kicks in for exact/compatible
    * Claude matches available on this Bedrock identity.
    */
-  private async resolveBedrockFallbackModel(requestedModel: string, signal?: AbortSignal): Promise<string | null> {
+  private async resolveBedrockFallbackModel(
+    requestedModel: string,
+    signal?: AbortSignal
+  ): Promise<string | null> {
     if (!isBedrockConfigured(this.config.bedrock)) return null
     // Already a Bedrock-routed id -> handled elsewhere.
     if (isBedrockModel(requestedModel, this.config.bedrock)) return null
@@ -5384,7 +7924,11 @@ export class ProxyServer {
     return this.config.tierRoutingEnabled !== false
   }
 
-  private logTierPrefilter(modelId: string | undefined, excludedCount: number, remainingCount: number): void {
+  private logTierPrefilter(
+    modelId: string | undefined,
+    excludedCount: number,
+    remainingCount: number
+  ): void {
     proxyLogger.info(
       'ProxyServer',
       `Tier pre-filter for model ${modelId ?? '(default)'}: excluded ${excludedCount}, remaining ${remainingCount}`
@@ -5435,27 +7979,34 @@ export class ProxyServer {
    *   3. PREMIUM model + pool has NO paid-tier account -> Bedrock only (no probing).
    *   4. Else confirm via capability scan; route to Bedrock only if no account supports it.
    */
-  private async resolveBedrockOnlyRoute(requestedModel: string, signal?: AbortSignal): Promise<string | null> {
+  private async resolveBedrockOnlyRoute(
+    requestedModel: string,
+    signal?: AbortSignal
+  ): Promise<string | null> {
     if (!isBedrockConfigured(this.config.bedrock)) return null
     if (isBedrockModel(requestedModel, this.config.bedrock)) return null
     const bedrockId = await this.resolveBedrockFallbackModel(requestedModel, signal)
     if (!bedrockId) return null
     if (this.accountPool.size === 0) return bedrockId
     if (this.isPremiumModel(requestedModel) && !this.poolHasPaidTierAccount()) {
-      proxyLogger.info('ProxyServer', `Pool is free-only; premium model ${requestedModel} -> Bedrock`)
+      proxyLogger.info(
+        'ProxyServer',
+        `Pool is free-only; premium model ${requestedModel} -> Bedrock`
+      )
       return bedrockId
     }
     if (await this.poolSupportsModel(requestedModel, signal)) return null
     return bedrockId
   }
 
-
-  /** Record a completed Bedrock request into stats/logs (no Kiro account involved). */
+  /** Record a completed external-provider request into stats/logs. */
   private recordBedrockUsage(input: {
     path: string
     model: string
     usage: KiroUsage
     startTime: number
+    providerId?: string
+    providerName?: string
   }): void {
     const inputTokens = input.usage.inputTokens || 0
     const outputTokens = input.usage.outputTokens || 0
@@ -5465,10 +8016,8 @@ export class ProxyServer {
     this.stats.inputTokens += inputTokens
     this.stats.outputTokens += outputTokens
     this.notifyUsageStatsUpdate()
-    const modelStat = this.stats.modelStats.get(input.model) || { model: input.model, requests: 0, tokens: 0 }
-    modelStat.requests++
-    modelStat.tokens += inputTokens + outputTokens
-    this.stats.modelStats.set(input.model, modelStat)
+    // 复用共享实现，保证与 Kiro 链路的按模型统计口径一致
+    this.accumulateModelStats(input.model, inputTokens, outputTokens)
     this.events.onResponse?.({
       path: input.path,
       model: input.model,
@@ -5477,13 +8026,13 @@ export class ProxyServer {
       inputTokens,
       outputTokens,
       responseTime,
-      accountId: 'bedrock',
-      accountEmail: 'Bedrock'
+      accountId: input.providerId || 'bedrock',
+      accountEmail: input.providerName || 'Bedrock'
     })
     this.recordRequest({
       path: input.path,
       model: input.model,
-      accountId: 'bedrock',
+      accountId: input.providerId || 'bedrock',
       inputTokens,
       outputTokens,
       responseTime,
@@ -5491,43 +8040,239 @@ export class ProxyServer {
     })
   }
 
-  private async handleXpixiOpenAIChat(
+  private customUsage(response: OpenAIChatResponse): KiroUsage {
+    return {
+      inputTokens: response.usage?.prompt_tokens || 0,
+      outputTokens: response.usage?.completion_tokens || 0,
+      credits: 0,
+      cacheReadTokens: response.usage?.prompt_tokens_details?.cached_tokens || 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: response.usage?.completion_tokens_details?.reasoning_tokens || 0
+    }
+  }
+
+  private async handleCustomOpenAIChat(
     res: http.ServerResponse,
     request: OpenAIChatRequest,
+    provider: CustomApiProviderConfig,
+    upstreamModelId: string,
     startTime: number,
     matchedApiKey?: import('./types').ApiKey,
     signal?: AbortSignal
   ): Promise<void> {
     void matchedApiKey
-    if (!this.config.xpixi?.enabled || !this.config.xpixi?.apiKey) {
-      this.recordRequestFailed()
-      this.sendError(res, 503, 'Xpixi provider is not configured (missing API key)')
-      return
-    }
     try {
-      const response = await callXpixi(request, this.config.xpixi, signal)
+      const response = await callCustomApiOpenAI(request, provider, upstreamModelId, signal)
       this.throwIfResponseClosed(res, signal)
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify(response))
-
-      // Record usage
-      const usage: KiroUsage = {
-        inputTokens: response.usage.prompt_tokens,
-        outputTokens: response.usage.completion_tokens,
-        credits: response.usage.total_tokens,
-        cacheReadTokens: response.usage.prompt_tokens_details?.cached_tokens || 0,
-        cacheWriteTokens: 0,
-        reasoningTokens: response.usage.completion_tokens_details?.reasoning_tokens || 0
+      if (request.stream) {
+        const choice = response.choices[0]
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive'
+        })
+        res.write(
+          `data: ${JSON.stringify(createOpenaiStreamChunk(response.id, request.model, { role: 'assistant' }))}\n\n`
+        )
+        if (choice?.message.content)
+          res.write(
+            `data: ${JSON.stringify(createOpenaiStreamChunk(response.id, request.model, { content: choice.message.content }))}\n\n`
+          )
+        if (choice?.message.tool_calls?.length)
+          res.write(
+            `data: ${JSON.stringify(createOpenaiStreamChunk(response.id, request.model, { tool_calls: choice.message.tool_calls.map((tool, index) => ({ ...tool, index })) }))}\n\n`
+          )
+        res.write(
+          `data: ${JSON.stringify(createOpenaiStreamChunk(response.id, request.model, {}, choice?.finish_reason === 'tool_calls' ? 'tool_calls' : 'stop'))}\n\n`
+        )
+        res.write('data: [DONE]\n\n')
+        res.end()
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(response))
       }
-      this.recordBedrockUsage({ path: '/v1/chat/completions', model: request.model, usage, startTime })
+      this.recordBedrockUsage({
+        path: '/v1/chat/completions',
+        model: request.model,
+        usage: this.customUsage(response),
+        startTime,
+        providerId: `custom:${provider.id}`,
+        providerName: provider.name
+      })
     } catch (error) {
       if (this.isAbortError(error, signal)) return
       this.recordRequestFailed()
-      const message = error instanceof Error ? error.message : 'Xpixi request failed'
+      const message = error instanceof Error ? error.message : `${provider.name} request failed`
       if (!res.headersSent) this.sendError(res, 502, this.sanitizeErrorMessage(message))
       else res.end()
-      this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 502, error: message })
-      this.recordRequest({ path: '/v1/chat/completions', model: request.model, accountId: 'xpixi', responseTime: Date.now() - startTime, success: false, error: message })
+      this.events.onResponse?.({
+        path: '/v1/chat/completions',
+        model: request.model,
+        status: 502,
+        error: message
+      })
+      this.recordRequest({
+        path: '/v1/chat/completions',
+        model: request.model,
+        accountId: `custom:${provider.id}`,
+        responseTime: Date.now() - startTime,
+        success: false,
+        error: message
+      })
+    }
+  }
+
+  private async handleCustomClaudeMessages(
+    res: http.ServerResponse,
+    request: ClaudeRequest,
+    provider: CustomApiProviderConfig,
+    upstreamModelId: string,
+    startTime: number,
+    matchedApiKey?: import('./types').ApiKey,
+    signal?: AbortSignal
+  ): Promise<void> {
+    void matchedApiKey
+    try {
+      const response = await callCustomApiClaude(request, provider, upstreamModelId, signal)
+      this.throwIfResponseClosed(res, signal)
+      if (request.stream) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive'
+        })
+        res.write(
+          `event: message_start\ndata: ${JSON.stringify(createClaudeStreamEvent('message_start', { message: { ...response, content: [], stop_reason: null, usage: { ...response.usage, output_tokens: 0 } } }))}\n\n`
+        )
+        response.content.forEach((block, index) => {
+          res.write(
+            `event: content_block_start\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_start', { index, content_block: block.type === 'text' ? { type: 'text', text: '' } : block }))}\n\n`
+          )
+          if (block.type === 'text' && block.text)
+            res.write(
+              `event: content_block_delta\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_delta', { index, delta: { type: 'text_delta', text: block.text } }))}\n\n`
+            )
+          res.write(
+            `event: content_block_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_stop', { index }))}\n\n`
+          )
+        })
+        res.write(
+          `event: message_delta\ndata: ${JSON.stringify(createClaudeStreamEvent('message_delta', { delta: { type: 'message_delta', stop_reason: response.stop_reason || 'end_turn' }, usage: { output_tokens: response.usage.output_tokens } }))}\n\n`
+        )
+        res.write(
+          `event: message_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('message_stop'))}\n\n`
+        )
+        res.end()
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(response))
+      }
+      this.recordBedrockUsage({
+        path: '/v1/messages',
+        model: request.model,
+        usage: {
+          inputTokens: response.usage.input_tokens || 0,
+          outputTokens: response.usage.output_tokens || 0,
+          credits: 0,
+          cacheReadTokens: response.usage.cache_read_input_tokens || 0,
+          cacheWriteTokens: response.usage.cache_creation_input_tokens || 0
+        },
+        startTime,
+        providerId: `custom:${provider.id}`,
+        providerName: provider.name
+      })
+    } catch (error) {
+      if (this.isAbortError(error, signal)) return
+      this.recordRequestFailed()
+      const message = error instanceof Error ? error.message : `${provider.name} request failed`
+      if (!res.headersSent)
+        this.sendError(res, 502, this.sanitizeErrorMessage(message), 'anthropic')
+      else res.end()
+      this.events.onResponse?.({
+        path: '/v1/messages',
+        model: request.model,
+        status: 502,
+        error: message
+      })
+      this.recordRequest({
+        path: '/v1/messages',
+        model: request.model,
+        accountId: `custom:${provider.id}`,
+        responseTime: Date.now() - startTime,
+        success: false,
+        error: message
+      })
+    }
+  }
+
+  private async handleCustomResponses(
+    res: http.ServerResponse,
+    chatRequest: OpenAIChatRequest,
+    responseRequest: OpenAIResponsesRequest,
+    provider: CustomApiProviderConfig,
+    upstreamModelId: string,
+    startTime: number,
+    matchedApiKey?: import('./types').ApiKey,
+    signal?: AbortSignal
+  ): Promise<void> {
+    void matchedApiKey
+    try {
+      const chatResponse = await callCustomApiOpenAI(chatRequest, provider, upstreamModelId, signal)
+      const response = openAIChatToResponsesResponse(
+        chatResponse,
+        responseRequest.previous_response_id
+      )
+      this.throwIfResponseClosed(res, signal)
+      if (responseRequest.stream) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive'
+        })
+        res.write(
+          `event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { ...response, output: [] } })}\n\n`
+        )
+        response.output.forEach((item, outputIndex) =>
+          res.write(
+            `event: response.output_item.done\ndata: ${JSON.stringify({ type: 'response.output_item.done', output_index: outputIndex, item })}\n\n`
+          )
+        )
+        res.write(
+          `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response })}\n\n`
+        )
+        res.end()
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(response))
+      }
+      this.recordBedrockUsage({
+        path: '/v1/responses',
+        model: chatRequest.model,
+        usage: this.customUsage(chatResponse),
+        startTime,
+        providerId: `custom:${provider.id}`,
+        providerName: provider.name
+      })
+    } catch (error) {
+      if (this.isAbortError(error, signal)) return
+      this.recordRequestFailed()
+      const message = error instanceof Error ? error.message : `${provider.name} request failed`
+      if (!res.headersSent) this.sendError(res, 502, this.sanitizeErrorMessage(message))
+      else res.end()
+      this.events.onResponse?.({
+        path: '/v1/responses',
+        model: chatRequest.model,
+        status: 502,
+        error: message
+      })
+      this.recordRequest({
+        path: '/v1/responses',
+        model: chatRequest.model,
+        accountId: `custom:${provider.id}`,
+        responseTime: Date.now() - startTime,
+        success: false,
+        error: message
+      })
     }
   }
 
@@ -5570,18 +8315,24 @@ export class ProxyServer {
           {
             onText: (text) => {
               ensureStart()
-              res.write(`data: ${JSON.stringify(createOpenaiStreamChunk(id, request.model, { content: text }))}\n\n`)
+              res.write(
+                `data: ${JSON.stringify(createOpenaiStreamChunk(id, request.model, { content: text }))}\n\n`
+              )
             },
             onToolUseStart: (index, toolUseId, name) => {
               ensureStart()
               const idx = toolCounter++
               toolIndexById.set(index, idx)
-              res.write(`data: ${JSON.stringify(createOpenaiStreamChunk(id, request.model, { tool_calls: [{ index: idx, id: toolUseId, type: 'function', function: { name, arguments: '' } }] }))}\n\n`)
+              res.write(
+                `data: ${JSON.stringify(createOpenaiStreamChunk(id, request.model, { tool_calls: [{ index: idx, id: toolUseId, type: 'function', function: { name, arguments: '' } }] }))}\n\n`
+              )
             },
             onToolUseDelta: (index, partialJson) => {
               ensureStart()
               const idx = toolIndexById.get(index) ?? 0
-              res.write(`data: ${JSON.stringify(createOpenaiStreamChunk(id, request.model, { tool_calls: [{ index: idx, function: { arguments: partialJson } }] }))}\n\n`)
+              res.write(
+                `data: ${JSON.stringify(createOpenaiStreamChunk(id, request.model, { tool_calls: [{ index: idx, function: { arguments: partialJson } }] }))}\n\n`
+              )
             }
           },
           signal
@@ -5596,14 +8347,24 @@ export class ProxyServer {
         res.write(`data: ${JSON.stringify(usageChunk)}\n\n`)
         res.write('data: [DONE]\n\n')
         res.end()
-        this.recordBedrockUsage({ path: '/v1/chat/completions', model: request.model, usage: converseUsageToKiro(result.usage), startTime })
+        this.recordBedrockUsage({
+          path: '/v1/chat/completions',
+          model: request.model,
+          usage: converseUsageToKiro(result.usage),
+          startTime
+        })
       } else {
         const resp = await bedrockConverse(this.config.bedrock!, modelId, body, signal)
         const openai = converseToOpenAI(resp, request.model)
         this.throwIfResponseClosed(res, signal)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(openai))
-        this.recordBedrockUsage({ path: '/v1/chat/completions', model: request.model, usage: converseUsageToKiro(resp.usage), startTime })
+        this.recordBedrockUsage({
+          path: '/v1/chat/completions',
+          model: request.model,
+          usage: converseUsageToKiro(resp.usage),
+          startTime
+        })
       }
     } catch (error) {
       if (this.isAbortError(error, signal)) return
@@ -5611,8 +8372,20 @@ export class ProxyServer {
       const message = error instanceof Error ? error.message : 'Bedrock request failed'
       if (!res.headersSent) this.sendError(res, 502, this.sanitizeErrorMessage(message))
       else res.end()
-      this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 502, error: message })
-      this.recordRequest({ path: '/v1/chat/completions', model: request.model, accountId: 'bedrock', responseTime: Date.now() - startTime, success: false, error: message })
+      this.events.onResponse?.({
+        path: '/v1/chat/completions',
+        model: request.model,
+        status: 502,
+        error: message
+      })
+      this.recordRequest({
+        path: '/v1/chat/completions',
+        model: request.model,
+        accountId: 'bedrock',
+        responseTime: Date.now() - startTime,
+        success: false,
+        error: message
+      })
     }
   }
 
@@ -5626,7 +8399,12 @@ export class ProxyServer {
     void matchedApiKey
     if (!isBedrockConfigured(this.config.bedrock)) {
       this.recordRequestFailed()
-      this.sendError(res, 503, 'Bedrock provider is not configured (missing credentials)', 'anthropic')
+      this.sendError(
+        res,
+        503,
+        'Bedrock provider is not configured (missing credentials)',
+        'anthropic'
+      )
       return
     }
     const modelId = stripBedrockPrefix(request.model)
@@ -5639,15 +8417,22 @@ export class ProxyServer {
           Connection: 'keep-alive'
         })
         const msgId = `msg_${uuidv4()}`
-        res.write(`event: message_start\ndata: ${JSON.stringify(createClaudeStreamEvent('message_start', { message: { id: msgId, type: 'message', role: 'assistant', content: [], model: request.model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }))}\n\n`)
+        res.write(
+          `event: message_start\ndata: ${JSON.stringify(createClaudeStreamEvent('message_start', { message: { id: msgId, type: 'message', role: 'assistant', content: [], model: request.model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }))}\n\n`
+        )
         let textBlockOpen = false
         const blockIndexById = new Map<number, number>()
         let blockCounter = 0
+        // 文本块必须从同一个计数器分配 index：写死 0 时，若 Bedrock 先发 toolUse，
+        // 工具块已经占了 index 0，随后开的文本块会在 SDK 组装消息时把它覆盖掉
+        let textBlockIndex = 0
         const openTextBlock = (): void => {
           if (textBlockOpen) return
-          res.write(`event: content_block_start\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }))}\n\n`)
+          textBlockIndex = blockCounter++
+          res.write(
+            `event: content_block_start\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_start', { index: textBlockIndex, content_block: { type: 'text', text: '' } }))}\n\n`
+          )
           textBlockOpen = true
-          blockCounter = Math.max(blockCounter, 1)
         }
         const result = await bedrockConverseStream(
           this.config.bedrock!,
@@ -5656,46 +8441,86 @@ export class ProxyServer {
           {
             onText: (text) => {
               openTextBlock()
-              res.write(`event: content_block_delta\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_delta', { index: 0, delta: { type: 'text_delta', text } }))}\n\n`)
+              res.write(
+                `event: content_block_delta\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_delta', { index: textBlockIndex, delta: { type: 'text_delta', text } }))}\n\n`
+              )
             },
             onToolUseStart: (index, toolUseId, name) => {
               const bi = blockCounter++
               blockIndexById.set(index, bi)
-              res.write(`event: content_block_start\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_start', { index: bi, content_block: { type: 'tool_use', id: toolUseId, name, input: {} } }))}\n\n`)
+              res.write(
+                `event: content_block_start\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_start', { index: bi, content_block: { type: 'tool_use', id: toolUseId, name, input: {} } }))}\n\n`
+              )
             },
             onToolUseDelta: (index, partialJson) => {
               const bi = blockIndexById.get(index) ?? 1
-              res.write(`event: content_block_delta\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_delta', { index: bi, delta: { type: 'input_json_delta', text: partialJson } }))}\n\n`)
+              // Anthropic SDK 只累加 delta.partial_json；写成 text 会让每次工具调用的 input 都是 {}
+              res.write(
+                `event: content_block_delta\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_delta', { index: bi, delta: { type: 'input_json_delta', partial_json: partialJson } }))}\n\n`
+              )
             },
             onToolUseStop: (index) => {
               const bi = blockIndexById.get(index)
-              if (bi !== undefined) res.write(`event: content_block_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_stop', { index: bi }))}\n\n`)
+              if (bi !== undefined)
+                res.write(
+                  `event: content_block_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_stop', { index: bi }))}\n\n`
+                )
             }
           },
           signal
         )
-        if (textBlockOpen) res.write(`event: content_block_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_stop', { index: 0 }))}\n\n`)
+        if (textBlockOpen)
+          res.write(
+            `event: content_block_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_stop', { index: textBlockIndex }))}\n\n`
+          )
         const stopReason = result.toolUses.length ? 'tool_use' : 'end_turn'
-        res.write(`event: message_delta\ndata: ${JSON.stringify(createClaudeStreamEvent('message_delta', { delta: { type: 'message_delta', stop_reason: stopReason }, usage: { output_tokens: result.usage.outputTokens } }))}\n\n`)
-        res.write(`event: message_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('message_stop'))}\n\n`)
+        res.write(
+          `event: message_delta\ndata: ${JSON.stringify(createClaudeStreamEvent('message_delta', { delta: { type: 'message_delta', stop_reason: stopReason }, usage: { output_tokens: result.usage.outputTokens } }))}\n\n`
+        )
+        res.write(
+          `event: message_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('message_stop'))}\n\n`
+        )
         res.end()
-        this.recordBedrockUsage({ path: '/v1/messages', model: request.model, usage: converseUsageToKiro(result.usage), startTime })
+        this.recordBedrockUsage({
+          path: '/v1/messages',
+          model: request.model,
+          usage: converseUsageToKiro(result.usage),
+          startTime
+        })
       } else {
         const resp = await bedrockConverse(this.config.bedrock!, modelId, body, signal)
         const claude = converseToClaude(resp, request.model)
         this.throwIfResponseClosed(res, signal)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(claude))
-        this.recordBedrockUsage({ path: '/v1/messages', model: request.model, usage: converseUsageToKiro(resp.usage), startTime })
+        this.recordBedrockUsage({
+          path: '/v1/messages',
+          model: request.model,
+          usage: converseUsageToKiro(resp.usage),
+          startTime
+        })
       }
     } catch (error) {
       if (this.isAbortError(error, signal)) return
       this.recordRequestFailed()
       const message = error instanceof Error ? error.message : 'Bedrock request failed'
-      if (!res.headersSent) this.sendError(res, 502, this.sanitizeErrorMessage(message), 'anthropic')
+      if (!res.headersSent)
+        this.sendError(res, 502, this.sanitizeErrorMessage(message), 'anthropic')
       else res.end()
-      this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 502, error: message })
-      this.recordRequest({ path: '/v1/messages', model: request.model, accountId: 'bedrock', responseTime: Date.now() - startTime, success: false, error: message })
+      this.events.onResponse?.({
+        path: '/v1/messages',
+        model: request.model,
+        status: 502,
+        error: message
+      })
+      this.recordRequest({
+        path: '/v1/messages',
+        model: request.model,
+        accountId: 'bedrock',
+        responseTime: Date.now() - startTime,
+        success: false,
+        error: message
+      })
     }
   }
 
@@ -5720,51 +8545,95 @@ export class ProxyServer {
       const body = openAIToConverse(chatRequest)
       const resp = await bedrockConverse(this.config.bedrock!, modelId, body, signal)
       const chatResponse = converseToOpenAI(resp, chatRequest.model)
-      const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
+      const response = openAIChatToResponsesResponse(
+        chatResponse,
+        responseRequest.previous_response_id
+      )
       this.throwIfResponseClosed(res, signal)
       if (streaming) {
-        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive'
+        })
         const responseId = `resp_${uuidv4()}`
-        res.write(`event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: responseId, object: 'response', created_at: Math.floor(Date.now() / 1000), model: chatRequest.model, output: [] } })}\n\n`)
+        res.write(
+          `event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: responseId, object: 'response', created_at: Math.floor(Date.now() / 1000), model: chatRequest.model, output: [] } })}\n\n`
+        )
         const streamedResponse = { ...response, id: responseId }
         streamedResponse.output.forEach((item, outputIndex) => {
           this.throwIfResponseClosed(res, signal)
-          res.write(`event: response.output_item.added\ndata: ${JSON.stringify({ type: 'response.output_item.added', output_index: outputIndex, item })}\n\n`)
+          res.write(
+            `event: response.output_item.added\ndata: ${JSON.stringify({ type: 'response.output_item.added', output_index: outputIndex, item })}\n\n`
+          )
           if (item.type === 'message') {
             item.content.forEach((part, contentIndex) => {
               this.throwIfResponseClosed(res, signal)
-              res.write(`event: response.content_part.added\ndata: ${JSON.stringify({ type: 'response.content_part.added', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part: { type: part.type, text: '' } })}\n\n`)
+              res.write(
+                `event: response.content_part.added\ndata: ${JSON.stringify({ type: 'response.content_part.added', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part: { type: part.type, text: '' } })}\n\n`
+              )
               if (part.text) {
-                res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', item_id: item.id, output_index: outputIndex, content_index: contentIndex, delta: part.text })}\n\n`)
+                res.write(
+                  `event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', item_id: item.id, output_index: outputIndex, content_index: contentIndex, delta: part.text })}\n\n`
+                )
               }
-              res.write(`event: response.output_text.done\ndata: ${JSON.stringify({ type: 'response.output_text.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, text: part.text })}\n\n`)
-              res.write(`event: response.content_part.done\ndata: ${JSON.stringify({ type: 'response.content_part.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part })}\n\n`)
+              res.write(
+                `event: response.output_text.done\ndata: ${JSON.stringify({ type: 'response.output_text.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, text: part.text })}\n\n`
+              )
+              res.write(
+                `event: response.content_part.done\ndata: ${JSON.stringify({ type: 'response.content_part.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part })}\n\n`
+              )
             })
           } else {
             if (item.arguments) {
-              res.write(`event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: item.id, output_index: outputIndex, delta: item.arguments })}\n\n`)
+              res.write(
+                `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: item.id, output_index: outputIndex, delta: item.arguments })}\n\n`
+              )
             }
-            res.write(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.done', item_id: item.id, output_index: outputIndex, arguments: item.arguments })}\n\n`)
+            res.write(
+              `event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.done', item_id: item.id, output_index: outputIndex, arguments: item.arguments })}\n\n`
+            )
           }
           this.throwIfResponseClosed(res, signal)
-          res.write(`event: response.output_item.done\ndata: ${JSON.stringify({ type: 'response.output_item.done', output_index: outputIndex, item })}\n\n`)
+          res.write(
+            `event: response.output_item.done\ndata: ${JSON.stringify({ type: 'response.output_item.done', output_index: outputIndex, item })}\n\n`
+          )
         })
         this.throwIfResponseClosed(res, signal)
-        res.write(`event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: streamedResponse })}\n\n`)
+        res.write(
+          `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: streamedResponse })}\n\n`
+        )
         res.end()
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
       }
-      this.recordBedrockUsage({ path: '/v1/responses', model: chatRequest.model, usage: converseUsageToKiro(resp.usage), startTime })
+      this.recordBedrockUsage({
+        path: '/v1/responses',
+        model: chatRequest.model,
+        usage: converseUsageToKiro(resp.usage),
+        startTime
+      })
     } catch (error) {
       if (this.isAbortError(error, signal)) return
       this.recordRequestFailed()
       const message = error instanceof Error ? error.message : 'Bedrock request failed'
       if (!res.headersSent) this.sendError(res, 502, this.sanitizeErrorMessage(message))
       else res.end()
-      this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 502, error: message })
-      this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: 'bedrock', responseTime: Date.now() - startTime, success: false, error: message })
+      this.events.onResponse?.({
+        path: '/v1/responses',
+        model: chatRequest.model,
+        status: 502,
+        error: message
+      })
+      this.recordRequest({
+        path: '/v1/responses',
+        model: chatRequest.model,
+        accountId: 'bedrock',
+        responseTime: Date.now() - startTime,
+        success: false,
+        error: message
+      })
     }
   }
 
@@ -5774,20 +8643,30 @@ export class ProxyServer {
    * with ACTIVE cross-region inference profiles (Claude Opus/Sonnet, etc).
    * When bedrock.models is set, only those ids are exposed.
    */
-  async listBedrockClientModels(signal?: AbortSignal): Promise<Array<{ id: string; object: 'model'; created: number; owned_by: string }>> {
+  async listBedrockClientModels(
+    signal?: AbortSignal
+  ): Promise<Array<{ id: string; object: 'model'; created: number; owned_by: string }>> {
     if (!isBedrockConfigured(this.config.bedrock)) return []
     let available
     try {
       available = await listBedrockAvailableModels(this.config.bedrock!, signal)
     } catch (error) {
-      console.error('[ProxyServer] Bedrock model list failed:', error instanceof Error ? error.message : error)
+      console.error(
+        '[ProxyServer] Bedrock model list failed:',
+        error instanceof Error ? error.message : error
+      )
       return []
     }
     const created = Math.floor(Date.now() / 1000)
     const configured = this.config.bedrock?.models
     return available
       .filter((m) => !configured || configured.length === 0 || configured.includes(m.id))
-      .map((m) => ({ id: m.id, object: 'model' as const, created, owned_by: m.provider || 'bedrock' }))
+      .map((m) => ({
+        id: m.id,
+        object: 'model' as const,
+        created,
+        owned_by: m.provider || 'bedrock'
+      }))
   }
 
   // Phase 13: Skills system handler
@@ -5814,6 +8693,12 @@ export class ProxyServer {
         this.sendError(res, 400, 'Missing id parameter')
         return
       }
+      // 路径穿越防护：URLSearchParams 会把 %2F 解码成 /，而 getSkillContent 直接
+      // path.join(dir, skillId, 'SKILL.md')，没有做目录包含校验
+      if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+        this.sendError(res, 400, 'Invalid skill id')
+        return
+      }
       const content = this.skillsManager.getSkillContent(id)
       if (!content) {
         this.sendError(res, 404, `Skill not found: ${id}`)
@@ -5827,6 +8712,11 @@ export class ProxyServer {
     // Direct skill access: /skills/:id/SKILL.md
     const match = urlPath.match(/^\/skills\/([^/]+)\/SKILL\.md$/)
     if (match) {
+      // 同一个 sink 的路径穿越防护：[^/]+ 仍然允许 ".." 这种段
+      if (!/^[A-Za-z0-9_-]+$/.test(match[1])) {
+        this.sendError(res, 400, 'Invalid skill id')
+        return
+      }
       const content = this.skillsManager.getSkillContent(match[1])
       if (!content) {
         this.sendError(res, 404, `Skill not found: ${match[1]}`)
@@ -5840,14 +8730,25 @@ export class ProxyServer {
     this.sendError(res, 404, 'Skills endpoint not found')
   }
 
-  // Phase 11 + 15: Image generation endpoint (ChatGPT OAuth free + Bedrock paid)
+  // Phase 11 + 15: Image generation endpoint (ChatGPT OAuth + Bedrock)
   private async handleImageGeneration(
     req: http.IncomingMessage,
     res: http.ServerResponse,
     signal?: AbortSignal
   ): Promise<void> {
     const bodyStr = await this.readBody(req, signal)
-    let request: { prompt: string; model?: string; n?: number; size?: string; quality?: string; style?: string; response_format?: 'url' | 'b64_json'; negative_prompt?: string; cfg_scale?: number; seed?: number }
+    let request: {
+      prompt: string
+      model?: string
+      n?: number
+      size?: string
+      quality?: string
+      style?: string
+      response_format?: 'url' | 'b64_json'
+      negative_prompt?: string
+      cfg_scale?: number
+      seed?: number
+    }
     try {
       request = JSON.parse(bodyStr)
     } catch {
@@ -5861,11 +8762,18 @@ export class ProxyServer {
     }
 
     const protocol = this.isHttps ? 'https' : 'http'
-    const serverBaseUrl = `${protocol}://${this.config.host || '127.0.0.1'}:${this.config.port}`
+    const configuredHost = this.config.host || '127.0.0.1'
+    const imageHost =
+      configuredHost === '0.0.0.0' || configuredHost === '::' ? '127.0.0.1' : configuredHost
+    const serverBaseUrl = `${protocol}://${imageHost}:${this.config.port}`
+    const startTime = Date.now()
+    let usageAccount: Pick<ChatGPTAccountState, 'id' | 'email'> | undefined
 
     try {
-      const startTime = Date.now()
-      let result: { created: number; data: Array<{ url?: string; b64_json?: string; revised_prompt?: string }> }
+      let result: {
+        created: number
+        data: Array<{ url?: string; b64_json?: string; revised_prompt?: string }>
+      }
 
       // Route: Bedrock models → Bedrock, everything else → ChatGPT OAuth
       if (isBedrockImageModel(request.model) && this.config.bedrock?.enabled) {
@@ -5877,9 +8785,9 @@ export class ProxyServer {
           signal
         )
       } else {
-        // ChatGPT OAuth path (free)
-        const account = this.pickChatGPTImageAccount()
-        if (!account?.chatgpt) {
+        // ChatGPT OAuth path
+        const accounts = this.getChatGPTImageAccounts()
+        if (!accounts.length) {
           // Fallback to Bedrock if available
           if (this.config.bedrock?.enabled) {
             result = await generateImage(
@@ -5890,52 +8798,120 @@ export class ProxyServer {
               signal
             )
           } else {
-            this.sendError(res, 503, 'No ChatGPT accounts available for image generation. Please login via Krouter UI (Settings > ChatGPT Login).')
+            const message =
+              'No ChatGPT accounts available for image generation. Connect ChatGPT in Routing Control Room > ChatGPT OAuth.'
+            this.events.onResponse?.({
+              path: '/v1/images/generations',
+              model: request.model || 'gpt-image-2',
+              status: 503,
+              responseTime: Date.now() - startTime,
+              error: message
+            })
+            this.sendError(res, 503, message)
             return
           }
         } else {
-          result = await generateChatGPTImage(
-            account.chatgpt,
-            request,
-            this.chatgptImageConfig,
-            this.imageStorage,
-            serverBaseUrl,
-            signal
-          )
+          let lastError: Error | undefined
+          let generated: typeof result | undefined
+          for (const candidate of accounts) {
+            try {
+              const account = await this.ensureChatGPTToken(candidate)
+              generated = await generateChatGPTImage(
+                account,
+                request,
+                this.chatgptImageConfig,
+                this.imageStorage,
+                serverBaseUrl,
+                signal
+              )
+              account.lastError = undefined
+              account.updatedAt = Date.now()
+              this.persistChatGPTAccounts()
+              usageAccount = { id: account.id, email: account.email }
+              break
+            } catch (error) {
+              if (this.isAbortError(error, signal)) throw error
+              lastError = error instanceof Error ? error : new Error(String(error))
+              candidate.lastError = this.sanitizeOAuthError(lastError)
+              candidate.updatedAt = Date.now()
+              this.persistChatGPTAccounts()
+              const status = error instanceof ChatGPTImageApiError ? error.status : 503
+              if (![401, 403, 408, 409, 429].includes(status) && status < 500) break
+            }
+          }
+          if (generated) {
+            result = generated
+          } else if (this.config.bedrock?.enabled) {
+            result = await generateImage(
+              this.config.bedrock,
+              request,
+              this.imageStorage,
+              serverBaseUrl,
+              signal
+            )
+          } else {
+            throw lastError || new Error('All ChatGPT accounts failed image generation')
+          }
         }
       }
 
       const elapsed = Date.now() - startTime
       endpointMetrics.record({ path: '/v1/images/generations', status: 200, responseTime: elapsed })
+      this.events.onResponse?.({
+        path: '/v1/images/generations',
+        model: request.model || 'gpt-image-2',
+        status: 200,
+        responseTime: elapsed,
+        accountId: usageAccount?.id,
+        accountEmail: usageAccount?.email
+      })
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result))
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      const status =
+        error instanceof BedrockImageApiError || error instanceof ChatGPTImageApiError
+          ? error.status
+          : 500
       proxyLogger.error('ProxyServer', `Image generation failed: ${message}`)
-      endpointMetrics.record({ path: '/v1/images/generations', status: 500, errorCategory: 'server_error' })
-      this.sendError(res, 500, message)
+      endpointMetrics.record({
+        path: '/v1/images/generations',
+        status,
+        errorCategory: categorizeError(status, message)
+      })
+      this.events.onResponse?.({
+        path: '/v1/images/generations',
+        model: request.model || 'gpt-image-2',
+        status,
+        responseTime: Date.now() - startTime,
+        accountId: usageAccount?.id,
+        accountEmail: usageAccount?.email,
+        error: message
+      })
+      if (status === 429) res.setHeader('Retry-After', '30')
+      this.sendError(res, status, message)
     }
   }
 
-  /** Phase 15: Pick best account with valid ChatGPT token for image generation */
-  private pickChatGPTImageAccount(): ProxyAccount | null {
-    const accounts = this.accountPool.getAccounts().filter(acc =>
-      acc.chatgpt &&
-      acc.chatgpt.accessToken &&
-      acc.chatgpt.consecutiveFailures < 5 &&
-      (!acc.chatgpt.imageQuota || acc.chatgpt.imageQuota.used < acc.chatgpt.imageQuota.limit)
-    )
-
-    if (accounts.length === 0) return null
-
-    // Prefer account with lowest quota usage
-    accounts.sort((a, b) => {
-      const aUsed = a.chatgpt?.imageQuota?.used ?? 0
-      const bUsed = b.chatgpt?.imageQuota?.used ?? 0
-      return aUsed - bUsed
-    })
-
-    return accounts[0]
+  /** Phase 15: Keep image requests away from exhausted accounts and rotate on account-specific failures. */
+  private getChatGPTImageAccounts(): ChatGPTAccountState[] {
+    return this.getChatGPTAccounts()
+      .filter(
+        (account) =>
+          account.accessToken &&
+          account.refreshToken &&
+          account.consecutiveFailures < 5 &&
+          this.chatGPTQuotaAvailable(account) &&
+          (!account.imageQuota || account.imageQuota.used < account.imageQuota.limit)
+      )
+      .sort(
+        (a, b) =>
+          a.consecutiveFailures - b.consecutiveFailures ||
+          (a.imageQuota?.used || 0) / Math.max(1, a.imageQuota?.limit || 1) -
+            (b.imageQuota?.used || 0) / Math.max(1, b.imageQuota?.limit || 1) ||
+          (a.lastImageGenAt || 0) - (b.lastImageGenAt || 0) ||
+          a.updatedAt - b.updatedAt
+      )
   }
 
   // Phase 11: Serve generated images
@@ -5959,6 +8935,297 @@ export class ProxyServer {
     res.end(data)
   }
 
+  private getChatGPTAccounts(): ChatGPTAccountState[] {
+    if (!Array.isArray(this.config.chatgptAccounts)) this.config.chatgptAccounts = []
+    return this.config.chatgptAccounts
+  }
+
+  private persistChatGPTAccounts(): void {
+    // KHÔNG clone lại mảng ở đây. Trước đây dòng này thay this.config.chatgptAccounts bằng
+    // bản sao mới, nên mọi tham chiếu account đang được giữ bởi caller (ví dụ
+    // requestChatGPTWithFallback persist rồi mới `return { account }`) lập tức trở thành
+    // mồ côi: recordChatGPTCodexUsage ghi số liệu vào object không còn nằm trong config,
+    // và refresh token vừa xoay của account thứ 2 trở đi bị bản persist kế tiếp nuốt mất.
+    // Cả hai consumer của onConfigChanged đều serialize config nên không cần snapshot.
+    this.getChatGPTAccounts()
+    this.events.onConfigChanged?.(this.config)
+  }
+
+  private upsertChatGPTAccount(tokens: ChatGPTTokenSet): ChatGPTAccountState {
+    const accounts = this.getChatGPTAccounts()
+    const emailKey = tokens.email?.trim().toLowerCase()
+    const existing = tokens.accountId
+      ? accounts.find((account) => account.accountId === tokens.accountId)
+      : emailKey
+        ? accounts.find((account) => account.email?.trim().toLowerCase() === emailKey)
+        : undefined
+    const now = Date.now()
+    const account: ChatGPTAccountState = existing || {
+      id: crypto.randomUUID(),
+      accessToken: '',
+      refreshToken: '',
+      expiresAt: 0,
+      consecutiveFailures: 0,
+      createdAt: now,
+      updatedAt: now
+    }
+    Object.assign(account, tokens, { consecutiveFailures: 0, updatedAt: now })
+    if (!existing) accounts.push(account)
+    this.persistChatGPTAccounts()
+    return account
+  }
+
+  private sanitizeOAuthError(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error)
+    return message
+      .replace(
+        /(access_token|refresh_token|id_token|authorization)\s*[=:]\s*[^\s,;}]+/gi,
+        '$1=[redacted]'
+      )
+      .replace(/bearer\s+[^\s,;}]+/gi, 'Bearer [redacted]')
+      .slice(0, 500)
+  }
+
+  public getChatGPTOAuthStatus(): {
+    enabled: boolean
+    experimental: boolean
+    catalogVersion: string
+    reasoningEffort: string
+    reasoningEfforts: string[]
+    models: Array<{
+      id: string
+      name: string
+      capabilities: string[]
+      thinkingEfforts: string[]
+      availability: 'unverified' | 'available' | 'unavailable'
+      availableAccounts: number
+    }>
+    accounts: Array<{
+      id: string
+      email?: string
+      plan?: string
+      tokenValid: boolean
+      expiresAt: number
+      imageQuota?: ChatGPTAccountState['imageQuota']
+      quotaWindows?: ChatGPTAccountState['quotaWindows']
+      quotaSyncedAt?: number
+      quotaError?: string
+      modelAvailability?: ChatGPTAccountState['modelAvailability']
+      localUsage?: ChatGPTAccountState['localUsage']
+      lastRefreshAt?: number
+      lastError?: string
+      lastImageGen?: number
+      failures: number
+      createdAt: number
+      updatedAt: number
+    }>
+    totalAccounts: number
+    availableForImageGen: number
+    availableForCodex: number
+    oauthFlowPending: boolean
+    pendingFlow?: { id: string; mode: OAuthFlowMode; startedAt: number; expiresAt: number }
+    lastError?: string
+    lastCompletedAt?: number
+  } {
+    const accounts = this.getChatGPTAccounts().map((account) => ({
+      id: account.id,
+      email: account.email,
+      plan: account.plan,
+      tokenValid: isTokenValid(account, 0),
+      expiresAt: account.expiresAt,
+      imageQuota: account.imageQuota,
+      quotaWindows: account.quotaWindows,
+      quotaSyncedAt: account.quotaSyncedAt,
+      quotaError: account.quotaError,
+      modelAvailability: account.modelAvailability,
+      localUsage: account.localUsage,
+      lastRefreshAt: account.lastRefreshAt,
+      lastError: account.lastError,
+      lastImageGen: account.lastImageGenAt,
+      failures: account.consecutiveFailures,
+      createdAt: account.createdAt,
+      updatedAt: account.updatedAt
+    }))
+    const models = listChatGPTCodexModels(this.chatgptCodexConfig).map((model) => {
+      const states = accounts
+        .map((account) => account.modelAvailability?.[model.id])
+        .filter((state): state is 'unverified' | 'available' | 'unavailable' => Boolean(state))
+      return {
+        id: `chatgpt/${model.id}`,
+        name: model.name,
+        capabilities: model.capabilities,
+        thinkingEfforts: chatGPTCodexThinkingEfforts(model.id),
+        availability: states.includes('available')
+          ? ('available' as const)
+          : states.length > 0 && states.every((state) => state === 'unavailable')
+            ? ('unavailable' as const)
+            : ('unverified' as const),
+        availableAccounts: states.filter((state) => state === 'available').length
+      }
+    })
+    return {
+      enabled: this.chatgptCodexConfig.enabled,
+      experimental: true,
+      catalogVersion: this.chatgptCodexConfig.catalogVersion,
+      reasoningEffort: this.chatgptCodexConfig.reasoningEffort,
+      reasoningEfforts: [...CHATGPT_REASONING_EFFORTS],
+      models,
+      accounts,
+      totalAccounts: accounts.length,
+      availableForImageGen: accounts.filter((account) => account.tokenValid && account.failures < 5)
+        .length,
+      availableForCodex: accounts.filter((account) => account.tokenValid && account.failures < 5)
+        .length,
+      oauthFlowPending: Boolean(this.pendingOAuthFlow),
+      pendingFlow: this.pendingOAuthFlow
+        ? {
+            id: this.pendingOAuthFlow.id,
+            mode: this.pendingOAuthFlow.mode,
+            startedAt: this.pendingOAuthFlow.startedAt,
+            expiresAt: this.pendingOAuthFlow.expiresAt
+          }
+        : undefined,
+      lastError: this.lastChatGPTOAuthError || undefined,
+      lastCompletedAt: this.lastChatGPTOAuthCompletedAt
+    }
+  }
+
+  public async startChatGPTOAuth(mode: OAuthFlowMode = 'local'): Promise<{
+    success: boolean
+    authUrl?: string
+    flowId?: string
+    mode?: OAuthFlowMode
+    expiresAt?: number
+    error?: string
+  }> {
+    if (this.pendingOAuthFlow)
+      return { success: false, error: 'A ChatGPT OAuth flow is already pending' }
+    try {
+      const flow = await initiateOAuthFlow(DEFAULT_CHATGPT_OAUTH_CONFIG, { mode })
+      const pending = {
+        id: flow.flowId,
+        mode: flow.mode,
+        startedAt: Date.now(),
+        expiresAt: flow.expiresAt,
+        submitCallbackUrl: flow.submitCallbackUrl,
+        cancel: flow.cancel
+      }
+      this.pendingOAuthFlow = pending
+      this.lastChatGPTOAuthError = null
+      void flow.waitForCallback
+        .then(({ tokens }) => {
+          const account = this.upsertChatGPTAccount(tokens)
+          this.lastChatGPTOAuthCompletedAt = Date.now()
+          proxyLogger.info('ChatGPTAuth', `OAuth completed for ${account.email || account.id}`)
+          if (this.pendingOAuthFlow?.id === flow.flowId) this.pendingOAuthFlow = null
+        })
+        .catch((error) => {
+          const message = this.sanitizeOAuthError(error)
+          if (message === 'OAuth flow cancelled by user') {
+            this.lastChatGPTOAuthError = null
+            proxyLogger.info('ChatGPTAuth', 'OAuth flow cancelled by user')
+          } else {
+            this.lastChatGPTOAuthError = message
+            proxyLogger.error('ChatGPTAuth', `OAuth flow failed: ${message}`)
+          }
+          if (this.pendingOAuthFlow?.id === flow.flowId) this.pendingOAuthFlow = null
+        })
+      return {
+        success: true,
+        authUrl: flow.authUrl,
+        flowId: flow.flowId,
+        mode: flow.mode,
+        expiresAt: flow.expiresAt
+      }
+    } catch (error) {
+      const message = this.sanitizeOAuthError(error)
+      this.lastChatGPTOAuthError = message
+      return { success: false, error: message }
+    }
+  }
+
+  public async submitChatGPTOAuthCallback(
+    callbackUrl: string
+  ): Promise<{ success: boolean; error?: string }> {
+    const pending = this.pendingOAuthFlow
+    if (!pending || pending.mode !== 'manual' || !pending.submitCallbackUrl) {
+      return { success: false, error: 'No manual ChatGPT OAuth flow is pending' }
+    }
+    try {
+      await pending.submitCallbackUrl(callbackUrl)
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: this.sanitizeOAuthError(error) }
+    }
+  }
+
+  public async refreshChatGPTCodexState(
+    accountId?: string
+  ): Promise<{ success: boolean; refreshed: number; errors: number; error?: string }> {
+    const targets = this.getChatGPTAccounts().filter(
+      (account) => !accountId || account.id === accountId
+    )
+    if (!targets.length)
+      return { success: false, refreshed: 0, errors: 0, error: 'ChatGPT account not found' }
+    let refreshed = 0
+    let errors = 0
+    for (const account of targets) {
+      try {
+        let current = await this.ensureChatGPTToken(account)
+        let quotaWindows
+        try {
+          quotaWindows = await fetchChatGPTUsage(current, this.chatgptCodexConfig)
+        } catch (error) {
+          if (!(error instanceof ChatGPTCodexApiError) || error.status !== 401) throw error
+          current = await this.ensureChatGPTToken(account, true)
+          quotaWindows = await fetchChatGPTUsage(current, this.chatgptCodexConfig)
+        }
+        if (!quotaWindows.length) {
+          throw new Error('ChatGPT usage response did not include any supported quota windows')
+        }
+        current.quotaWindows = quotaWindows
+        current.quotaSyncedAt = Date.now()
+        current.quotaError = undefined
+        current.updatedAt = Date.now()
+        refreshed += 1
+      } catch (error) {
+        account.quotaError = this.sanitizeOAuthError(error)
+        account.updatedAt = Date.now()
+        errors += 1
+      }
+    }
+    this.persistChatGPTAccounts()
+    return {
+      success: errors === 0,
+      refreshed,
+      errors,
+      ...(errors ? { error: 'One or more ChatGPT accounts could not be refreshed' } : {})
+    }
+  }
+
+  public cancelChatGPTOAuth(): { success: boolean; error?: string } {
+    if (!this.pendingOAuthFlow) return { success: false, error: 'No ChatGPT OAuth flow is pending' }
+    const pending = this.pendingOAuthFlow
+    this.pendingOAuthFlow = null
+    pending.cancel('OAuth flow cancelled by user')
+    return { success: true }
+  }
+
+  public logoutChatGPTAccount(accountId?: string): {
+    success: boolean
+    accountId?: string
+    error?: string
+  } {
+    const accounts = this.getChatGPTAccounts()
+    const index = accountId ? accounts.findIndex((account) => account.id === accountId) : 0
+    if (index < 0 || accounts.length === 0)
+      return { success: false, error: 'ChatGPT account not found' }
+    const [removed] = accounts.splice(index, 1)
+    this.persistChatGPTAccounts()
+    proxyLogger.info('ChatGPTAuth', `Disconnected ChatGPT account ${removed.email || removed.id}`)
+    return { success: true, accountId: removed.id }
+  }
+
   // Phase 15: ChatGPT OAuth login/callback/status endpoints
   private async handleChatGPTAuth(
     req: http.IncomingMessage,
@@ -5968,98 +9235,82 @@ export class ProxyServer {
     const method = (req.method || 'GET').toUpperCase()
 
     if (path === '/auth/chatgpt/login' && method === 'POST') {
-      // Initiate OAuth flow — returns authorization URL for client to open
-      try {
-        const oauthConfig = { ...DEFAULT_CHATGPT_OAUTH_CONFIG }
-        if (this.config.chatgptImage?.enabled === false) {
-          this.sendError(res, 503, 'ChatGPT image generation is disabled')
-          return
-        }
-
-        const { authUrl, waitForCallback } = await initiateOAuthFlow(oauthConfig)
-
-        // Store pending flow — will resolve when user completes OAuth
-        this.pendingOAuthFlow = waitForCallback.then(async ({ tokens }) => {
-          // Find first account without chatgpt tokens, or the primary account
-          const accounts = this.accountPool.getAccounts()
-          const targetAccount = accounts.find(a => !a.chatgpt) || accounts[0]
-          if (targetAccount) {
-            this.accountPool.updateAccount(targetAccount.id, {
-              chatgpt: {
-                accessToken: tokens.accessToken,
-                refreshToken: tokens.refreshToken,
-                expiresAt: tokens.expiresAt,
-                email: tokens.email,
-                consecutiveFailures: 0,
-              }
-            })
-            proxyLogger.info('ChatGPTAuth', `OAuth completed for ${tokens.email || 'unknown'}, stored on account ${targetAccount.id}`)
-          }
-          this.pendingOAuthFlow = null
-          return tokens
-        }).catch(err => {
-          proxyLogger.error('ChatGPTAuth', `OAuth flow failed: ${(err as Error).message}`)
-          this.pendingOAuthFlow = null
-          throw err
-        })
-
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ authUrl, message: 'Open this URL in your browser to login' }))
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        this.sendError(res, 500, message)
+      const result = await this.startChatGPTOAuth('manual')
+      if (!result.success) {
+        this.sendError(
+          res,
+          result.error?.includes('already pending') ? 409 : 500,
+          result.error || 'Failed to start ChatGPT OAuth'
+        )
+        return
       }
-    } else if (path === '/auth/chatgpt/callback') {
-      // OAuth callback — handled by the callback server in chatgptOAuth.ts
-      // This route only catches misrouted callbacks
-      res.writeHead(200, { 'Content-Type': 'text/html' })
-      res.end('<html><body><h2>OAuth callback received</h2><p>You can close this window.</p></body></html>')
-    } else if (path === '/auth/chatgpt/status' && method === 'GET') {
-      // Return status of all ChatGPT-linked accounts
-      const accounts = this.accountPool.getAccounts()
-        .filter(a => a.chatgpt)
-        .map(a => ({
-          accountId: a.id,
-          email: a.chatgpt!.email,
-          plan: a.chatgpt!.plan,
-          tokenValid: a.chatgpt!.expiresAt > Date.now(),
-          imageQuota: a.chatgpt!.imageQuota,
-          lastImageGen: a.chatgpt!.lastImageGenAt,
-          failures: a.chatgpt!.consecutiveFailures,
-        }))
-
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+      res.end(JSON.stringify(result))
+    } else if (path === '/auth/chatgpt/cancel' && method === 'POST') {
+      const result = this.cancelChatGPTOAuth()
+      if (!result.success) {
+        this.sendError(res, 409, result.error || 'No OAuth flow is pending')
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({
-        accounts,
-        totalAccounts: accounts.length,
-        availableForImageGen: accounts.filter(a => a.tokenValid && a.failures < 5).length,
-        oauthFlowPending: !!this.pendingOAuthFlow,
-      }))
+      res.end(JSON.stringify(result))
+    } else if (path === '/auth/chatgpt/callback' && method === 'POST') {
+      // OAuth callback — handled by the callback server in chatgptOAuth.ts
+      // VPS mode accepts the browser's localhost callback URL as data.
+      const bodyStr = await this.readBody(req)
+      let body: { callbackUrl?: string } = {}
+      try {
+        body = JSON.parse(bodyStr)
+      } catch {
+        this.sendError(res, 400, 'Invalid JSON body')
+        return
+      }
+      if (!body.callbackUrl || typeof body.callbackUrl !== 'string') {
+        this.sendError(res, 400, 'Required field: callbackUrl')
+        return
+      }
+      const result = await this.submitChatGPTOAuthCallback(body.callbackUrl)
+      if (!result.success) {
+        this.sendError(res, 400, result.error || 'OAuth callback was rejected')
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+      res.end(JSON.stringify({ success: true }))
+    } else if (path === '/auth/chatgpt/status' && method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+      res.end(JSON.stringify(this.getChatGPTOAuthStatus()))
     } else if (path === '/auth/chatgpt/logout' && method === 'POST') {
       // Remove ChatGPT tokens from an account
       const bodyStr = await this.readBody(req)
       let body: { accountId?: string } = {}
-      try { body = JSON.parse(bodyStr) } catch { /* empty */ }
-
-      const accounts = this.accountPool.getAccounts().filter(a => a.chatgpt)
-      const target = body.accountId
-        ? accounts.find(a => a.id === body.accountId)
-        : accounts[0]
-
-      if (target) {
-        this.accountPool.updateAccount(target.id, { chatgpt: undefined } as any)
-        proxyLogger.info('ChatGPTAuth', `Logged out ChatGPT from account ${target.id}`)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ success: true, accountId: target.id }))
-      } else {
-        this.sendError(res, 404, 'No ChatGPT account found to logout')
+      try {
+        body = JSON.parse(bodyStr)
+      } catch {
+        /* empty */
       }
+
+      const result = this.logoutChatGPTAccount(body.accountId)
+      if (!result.success) {
+        this.sendError(res, 404, result.error || 'ChatGPT account not found')
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(result))
     } else if (path === '/auth/chatgpt/token' && method === 'POST') {
       // Manual token injection — for headless/VPS environments without browser
       // User can paste access_token + refresh_token directly
       const bodyStr = await this.readBody(req)
-      let body: { access_token?: string; refresh_token?: string; email?: string } = {}
-      try { body = JSON.parse(bodyStr) } catch {
+      let body: {
+        access_token?: string
+        refresh_token?: string
+        email?: string
+        plan?: string
+        account_id?: string
+        is_fedramp?: boolean
+      } = {}
+      try {
+        body = JSON.parse(bodyStr)
+      } catch {
         this.sendError(res, 400, 'Invalid JSON body')
         return
       }
@@ -6069,32 +9320,45 @@ export class ProxyServer {
         return
       }
 
-      const accounts = this.accountPool.getAccounts()
-      const targetAccount = accounts.find(a => !a.chatgpt) || accounts[0]
-
-      if (!targetAccount) {
-        this.sendError(res, 503, 'No accounts in pool to attach ChatGPT tokens')
-        return
-      }
-
-      this.accountPool.updateAccount(targetAccount.id, {
-        chatgpt: {
-          accessToken: body.access_token,
-          refreshToken: body.refresh_token,
-          expiresAt: Date.now() + 14 * 24 * 3600_000, // ~2 weeks default
-          email: body.email,
-          consecutiveFailures: 0,
-        }
+      const targetAccount = this.upsertChatGPTAccount({
+        accessToken: body.access_token,
+        refreshToken: body.refresh_token,
+        expiresAt: Date.now() + 3600_000,
+        email: body.email,
+        plan: body.plan,
+        accountId: body.account_id,
+        isFedRAMP: body.is_fedramp
       })
 
-      proxyLogger.info('ChatGPTAuth', `Manual token injected for ${body.email || 'unknown'} on account ${targetAccount.id}`)
+      proxyLogger.info(
+        'ChatGPTAuth',
+        `Manual token injected for ${body.email || 'unknown'} on account ${targetAccount.id}`
+      )
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({
-        success: true,
-        accountId: targetAccount.id,
-        email: body.email,
-        message: 'Token stored. You can now use /v1/images/generations'
-      }))
+      res.end(
+        JSON.stringify({
+          success: true,
+          accountId: targetAccount.id,
+          email: body.email,
+          message:
+            'Token stored. ChatGPT/Codex routes are ready when the experimental provider is enabled.'
+        })
+      )
+    } else if (path === '/auth/chatgpt/refresh' && method === 'POST') {
+      const bodyStr = await this.readBody(req)
+      let body: { accountId?: string } = {}
+      try {
+        body = JSON.parse(bodyStr || '{}')
+      } catch {
+        this.sendError(res, 400, 'Invalid JSON body')
+        return
+      }
+      const result = await this.refreshChatGPTCodexState(body.accountId)
+      res.writeHead(result.success ? 200 : 207, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store'
+      })
+      res.end(JSON.stringify(result))
     } else {
       this.sendError(res, 404, 'Unknown auth endpoint')
     }

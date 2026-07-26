@@ -20,23 +20,30 @@ interface SkillFrontmatter {
 }
 
 function parseFrontmatter(content: string): { frontmatter: SkillFrontmatter; body: string } {
-  const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/)
-  if (!match) return { frontmatter: {}, body: content }
+  const normalized = content.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n')
+  if (!normalized.startsWith('---\n')) return { frontmatter: {}, body: content }
+  const end = normalized.indexOf('\n---\n', 4)
+  if (end === -1) return { frontmatter: {}, body: content }
 
   const frontmatter: SkillFrontmatter = {}
-  for (const line of match[1].split('\n')) {
+  const frontmatterBlock = normalized.slice(4, end)
+  const body = normalized.slice(end + 5)
+  for (const line of frontmatterBlock.split('\n')) {
     const kv = line.match(/^(\w+):\s*(.+)$/)
     if (kv) {
       const key = kv[1] as keyof SkillFrontmatter
       const val = kv[2].trim()
       if (key === 'tags') {
-        frontmatter.tags = val.replace(/[\[\]]/g, '').split(',').map(t => t.trim())
+        frontmatter.tags = val
+          .replace(/[[\]]/g, '')
+          .split(',')
+          .map((t) => t.trim())
       } else {
-        (frontmatter as Record<string, string>)[key] = val
+        ;(frontmatter as Record<string, string>)[key] = val
       }
     }
   }
-  return { frontmatter, body: match[2] }
+  return { frontmatter, body }
 }
 
 export class SkillsManager {

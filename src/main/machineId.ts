@@ -232,7 +232,7 @@ export async function requestAdminRestart(): Promise<boolean> {
         const psPath = findPowerShell()
         if (psPath) {
           const escapedAppPath = appPath.replace(/\\/g, '\\\\')
-          const command = `"${psPath}" -NoProfile -Command "Start-Process -FilePath \"${escapedAppPath}\" -Verb RunAs"`
+          const command = `"${psPath}" -NoProfile -Command "Start-Process -FilePath "${escapedAppPath}" -Verb RunAs"`
           console.log('[MachineId] Running command:', command)
 
           exec(command, { windowsHide: true }, (error) => {
@@ -244,7 +244,9 @@ export async function requestAdminRestart(): Promise<boolean> {
           // PowerShell 不可用时回退到 ShellExecute runas
           console.log('[MachineId] PowerShell not found, using electron shell openPath with runas')
           const { shell } = await import('electron')
-          shell.openExternal(`file:///${appPath}`)
+          void shell.openExternal(`file:///${appPath}`).catch((error) => {
+            console.error('[MachineId] Không khởi chạy lại được ứng dụng:', error)
+          })
         }
 
         // 延迟退出，确保命令有时间执行

@@ -154,7 +154,11 @@ export async function openProtonLogin(
     const loggedIn = await checkLoggedIn(w)
     return { success: true, loggedIn }
   } catch (err) {
-    return { success: false, loggedIn: false, error: err instanceof Error ? err.message : String(err) }
+    return {
+      success: false,
+      loggedIn: false,
+      error: err instanceof Error ? err.message : String(err)
+    }
   }
 }
 
@@ -173,6 +177,29 @@ export async function getProtonLoginStatus(proxy?: string): Promise<{ loggedIn: 
 export function closeProtonWindow(): void {
   if (win && !win.isDestroyed()) win.destroy()
   win = null
+}
+
+/**
+ * Số lượt lấy OTP đang chạy. Cửa sổ Proton là singleton cấp module, nên nếu một registrar
+ * kết thúc và đóng cửa sổ ngay trong khi registrar khác vẫn đang poll thì lượt kia sẽ chết.
+ */
+let activeOtpWaits = 0
+let closeAfterIdle = false
+
+/**
+ * Yêu cầu đóng cửa sổ Proton khi không còn lượt lấy OTP nào đang chạy.
+ * Dùng từ đường dọn dẹp của registrar: cửa sổ ẩn (show:false, backgroundThrottling:false)
+ * không bao giờ tự đóng, nên nếu để lại thì 'window-all-closed' không bao giờ kích hoạt,
+ * app.quit() không được gọi và Krouter thành tiến trình ma chỉ tắt được bằng Task Manager
+ * (đồng thời single-instance lock chặn luôn việc mở lại).
+ */
+export function releaseProtonWindow(): void {
+  if (activeOtpWaits > 0) {
+    closeAfterIdle = true
+    return
+  }
+  closeAfterIdle = false
+  closeProtonWindow()
 }
 
 // ===== 取码 =====
@@ -323,10 +350,20 @@ interface WaitProtonOtpOptions {
 let otpQueue: Promise<unknown> = Promise.resolve()
 
 export function waitProtonOtp(address: string, opts: WaitProtonOtpOptions): Promise<string> {
-  const run = otpQueue.then(
-    () => runWaitProtonOtp(address, opts),
-    () => runWaitProtonOtp(address, opts)
-  )
+  const guarded = async (): Promise<string> => {
+    activeOtpWaits++
+    try {
+      return await runWaitProtonOtp(address, opts)
+    } finally {
+      activeOtpWaits--
+      // Registrar đã yêu cầu đóng trong lúc đang lấy mã → giờ mới thực sự đóng được
+      if (activeOtpWaits === 0 && closeAfterIdle) {
+        closeAfterIdle = false
+        closeProtonWindow()
+      }
+    }
+  }
+  const run = otpQueue.then(guarded, guarded)
   // 保持队列链不被某次 reject 中断
   otpQueue = run.catch(() => undefined)
   return run
@@ -366,9 +403,13 @@ async function runWaitProtonOtp(address: string, opts: WaitProtonOtpOptions): Pr
         log(`[Proton] 验证码: ${res.code} (${res.matched ? '收件人精确匹配' : '正文去点兜底匹配'})`)
         return res.code
       } else if (res && res.from === 'wrong-recipient') {
-        if (attempt % 8 === 0) log(`[Proton] 最新邮件收件人非当前地址，等待当前验证码... ${res.snippet || ''}`)
+        if (attempt % 8 === 0)
+          log(`[Proton] 最新邮件收件人非当前地址，等待当前验证码... ${res.snippet || ''}`)
       } else if (res && res.from === 'body-nocode') {
-        if (attempt % 8 === 0) log(`[Proton] ${res.matched ? '已打开当前邮件但未提取到码' : '暂无匹配邮件'}: ${res.snippet || ''}`)
+        if (attempt % 8 === 0)
+          log(
+            `[Proton] ${res.matched ? '已打开当前邮件但未提取到码' : '暂无匹配邮件'}: ${res.snippet || ''}`
+          )
       } else if (res && res.from === 'error') {
         if (attempt % 10 === 0) log(`[Proton] 取码脚本异常: ${res.err}`)
       }

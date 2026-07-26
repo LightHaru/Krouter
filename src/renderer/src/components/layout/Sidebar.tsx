@@ -1,42 +1,71 @@
 import { useEffect, useState } from 'react'
-import { Home, Users, Settings, Info, ChevronRight, Fingerprint, Sparkles, Server, Shield, Zap, UserPlus, CreditCard, ScrollText, Network, Bell, Stethoscope, BookOpen, Wand2 } from 'lucide-react'
-import { motion, AnimatePresence } from 'framer-motion'
+import {
+  Activity, BarChart3, Bell, BookOpen, ChevronLeft, CreditCard, Fingerprint, Home, Info,
+  Network, ScrollText, Server, Settings, Shield, Sparkles, Stethoscope, UserPlus,
+  Users, Wand2, Zap
+} from 'lucide-react'
+import { motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
-import krouterLogoSmall from '@/assets/krouter-mark.svg'
+import krouterMark from '@/assets/krouter-mark.svg'
 import { APP_NAME } from '@/brand'
 import { useTranslation } from '@/hooks/useTranslation'
 
-export type PageType = 'home' | 'accounts' | 'machineId' | 'kiroSettings' | 'proxy' | 'kproxy' | 'mitm' | 'proxyPool' | 'register' | 'subscription' | 'webhooks' | 'diagnose' | 'configSync' | 'skills' | 'logs' | 'docs' | 'settings' | 'about'
+export type PageType = 'home' | 'accounts' | 'machineId' | 'kiroSettings' | 'proxy' | 'usage' | 'kproxy' | 'mitm' | 'proxyPool' | 'register' | 'subscription' | 'webhooks' | 'diagnose' | 'configSync' | 'skills' | 'logs' | 'docs' | 'settings' | 'about'
 
 interface SidebarProps {
   currentPage: PageType
   onPageChange: (page: PageType) => void
   collapsed: boolean
   onToggleCollapse: () => void
-  /** 'static' = desktop cột cố định (có collapse); 'drawer' = mobile trượt (luôn full). */
   variant?: 'static' | 'drawer'
-  /** Gọi sau khi chọn trang — drawer dùng để tự đóng. */
   onNavigate?: () => void
 }
 
-const menuItemsConfig: { id: PageType; labelKey: string; icon: React.ElementType }[] = [
-  { id: 'home', labelKey: 'nav.home', icon: Home },
-  { id: 'accounts', labelKey: 'nav.accounts', icon: Users },
-  { id: 'machineId', labelKey: 'nav.machineId', icon: Fingerprint },
-  { id: 'kiroSettings', labelKey: 'nav.kiroSettings', icon: Sparkles },
-  { id: 'proxy', labelKey: 'nav.proxy', icon: Server },
-  { id: 'kproxy', labelKey: 'nav.kproxy', icon: Shield },
-  { id: 'mitm', labelKey: 'nav.mitm', icon: Zap },
-  { id: 'proxyPool', labelKey: 'nav.proxyPool', icon: Network },
-  { id: 'register', labelKey: 'nav.register', icon: UserPlus },
-  { id: 'subscription', labelKey: 'nav.subscription', icon: CreditCard },
-  { id: 'webhooks', labelKey: 'nav.webhooks', icon: Bell },
-  { id: 'diagnose', labelKey: 'nav.diagnose', icon: Stethoscope },
-  { id: 'skills', labelKey: 'nav.skills', icon: Wand2 },
-  { id: 'logs', labelKey: 'nav.logs', icon: ScrollText },
-  { id: 'docs', labelKey: 'nav.docs', icon: BookOpen },
-  { id: 'settings', labelKey: 'nav.settings', icon: Settings },
-  { id: 'about', labelKey: 'nav.about', icon: Info },
+interface NavItem {
+  id: PageType
+  labelKey: string
+  icon: React.ElementType
+}
+
+const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
+  {
+    label: 'Overview',
+    items: [
+      { id: 'home', labelKey: 'nav.home', icon: Home },
+      { id: 'accounts', labelKey: 'nav.accounts', icon: Users },
+      { id: 'subscription', labelKey: 'nav.subscription', icon: CreditCard }
+    ]
+  },
+  {
+    label: 'Routing',
+    items: [
+      { id: 'proxy', labelKey: 'nav.proxy', icon: Server },
+      { id: 'usage', labelKey: 'nav.usage', icon: BarChart3 },
+      { id: 'kproxy', labelKey: 'nav.kproxy', icon: Shield },
+      { id: 'mitm', labelKey: 'nav.mitm', icon: Zap },
+      { id: 'proxyPool', labelKey: 'nav.proxyPool', icon: Network }
+    ]
+  },
+  {
+    label: 'Automation',
+    items: [
+      { id: 'register', labelKey: 'nav.register', icon: UserPlus },
+      { id: 'kiroSettings', labelKey: 'nav.kiroSettings', icon: Sparkles },
+      { id: 'skills', labelKey: 'nav.skills', icon: Wand2 },
+      { id: 'webhooks', labelKey: 'nav.webhooks', icon: Bell }
+    ]
+  },
+  {
+    label: 'System',
+    items: [
+      { id: 'machineId', labelKey: 'nav.machineId', icon: Fingerprint },
+      { id: 'diagnose', labelKey: 'nav.diagnose', icon: Stethoscope },
+      { id: 'logs', labelKey: 'nav.logs', icon: ScrollText },
+      { id: 'docs', labelKey: 'nav.docs', icon: BookOpen },
+      { id: 'settings', labelKey: 'nav.settings', icon: Settings },
+      { id: 'about', labelKey: 'nav.about', icon: Info }
+    ]
+  }
 ]
 
 export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse, variant = 'static', onNavigate }: SidebarProps): React.ReactNode {
@@ -45,7 +74,6 @@ export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse
   const [isNarrow, setIsNarrow] = useState(false)
 
   useEffect(() => {
-    // Drawer luôn full-width nên không cần theo dõi bề rộng.
     if (isDrawer) return
     const query = window.matchMedia('(max-width: 900px)')
     const update = (): void => setIsNarrow(query.matches)
@@ -54,10 +82,8 @@ export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse
     return () => query.removeEventListener('change', update)
   }, [isDrawer])
 
-  // Drawer: luôn hiển thị đầy đủ label. Static: compact khi collapse hoặc màn hẹp.
   const compact = !isDrawer && (collapsed || isNarrow)
-
-  const handleSelect = (page: PageType): void => {
+  const selectPage = (page: PageType): void => {
     onPageChange(page)
     onNavigate?.()
   }
@@ -65,122 +91,58 @@ export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse
   return (
     <motion.aside
       initial={false}
-      animate={isDrawer ? { width: 264, height: 'auto' } : { width: isNarrow ? 56 : collapsed ? 64 : 224, height: 'auto' }}
-      transition={{ type: 'spring', stiffness: 320, damping: 30 }}
-      className={cn(
-        'glass-sidebar flex h-full min-h-0 shrink-0 flex-col overflow-hidden',
-        isDrawer ? 'w-[264px] rounded-none' : 'rounded-2xl md:rounded-3xl'
-      )}
+      animate={{ width: isDrawer ? 280 : compact ? 76 : 248 }}
+      transition={{ type: 'spring', stiffness: 360, damping: 34 }}
+      className={cn('control-sidebar flex h-full min-h-0 shrink-0 flex-col', isDrawer && 'rounded-none border-y-0 border-l-0')}
     >
-      <div className={cn(
-        'flex h-14 shrink-0 items-center justify-center gap-2 overflow-hidden border-b border-white/10 px-2 dark:border-white/5',
-        !compact && 'px-3'
-      )}>
-        <AnimatePresence mode="wait" initial={false}>
-          {compact ? (
-            <motion.img
-              key="logo-small"
-              src={krouterLogoSmall}
-              alt={APP_NAME}
-              initial={{ opacity: 0, scale: 0.8 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.8 }}
-              transition={{ duration: 0.2 }}
-              className="h-10 w-10 object-contain"
-            />
-          ) : (
-            <motion.div
-              key="logo-full"
-              initial={{ opacity: 0, x: -10 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -10 }}
-              transition={{ duration: 0.2 }}
-              className="flex items-center gap-2"
-            >
-              <img src={krouterLogoSmall} alt={APP_NAME} className="h-7 w-auto shrink-0" />
-              <span className="whitespace-nowrap text-sm font-semibold text-foreground">{APP_NAME}</span>
-            </motion.div>
+      <div className={cn('flex h-[76px] shrink-0 items-center border-b border-border/70', compact ? 'justify-center px-3' : 'px-5')}>
+        <div className="brand-lockup">
+          <div className="brand-mark"><img src={krouterMark} alt="" className="h-8 w-8" /></div>
+          {!compact && (
+            <div className="min-w-0">
+              <div className="text-[15px] font-extrabold tracking-[-0.02em] text-foreground">{APP_NAME}</div>
+              <div className="mt-0.5 text-[9px] font-bold uppercase tracking-[0.22em] text-muted-foreground">Control plane</div>
+            </div>
           )}
-        </AnimatePresence>
+        </div>
       </div>
 
-      <nav className={cn(
-        'min-h-0 flex-1 space-y-1 overflow-y-auto overflow-x-hidden px-1.5 py-2',
-        !compact && 'px-2 py-3'
-      )}>
-        {menuItemsConfig.map((item) => {
-          const Icon = item.icon
-          const isActive = currentPage === item.id
-          const label = t(item.labelKey)
-          return (
-            <button
-              key={item.id}
-              onClick={() => handleSelect(item.id)}
-              className={cn(
-                'group relative flex w-full items-center overflow-hidden rounded-xl text-sm font-medium transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50',
-                isActive
-                  ? 'text-primary-foreground shadow-[0_4px_16px_rgba(91,140,255,0.35)]'
-                  : 'text-muted-foreground hover:bg-white/40 hover:text-foreground dark:hover:bg-white/5',
-                compact ? 'h-10 justify-center p-2.5' : 'gap-3 px-3 py-2.5'
-              )}
-              title={compact ? label : undefined}
-            >
-              {isActive && (
-                <motion.span
-                  layoutId="sidebar-active-pill"
-                  className="absolute inset-0 rounded-xl"
-                  style={{ background: 'linear-gradient(135deg, var(--gradient-from), var(--gradient-to))' }}
-                  transition={{ type: 'spring', stiffness: 380, damping: 32 }}
-                />
-              )}
-              <Icon className={cn('relative z-10 h-5 w-5 shrink-0', isActive ? 'text-white' : '')} />
-              <AnimatePresence initial={false}>
-                {!compact && (
-                  <motion.span
-                    key="label"
-                    initial={{ opacity: 0, x: -8 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    exit={{ opacity: 0, x: -8 }}
-                    transition={{ duration: 0.15 }}
-                    className={cn('relative z-10 whitespace-nowrap', isActive && 'text-white')}
+      <nav className={cn('min-h-0 flex-1 overflow-y-auto overflow-x-hidden py-3', compact ? 'px-2.5' : 'px-3')}>
+        {NAV_GROUPS.map((group, groupIndex) => (
+          <div key={group.label} className={cn(groupIndex > 0 && 'mt-4')}>
+            {!compact && <div className="nav-section-label">{group.label}</div>}
+            {compact && groupIndex > 0 && <div className="mx-2 mb-2 border-t border-border/70" />}
+            <div className="space-y-1">
+              {group.items.map((item) => {
+                const Icon = item.icon
+                const active = currentPage === item.id
+                const label = t(item.labelKey)
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => selectPage(item.id)}
+                    title={label}
+                    aria-current={active ? 'page' : undefined}
+                    className={cn('control-nav-item', compact ? 'justify-center px-0' : 'px-3', active && 'is-active')}
                   >
-                    {label}
-                  </motion.span>
-                )}
-              </AnimatePresence>
-            </button>
-          )
-        })}
+                    {active && <motion.span layoutId="active-nav-rail" className="active-nav-rail" transition={{ type: 'spring', stiffness: 420, damping: 36 }} />}
+                    <Icon className="relative z-10 h-[18px] w-[18px] shrink-0" strokeWidth={active ? 2.4 : 1.9} />
+                    {!compact && <span className="relative z-10 min-w-0 truncate">{label}</span>}
+                    {!compact && active && <Activity className="relative z-10 ml-auto h-3.5 w-3.5 opacity-60" />}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        ))}
       </nav>
 
-      {!isNarrow && !isDrawer && (
-        <div className="border-t border-white/10 p-2 dark:border-white/5">
-          <button
-            onClick={onToggleCollapse}
-            className="group flex w-full items-center justify-center gap-2 overflow-hidden rounded-xl px-3 py-2 text-sm text-muted-foreground transition-all hover:bg-white/40 hover:text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 dark:hover:bg-white/5"
-            title={collapsed ? 'Mở rộng thanh bên' : 'Thu gọn thanh bên'}
-          >
-            <motion.div
-              animate={{ rotate: collapsed ? 0 : 180 }}
-              transition={{ duration: 0.3, ease: [0.4, 0, 0.2, 1] }}
-              className="shrink-0"
-            >
-              <ChevronRight className="h-4 w-4" />
-            </motion.div>
-            <AnimatePresence initial={false}>
-              {!collapsed && (
-                <motion.span
-                  key="collapse-label"
-                  initial={{ opacity: 0, width: 0 }}
-                  animate={{ opacity: 1, width: 'auto' }}
-                  exit={{ opacity: 0, width: 0 }}
-                  transition={{ duration: 0.15 }}
-                  className="overflow-hidden whitespace-nowrap"
-                >
-                  Thu gọn
-                </motion.span>
-              )}
-            </AnimatePresence>
+      {!isDrawer && !isNarrow && (
+        <div className="border-t border-border/70 p-3">
+          <button type="button" onClick={onToggleCollapse} className={cn('control-nav-item text-muted-foreground', compact ? 'justify-center px-0' : 'px-3')}>
+            <motion.span animate={{ rotate: compact ? 180 : 0 }} transition={{ duration: 0.2 }}><ChevronLeft className="h-[18px] w-[18px]" /></motion.span>
+            {!compact && <span>Collapse rail</span>}
           </button>
         </div>
       )}

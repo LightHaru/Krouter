@@ -140,9 +140,18 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
+// httpHostHeader do client gửi lên đi thẳng vào argv của cloudflared, nên chỉ
+// chấp nhận tên host thuần (kèm cổng số tùy chọn); giá trị khác bị bỏ hẳn.
+const HOST_HEADER_RE = /^[A-Za-z0-9.-]+(?::\d{1,5})?$/
+
+function sanitizeHostHeader(value: string | undefined): string {
+  const trimmed = String(value || '').trim()
+  if (!trimmed) return ''
+  return HOST_HEADER_RE.test(trimmed) ? trimmed : ''
+}
+
 class DashboardTunnelRuntime {
   private process: ChildProcess | null = null
-  private cleanupRegistered = false
   private status: DashboardTunnelStatus = {
     running: false,
     requested: false,
@@ -152,9 +161,10 @@ class DashboardTunnelRuntime {
     logs: []
   }
 
-  constructor() {
-    this.registerCleanup()
-  }
+  // Cố tình KHÔNG đăng ký handler SIGINT/SIGTERM ở đây: constructor chạy ngay
+  // lúc module được import, kể cả khi tunnel không bao giờ bật, và process.exit(0)
+  // ngay giữa một store.save() sẽ cắt cụt store.json. Việc tắt máy do
+  // src/server/index.ts điều phối, nó sẽ gọi stopSync()/dispose().
 
   getStatus(): DashboardTunnelStatus {
     if (this.process && this.process.exitCode === null && !this.process.killed) {
@@ -175,8 +185,11 @@ class DashboardTunnelRuntime {
   async start(input: DashboardTunnelStartInput = {}): Promise<{ success: boolean; status: DashboardTunnelStatus; error?: string }> {
     const existing = this.getStatus()
     const localUrl = (input.localUrl || defaultTunnelTarget()).trim()
-    const binary = (input.binary || defaultCloudflaredBinary()).trim()
-    const httpHostHeader = (input.httpHostHeader || defaultHttpHostHeader(localUrl)).trim()
+    // input.binary bị bỏ qua hoàn toàn: đường dẫn cloudflared chỉ được lấy từ
+    // cấu hình/biến môi trường, nếu không một request bất kỳ có thể chạy được
+    // file thực thi tùy ý trên máy chủ.
+    const binary = defaultCloudflaredBinary()
+    const httpHostHeader = sanitizeHostHeader(input.httpHostHeader) || defaultHttpHostHeader(localUrl).trim()
     if (existing.running) {
       if (existing.localUrl === localUrl && (existing.httpHostHeader || '') === httpHostHeader) {
         return { success: true, status: existing }
@@ -276,7 +289,9 @@ class DashboardTunnelRuntime {
     return { success: true, status: this.getStatus() }
   }
 
-  private stopSync(): void {
+  // Dừng cloudflared đồng bộ, KHÔNG thoát tiến trình. Dành cho hook tắt máy
+  // bên ngoài (src/server/index.ts) gọi trước khi ghi nốt store.
+  stopSync(): void {
     const child = this.process
     if (child && child.exitCode === null && !child.killed) {
       try {
@@ -290,15 +305,13 @@ class DashboardTunnelRuntime {
     clearPid()
   }
 
-  private registerCleanup(): void {
-    if (this.cleanupRegistered) return
-    this.cleanupRegistered = true
-    const cleanup = (): void => {
-      this.stopSync()
-      process.exit(0)
-    }
-    process.once('SIGINT', cleanup)
-    process.once('SIGTERM', cleanup)
+  dispose(): void {
+    this.stopSync()
+    this.process = null
+    this.status.running = false
+    this.status.requested = false
+    delete this.status.pid
+    delete this.status.publicUrl
   }
 
   private appendOutput(output: string): void {

@@ -30,6 +30,12 @@ export interface AccountMergeResult {
   added: number
   skipped: number
   addedAccountIds: string[]
+  /**
+   * Ánh xạ id nguồn -> id thật sự được ghi vào store. Hai giá trị này khác nhau khi id
+   * nguồn đụng account đang sống hoặc đụng một deletion tombstone và phải cấp id mới.
+   * Caller cần map này để kiểm tra account có thực sự tồn tại sau khi ghi hay không.
+   */
+  addedAccountTargets: Array<{ sourceId: string; targetId: string }>
   skippedAccountIds: string[]
   skippedAccounts: AccountMergeSkip[]
   syncedAccountIds: string[]
@@ -181,8 +187,18 @@ export function mergePeerAccountData(currentRaw: unknown, incomingRaw: unknown):
 
   const accounts: Record<string, StoredRecord> = { ...currentAccounts }
   const duplicateIndex = buildDuplicateIndex(accounts)
+  // Id đã bị xoá vẫn nằm trong tombstone list. WebStore.setAccountData ->
+  // enforceDeletionTombstones sẽ xoá đúng những key này ngay sau khi ta ghi, nên account
+  // peer nào trùng id với một tombstone phải được cấp id mới — nếu không nó bị nuốt im lặng
+  // trong khi response vẫn báo thành công.
+  const tombstonedIds = new Set(
+    Array.isArray(current._deletedAccountIds)
+      ? current._deletedAccountIds.filter((id): id is string => typeof id === 'string')
+      : []
+  )
   const skippedAccounts: AccountMergeSkip[] = []
   const addedAccountIds: string[] = []
+  const addedAccountTargets: Array<{ sourceId: string; targetId: string }> = []
   const skippedAccountIds: string[] = []
   const syncedAccountIds: string[] = []
   let added = 0
@@ -205,13 +221,14 @@ export function mergePeerAccountData(currentRaw: unknown, incomingRaw: unknown):
     }
 
     let targetId = sourceId
-    if (accounts[targetId]) targetId = crypto.randomUUID()
+    if (accounts[targetId] || tombstonedIds.has(targetId)) targetId = crypto.randomUUID()
     accounts[targetId] = { ...account, id: targetId, isActive: false }
     for (const key of duplicateKeys(accounts[targetId])) {
       if (!duplicateIndex.has(key)) duplicateIndex.set(key, targetId)
     }
     added++
     addedAccountIds.push(sourceId)
+    addedAccountTargets.push({ sourceId, targetId })
     syncedAccountIds.push(sourceId)
   }
 
@@ -227,6 +244,7 @@ export function mergePeerAccountData(currentRaw: unknown, incomingRaw: unknown):
     added,
     skipped: skippedAccounts.length,
     addedAccountIds,
+    addedAccountTargets,
     skippedAccountIds,
     skippedAccounts,
     syncedAccountIds

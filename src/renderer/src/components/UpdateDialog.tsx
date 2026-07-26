@@ -196,7 +196,7 @@ export function UpdateDialog(): React.JSX.Element | null {
             <div className="flex items-start gap-2 rounded-lg border border-green-500/25 bg-green-500/10 p-3 text-sm text-green-700 dark:text-green-300">
               <CheckCircle className="mt-0.5 h-4 w-4" />
               <span>
-                {Boolean((updateInfo as ApplyUpdateResult).restartScheduled)
+                {(updateInfo as ApplyUpdateResult).restartScheduled
                   ? 'Đã cài bản mới. Backend sẽ tự khởi động lại sau vài giây.'
                   : 'Đã cài bản mới. Nếu trang chưa đổi version, hãy restart backend/CLI để nạp code mới.'}
               </span>

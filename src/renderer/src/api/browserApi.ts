@@ -1,11 +1,15 @@
-type AnyCallback = (...args: any[]) => void
+type AnyCallback = (...args: unknown[]) => void
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 const EVENT_RECONNECT_MS = 2000
+const EVENT_RECONNECT_MAX_MS = 30000
+/** Sau ngần này lần kết nối hỏng liên tiếp thì coi như phiên đã mất, không phải mạng chập chờn. */
+const EVENT_RECONNECT_AUTH_HINT_AT = 4
 
 const listenerSets = new Map<string, Set<AnyCallback>>()
 let eventSource: EventSource | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let reconnectAttempts = 0
 
 function kebabFromOnMethod(methodName: string): string {
   return methodName
@@ -34,14 +38,22 @@ function ensureEventSource(): void {
       console.warn('[WebApi] Failed to parse event payload', error)
     }
   }
+  eventSource.onopen = () => {
+    reconnectAttempts = 0
+  }
   eventSource.onerror = () => {
     eventSource?.close()
     eventSource = null
     if (listenerSets.size > 0 && !reconnectTimer) {
+      // Trước đây thử lại đều đặn 2 giây vô hạn, không đếm lần: khi phiên đã hết hạn thì
+      // đó là vòng lặp 401 không bao giờ dừng. Có backoff + báo mất phiên sau vài lần hỏng.
+      reconnectAttempts++
+      if (reconnectAttempts >= EVENT_RECONNECT_AUTH_HINT_AT) notifyAuthLost()
+      const delay = Math.min(EVENT_RECONNECT_MS * 2 ** (reconnectAttempts - 1), EVENT_RECONNECT_MAX_MS)
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null
         ensureEventSource()
-      }, EVENT_RECONNECT_MS)
+      }, delay)
     }
   }
 }
@@ -62,12 +74,20 @@ function subscribe(channel: string, callback: AnyCallback): () => void {
     if (listenerSets.size === 0) {
       eventSource?.close()
       eventSource = null
+      reconnectAttempts = 0
       if (reconnectTimer) {
         clearTimeout(reconnectTimer)
         reconnectTimer = null
       }
     }
   }
+}
+
+/** Phát khi backend trả 401 để AuthGate đưa người dùng về màn hình đăng nhập. */
+export const AUTH_LOST_EVENT = 'krouter:auth-lost'
+
+function notifyAuthLost(): void {
+  window.dispatchEvent(new CustomEvent(AUTH_LOST_EVENT))
 }
 
 async function callBackend<T>(method: string, args: unknown[]): Promise<T> {
@@ -78,9 +98,20 @@ async function callBackend<T>(method: string, args: unknown[]): Promise<T> {
     body: JSON.stringify({ method, args })
   })
   const text = await response.text()
-  const data = text ? JSON.parse(text) : null
+  // JSON.parse phải nằm trong try và phải sau khi biết response.ok: một trang lỗi HTML do
+  // nginx sinh ra (502) sẽ ném SyntaxError "Unexpected token '<'" và che mất lỗi thật.
+  let data: { error?: string } | null = null
+  try {
+    data = text ? JSON.parse(text) : null
+  } catch {
+    data = null
+  }
   if (!response.ok) {
-    throw new Error(data?.error || response.statusText)
+    // Phiên hết hạn (TTL 7 ngày, hoặc bị đẩy ra khi vượt MAX_SESSIONS_PER_USER): trước đây
+    // không có nhánh nào xử lý, nên mọi nút bấm chỉ hiện "Unauthorized" trong khi lưới tài
+    // khoản vẫn render dữ liệu cache như thể mọi thứ bình thường.
+    if (response.status === 401) notifyAuthLost()
+    throw new Error(data?.error || text?.slice(0, 200) || response.statusText)
   }
   return data as T
 }
@@ -103,16 +134,43 @@ function importTextFile(): Promise<{ content: string; format: string } | null> {
     const input = document.createElement('input')
     input.type = 'file'
     input.accept = '.json,.txt,.csv,text/plain,application/json,text/csv'
+
+    // Trước đây mọi resolve đều nằm trong onchange. Người dùng đóng hộp thoại chọn file thì
+    // sự kiện bắn ra là 'cancel', không phải 'change' — promise treo vĩnh viễn nên khối
+    // `finally { setIsImporting(false) }` của caller không bao giờ chạy và nút Import kẹt ở
+    // trạng thái "Importing…" cho tới khi tải lại trang.
+    let settled = false
+    const finish = (value: { content: string; format: string } | null): void => {
+      if (settled) return
+      settled = true
+      window.removeEventListener('focus', onWindowFocus)
+      resolve(value)
+    }
+    // Safari cũ không bắn sự kiện 'cancel'; khi cửa sổ lấy lại focus mà vẫn chưa có file
+    // thì coi như người dùng đã huỷ.
+    const onWindowFocus = (): void => {
+      setTimeout(() => {
+        if (!settled && !input.files?.length) finish(null)
+      }, 300)
+    }
+
+    input.oncancel = () => finish(null)
     input.onchange = async () => {
       const file = input.files?.[0]
       if (!file) {
-        resolve(null)
+        finish(null)
         return
       }
-      const content = await file.text()
-      const format = file.name.split('.').pop()?.toLowerCase() || 'txt'
-      resolve({ content, format })
+      try {
+        const content = await file.text()
+        const format = file.name.split('.').pop()?.toLowerCase() || 'txt'
+        finish({ content, format })
+      } catch (error) {
+        console.warn('[WebApi] Không đọc được file đã chọn', error)
+        finish(null)
+      }
     }
+    window.addEventListener('focus', onWindowFocus, { once: true })
     input.click()
   })
 }

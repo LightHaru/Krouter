@@ -15,7 +15,10 @@ export interface OpenAIChatRequest {
   metadata?: Record<string, unknown>
   kiro_context?: KiroRequestContext
   reasoning_effort?: 'low' | 'medium' | 'high' | 'max' | string
-  thinking?: { type: 'enabled'; budget_tokens?: number } | { type: 'adaptive' } | { type: 'disabled' }
+  thinking?:
+    | { type: 'enabled'; budget_tokens?: number }
+    | { type: 'adaptive' }
+    | { type: 'disabled' }
 }
 
 export interface OpenAIMessage {
@@ -116,6 +119,11 @@ export interface OpenAIResponsesRequest {
   tool_choice?: string | { type: string; name?: string; function?: { name: string } }
   previous_response_id?: string
   reasoning?: unknown
+  include?: string[]
+  service_tier?: string
+  prompt_cache_key?: string
+  client_metadata?: Record<string, unknown>
+  text?: Record<string, unknown>
   metadata?: Record<string, unknown>
   kiro_context?: KiroRequestContext
 }
@@ -155,7 +163,12 @@ export interface OpenAIResponsesResponse {
 }
 
 export type OpenAIResponseOutputItem =
-  | { type: 'message'; id: string; role: 'assistant'; content: { type: 'output_text'; text: string }[] }
+  | {
+      type: 'message'
+      id: string
+      role: 'assistant'
+      content: { type: 'output_text'; text: string }[]
+    }
   | { type: 'function_call'; id: string; call_id: string; name: string; arguments: string }
 
 // ============ Claude 兼容格式 ============
@@ -169,12 +182,18 @@ export interface ClaudeRequest {
   system?: string | ClaudeSystemBlock[]
   tools?: ClaudeTool[]
   tool_choice?: { type: string; name?: string }
-  thinking?: { type: 'enabled'; budget_tokens: number } | { type: 'adaptive'; display?: string } | { type: 'disabled' }
+  thinking?:
+    | { type: 'enabled'; budget_tokens: number }
+    | { type: 'adaptive'; display?: string }
+    | { type: 'disabled' }
   conversation_id?: string
   metadata?: Record<string, unknown>
   kiro_context?: KiroRequestContext
   anthropic_beta?: string[]
-  output_config?: { effort?: string; task_budget?: { type: 'tokens'; total: number; remaining?: number } }
+  output_config?: {
+    effort?: string
+    task_budget?: { type: 'tokens'; total: number; remaining?: number }
+  }
   context_management?: { type?: string; [key: string]: unknown }
 }
 
@@ -191,17 +210,29 @@ export interface ClaudeSystemBlock {
 }
 
 export interface ClaudeContentBlock {
-  type: 'text' | 'image' | 'document' | 'tool_use' | 'tool_result' | 'thinking' | 'redacted_thinking'
+  type:
+    | 'text'
+    | 'image'
+    | 'document'
+    | 'tool_use'
+    | 'tool_result'
+    | 'thinking'
+    | 'redacted_thinking'
   text?: string
   thinking?: string
   signature?: string
   data?: string
-  source?: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string } | ClaudeDocumentSource
+  source?:
+    | { type: 'base64'; media_type: string; data: string }
+    | { type: 'url'; url: string }
+    | ClaudeDocumentSource
   id?: string
   name?: string
   input?: unknown
   tool_use_id?: string
   content?: string | ClaudeContentBlock[]
+  /** Cờ is_error của tool_result theo chuẩn Anthropic; ánh xạ sang KiroToolResult.status = 'error'. */
+  is_error?: boolean
   cache_control?: ClaudeCacheControl
 }
 
@@ -237,12 +268,41 @@ export interface ClaudeResponse {
 }
 
 export interface ClaudeStreamEvent {
-  type: 'message_start' | 'content_block_start' | 'content_block_delta' | 'content_block_stop' | 'message_delta' | 'message_stop' | 'ping' | 'error'
+  type:
+    | 'message_start'
+    | 'content_block_start'
+    | 'content_block_delta'
+    | 'content_block_stop'
+    | 'message_delta'
+    | 'message_stop'
+    | 'ping'
+    | 'error'
   message?: Partial<ClaudeResponse>
   index?: number
   content_block?: ClaudeContentBlock
-  delta?: { type: string; text?: string; thinking?: string; signature?: string; data?: string; reasoning_content?: string; stop_reason?: string; stop_sequence?: string }
-  usage?: { input_tokens?: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }
+  // partial_json: mảnh JSON của input tool_use trong input_json_delta (luồng Bedrock)
+  delta?: {
+    /**
+     * Optional vì hai loại sự kiện dùng chung field `delta` nhưng khác hình dạng:
+     * `content_block_delta` luôn có `type` (text_delta / input_json_delta / thinking_delta...),
+     * còn `message_delta` theo spec Anthropic chỉ mang { stop_reason, stop_sequence }.
+     */
+    type?: string
+    text?: string
+    thinking?: string
+    signature?: string
+    data?: string
+    partial_json?: string
+    reasoning_content?: string
+    stop_reason?: string
+    stop_sequence?: string | null
+  }
+  usage?: {
+    input_tokens?: number
+    output_tokens: number
+    cache_creation_input_tokens?: number
+    cache_read_input_tokens?: number
+  }
   error?: { type: string; message: string }
 }
 
@@ -269,7 +329,7 @@ export interface KiroCurrentMessage {
 
 export interface KiroUserInputMessage {
   content: string
-  modelId?: string  // 可选，占位消息不需要
+  modelId?: string // 可选，占位消息不需要
   origin: string
   images?: KiroImage[]
   documents?: KiroDocument[]
@@ -305,15 +365,17 @@ export interface KiroToolResult {
   toolUseId: string
 }
 
-export type KiroToolWrapper = {
-  toolSpecification: {
-    name: string
-    description: string
-    inputSchema: { json: unknown }
-  }
-} | {
-  cachePoint: KiroCachePoint
-}
+export type KiroToolWrapper =
+  | {
+      toolSpecification: {
+        name: string
+        description: string
+        inputSchema: { json: unknown }
+      }
+    }
+  | {
+      cachePoint: KiroCachePoint
+    }
 
 export interface KiroHistoryMessage {
   userInputMessage?: KiroUserInputMessage
@@ -384,7 +446,7 @@ export interface ProxyAccount {
   subscriptionType?: string
   profileArn?: string
   expiresAt?: number
-  machineId?: string  // 账户绑定的设备 ID（64位十六进制）
+  machineId?: string // 账户绑定的设备 ID（64位十六进制）
   /** 账号绑定的出口代理 URL（http/https）；为空则使用全局代理逻辑 */
   proxyUrl?: string
   /** 账号所属分组 ID；与 multiAccountSelectionMode='groups' + multiAccountGroupIds 配合做轮询分组过滤 */
@@ -406,9 +468,9 @@ export interface ProxyAccount {
   // 长期封禁追踪（区分于临时 errorCount 冷却）
   // Kiro 后端 TEMPORARILY_SUSPENDED / AccountSuspendedException 等风控触发时设置
   // 需要联系 AWS Support 人工解封，账号池会持续跳过直到 clearSuspended
-  suspendedAt?: number       // 封禁时间戳
-  suspendReason?: string     // 封禁原因 (如 'TEMPORARILY_SUSPENDED')
-  suspendMessage?: string    // 封禁完整错误消息 (含联系链接)
+  suspendedAt?: number // 封禁时间戳
+  suspendReason?: string // 封禁原因 (如 'TEMPORARILY_SUSPENDED')
+  suspendMessage?: string // 封禁完整错误消息 (含联系链接)
   // Phase 15: ChatGPT OAuth for free image generation
   chatgpt?: {
     accessToken: string
@@ -443,7 +505,7 @@ export interface TierEligibilityRule {
 /** Kết quả live-probe một model trên một tier đại diện. */
 export interface ModelProbeResult {
   modelId: string
-  tier: KiroTier
+  tier: KiroTier | 'bedrock' | 'chatgpt' | `custom:${string}`
   ok: boolean
   error?: string
   latencyMs?: number
@@ -469,12 +531,12 @@ export interface ApiKey {
   id: string
   name: string
   key: string
-  format: ApiKeyFormat  // 密钥格式
+  format: ApiKeyFormat // 密钥格式
   enabled: boolean
   createdAt: number
   lastUsedAt?: number
   // 额度限制
-  creditsLimit?: number  // Credits 上限（undefined 表示无限制）
+  creditsLimit?: number // Credits 上限（undefined 表示无限制）
   // 用量统计
   usage: {
     totalRequests: number
@@ -482,19 +544,25 @@ export interface ApiKey {
     totalInputTokens: number
     totalOutputTokens: number
     // 按日期统计（YYYY-MM-DD -> usage）
-    daily: Record<string, {
-      requests: number
-      credits: number
-      inputTokens: number
-      outputTokens: number
-    }>
+    daily: Record<
+      string,
+      {
+        requests: number
+        credits: number
+        inputTokens: number
+        outputTokens: number
+      }
+    >
     // 按模型统计
-    byModel?: Record<string, {
-      requests: number
-      credits: number
-      inputTokens: number
-      outputTokens: number
-    }>
+    byModel?: Record<
+      string,
+      {
+        requests: number
+        credits: number
+        inputTokens: number
+        outputTokens: number
+      }
+    >
   }
   // 用量历史记录（最近 100 条）
   usageHistory?: ApiKeyUsageRecord[]
@@ -503,7 +571,7 @@ export interface ApiKey {
 // 模型映射规则
 export interface ModelMappingRule {
   id: string
-  name: string  // 规则名称
+  name: string // 规则名称
   enabled: boolean
   // 映射类型：replace(替换), alias(别名), loadbalance(负载均衡)
   type: 'replace' | 'alias' | 'loadbalance'
@@ -523,8 +591,12 @@ export interface ProxyConfig {
   enabled: boolean
   port: number
   host: string
-  apiKey?: string  // 保留兼容性
-  apiKeys?: ApiKey[]  // 多 API Key 支持
+  apiKey?: string // 保留兼容性
+  apiKeys?: ApiKey[] // 多 API Key 支持
+  // Thông tin xác thực riêng cho admin API (/admin/*), tách biệt hoàn toàn với API key của
+  // tenant: một tenant key hợp lệ KHÔNG được phép quản trị pool. Khi không đặt, admin API
+  // chỉ chấp nhận request từ loopback.
+  adminApiKey?: string
   enableMultiAccount: boolean
   selectedAccountIds: string[]
   logRequests: boolean
@@ -540,8 +612,8 @@ export interface ProxyConfig {
   streamInitialBufferBytes?: number
   streamInitialBufferMs?: number
   // 流超时（0 = 关闭）：AWS 长时间不吐字节时主动 abort，避免客户端无限等待
-  // - streamFirstByteTimeoutMs: 首字节超时（默认 30000）
-  // - streamIdleTimeoutMs: 中途空闲超时（默认 60000，每收到一块即重置）
+  // - streamFirstByteTimeoutMs: first-byte timeout (default 120000)
+  // - streamIdleTimeoutMs: stream idle timeout (default 300000, reset per chunk)
   streamFirstByteTimeoutMs?: number
   streamIdleTimeoutMs?: number
   // 心跳（0 = 关闭）：等待首帧/换号期间定期发送 SSE 注释，避免中间代理/CDN 掐断空闲连接
@@ -655,8 +727,14 @@ export interface ProxyConfig {
   bedrock?: import('./bedrock').BedrockConfig
   /** Xpixi third-party API provider. Routed in parallel to Kiro and Bedrock. */
   xpixi?: import('./xpixi').XpixiConfig
-  /** Phase 15: ChatGPT OAuth image generation config */
+  /** Multi-provider OpenAI/Anthropic-compatible upstreams. */
+  customApiProviders?: import('./customApi').CustomApiProviderConfig[]
+  /** ChatGPT OAuth image generation config. */
   chatgptImage?: import('./chatgptImage').ChatGPTImageConfig
+  /** Experimental ChatGPT/Codex text provider. Only explicit chatgpt/* models use it. */
+  chatgptCodex?: import('./chatgptCodex').ChatGPTCodexConfig
+  /** Persisted ChatGPT OAuth identities, independent from the Kiro account pool. */
+  chatgptAccounts?: import('./chatgptOAuth').ChatGPTAccountState[]
 }
 
 export interface TlsConfig {

@@ -3,24 +3,26 @@ import * as http from 'http'
 import * as net from 'net'
 import * as tls from 'tls'
 import * as url from 'url'
-import type { 
-  KProxyConfig, 
-  KProxyStats, 
-  KProxyEvents,
-  KProxyRequestInfo 
-} from './types'
+import type { KProxyConfig, KProxyStats, KProxyEvents, KProxyRequestInfo } from './types'
 import { CertManager } from './certManager'
 
 // Machine ID 正则匹配模式（64位十六进制）
 const MACHINE_ID_REGEX = /[a-f0-9]{64}/gi
 // 支持两种格式：KiroIDE-0.6.18-{machineId} 或 KiroIDE 0.6.18 {machineId}
 const KIRO_UA_REGEX = /KiroIDE[-\s][\d.]+[-\s]([a-f0-9]{64})/i
+/** Ranh giới header/body của HTTP, so khớp trên byte để không phụ thuộc encoding. */
+const HEADER_TERMINATOR = Buffer.from('\r\n\r\n', 'latin1')
 
 /**
  * K-Proxy MITM 代理服务器
  */
 export class MitmProxy {
   private server: http.Server | null = null
+  /**
+   * Chỉ true sau khi listen() gọi callback thành công. Không được suy ra trạng thái chạy
+   * từ `server !== null`: một server đã tạo nhưng listen fail (EADDRINUSE) vẫn khác null.
+   */
+  private listening = false
   private certManager: CertManager
   private config: KProxyConfig
   private stats: KProxyStats
@@ -52,17 +54,31 @@ export class MitmProxy {
       return
     }
 
-    return new Promise((resolve, reject) => {
-      this.server = http.createServer((req, res) => {
+    return await new Promise((resolve, reject) => {
+      const server = http.createServer((req, res) => {
         this.handleHttpRequest(req, res)
       })
+      this.server = server
 
       // 处理 CONNECT 请求（HTTPS 隧道）
-      this.server.on('connect', (req, clientSocket: net.Socket, head) => {
+      server.on('connect', (req, clientSocket: net.Socket, head) => {
         this.handleConnect(req, clientSocket, head)
       })
 
-      this.server.on('error', (error: NodeJS.ErrnoException) => {
+      server.on('error', (error: NodeJS.ErrnoException) => {
+        // Nếu listen chưa từng thành công thì server này KHÔNG dùng được. Phải trả
+        // this.server về null, nếu không isRunning() (chính là `this.server !== null`)
+        // sẽ báo "đang chạy" trong khi không có gì listen trên cổng, và guard ở đầu
+        // start() sẽ short-circuit mọi lần thử lại bằng success.
+        if (!this.listening) {
+          this.server = null
+          server.removeAllListeners()
+          try {
+            server.close()
+          } catch {
+            /* ignore */
+          }
+        }
         if (error.code === 'EADDRINUSE') {
           console.error(`[MitmProxy] Port ${this.config.port} is already in use`)
           reject(new Error(`Port ${this.config.port} is already in use`))
@@ -73,8 +89,9 @@ export class MitmProxy {
         }
       })
 
-      this.server.listen(this.config.port, this.config.host, () => {
+      server.listen(this.config.port, this.config.host, () => {
         console.log(`[MitmProxy] Started on ${this.config.host}:${this.config.port}`)
+        this.listening = true
         this.stats.startTime = Date.now()
         this.events.onStatusChange?.(true, this.config.port)
         resolve()
@@ -92,27 +109,43 @@ export class MitmProxy {
 
     // 关闭所有 TLS 服务器
     for (const [_host, tlsServer] of this.tlsServers) {
-      try { tlsServer.close() } catch { /* ignore */ }
+      try {
+        tlsServer.close()
+      } catch {
+        /* ignore */
+      }
     }
     this.tlsServers.clear()
 
     // 强制销毁所有活跃隧道连接：否则 server.close() 会等 Keep-Alive 连接自然超时（~60s）
     for (const sock of this.sockets) {
-      try { sock.destroy() } catch { /* ignore */ }
+      try {
+        sock.destroy()
+      } catch {
+        /* ignore */
+      }
     }
     this.sockets.clear()
 
     const srv = this.server
     this.server = null
-    return new Promise((resolve) => {
+    this.listening = false
+    return await new Promise((resolve) => {
+      // Không có cờ settled thì cả close callback lẫn timeout dự phòng đều chạy finish(),
+      // bắn onStatusChange(false) hai lần: nếu người dùng stop rồi start lại trong 1 giây,
+      // phát lần hai sẽ lật UI về "đã dừng" trong khi proxy đang phục vụ.
+      let settled = false
       const finish = (): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(fallback)
         console.log('[MitmProxy] Stopped')
         this.events.onStatusChange?.(false, this.config.port)
         resolve()
       }
-      srv.close(() => finish())
       // 双保险：1 秒后无论 close 回调是否触发都 resolve
-      setTimeout(finish, 1000)
+      const fallback = setTimeout(finish, 1000)
+      srv.close(finish)
     })
   }
 
@@ -133,14 +166,36 @@ export class MitmProxy {
     }
 
     const proxyReq = http.request(options, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode || 200, proxyRes.headers)
+      if (!res.headersSent) {
+        res.writeHead(proxyRes.statusCode || 200, proxyRes.headers)
+      }
+      // Upstream reset giữa chừng (rất thường gặp với SSE dài) phải được xử lý tại chỗ,
+      // nếu không lỗi sẽ nổ ra ngoài EventEmitter và không ai bắt được.
+      proxyRes.on('error', (error) => {
+        console.error('[MitmProxy] Upstream response error:', error.message)
+        proxyReq.destroy()
+        if (!res.writableEnded) res.end()
+      })
       proxyRes.pipe(res)
     })
 
     proxyReq.on('error', (error) => {
       console.error('[MitmProxy] HTTP proxy error:', error)
-      res.writeHead(502)
-      res.end('Bad Gateway')
+      // Thiếu guard headersSent thì writeHead ném ERR_HTTP_HEADERS_SENT ngay trong handler của
+      // EventEmitter → uncaughtException → chết cả tiến trình main của Electron.
+      if (!res.headersSent) res.writeHead(502)
+      if (!res.writableEnded) res.end('Bad Gateway')
+    })
+
+    req.on('error', (error) => {
+      console.error('[MitmProxy] Client request error:', error.message)
+      proxyReq.destroy()
+      if (!res.writableEnded) res.end()
+    })
+
+    res.on('error', (error) => {
+      console.error('[MitmProxy] Client response error:', error.message)
+      proxyReq.destroy()
     })
 
     req.pipe(proxyReq)
@@ -149,11 +204,7 @@ export class MitmProxy {
   /**
    * 处理 CONNECT 请求（HTTPS 隧道）
    */
-  private handleConnect(
-    req: http.IncomingMessage, 
-    clientSocket: net.Socket, 
-    head: Buffer
-  ): void {
+  private handleConnect(req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer): void {
     // 跟踪隧道连接，stop() 时强制断开
     this.sockets.add(clientSocket)
     clientSocket.once('close', () => this.sockets.delete(clientSocket))
@@ -180,7 +231,9 @@ export class MitmProxy {
    */
   private shouldMitm(hostname: string): boolean {
     for (const domain of this.config.mitmDomains) {
-      if (hostname.includes(domain)) {
+      // Khớp có neo: `includes` khiến `amazon.com.evil.net` cũng trùng `amazon.com`,
+      // Krouter sẽ giả mạo chứng chỉ, giải mã đường hầm và viết lại body của tên miền lạ đó.
+      if (hostname === domain || hostname.endsWith('.' + domain)) {
         if (this.config.logRequests) {
           console.log(`[MitmProxy] MITM: ${hostname} matches ${domain}`)
         }
@@ -197,9 +250,9 @@ export class MitmProxy {
    * 直接转发连接（不解密）
    */
   private handleDirectConnect(
-    hostname: string, 
-    port: number, 
-    clientSocket: net.Socket, 
+    hostname: string,
+    port: number,
+    clientSocket: net.Socket,
     head: Buffer
   ): void {
     const serverSocket = net.connect(port, hostname, () => {
@@ -224,9 +277,9 @@ export class MitmProxy {
    * MITM 拦截连接
    */
   private handleMitmConnect(
-    hostname: string, 
-    port: number, 
-    clientSocket: net.Socket, 
+    hostname: string,
+    port: number,
+    clientSocket: net.Socket,
     _head: Buffer
   ): void {
     try {
@@ -266,27 +319,42 @@ export class MitmProxy {
    * 处理解密后的 HTTPS 连接
    */
   private handleDecryptedConnection(
-    clientSocket: tls.TLSSocket, 
-    hostname: string, 
+    clientSocket: tls.TLSSocket,
+    hostname: string,
     port: number
   ): void {
-    let requestData = ''
+    // Gom bằng Buffer, KHÔNG bằng chuỗi. Trước đây `requestData += chunk.toString()` decode
+    // từng chunk rời rạc theo utf8: một ký tự nhiều byte (tiếng Việt có dấu, CJK, emoji) nằm
+    // vắt qua ranh giới chunk sẽ biến nửa đầu thành U+FFFD (3 byte) trong khi các byte tiếp
+    // theo sang chunk sau vẫn nguyên vẹn — body gửi lên AWS vừa sai nội dung vừa lệch số byte
+    // so với Content-Length.
+    const headerChunks: Buffer[] = []
     let headersParsed = false
     let contentLength = 0
     let bodyReceived = 0
     let modifiedHeaders: string = ''
     let requestInfo: KProxyRequestInfo | null = null
+    // Các mảnh body đến TRONG LÚC bắt tay TLS với upstream (100ms+): trước đây chúng rơi vào
+    // handler này mà không có nhánh else nào nên bị vứt bỏ hoàn toàn — request 60KB gửi lên
+    // Content-Length: 61440 nhưng chỉ có ~14KB đầu tới nơi, AWS treo chờ số byte không bao giờ đến.
+    const pendingBody: Buffer[] = []
+    // live = true sau khi forwardRequest đã nối thẳng client → upstream (hết giai đoạn đệm)
+    const forwardState = { live: false }
 
     clientSocket.on('data', (chunk: Buffer) => {
       if (!headersParsed) {
-        requestData += chunk.toString()
-        const headerEnd = requestData.indexOf('\r\n\r\n')
-        
+        headerChunks.push(chunk)
+        const buffered = headerChunks.length === 1 ? headerChunks[0] : Buffer.concat(headerChunks)
+        const headerEnd = buffered.indexOf(HEADER_TERMINATOR)
+
         if (headerEnd !== -1) {
           headersParsed = true
-          const headers = requestData.substring(0, headerEnd)
-          const body = requestData.substring(headerEnd + 4)
-          
+          headerChunks.length = 0
+          // Header HTTP theo spec là ISO-8859-1; latin1 ánh xạ 1 byte <-> 1 ký tự nên
+          // decode/encode luôn khứ hồi đúng từng byte.
+          const headers = buffered.subarray(0, headerEnd).toString('latin1')
+          const body = buffered.subarray(headerEnd + HEADER_TERMINATOR.length)
+
           // 解析并修改请求头
           const { modified, newHeaders, info } = this.modifyHeaders(headers, hostname)
           modifiedHeaders = newHeaders
@@ -304,20 +372,43 @@ export class MitmProxy {
             contentLength = parseInt(clMatch[1], 10)
           }
 
-          // 替换 body 中的 machineId
+          // 替换 body 中的 machineId（thao tác trên byte, không đụng tới encoding)
           const modifiedBody = this.modifyBody(body)
-          if (modifiedBody !== body) {
+          if (modifiedBody.length !== body.length) {
             // body 长度变了，更新 Content-Length
-            const newLength = contentLength - Buffer.byteLength(body) + Buffer.byteLength(modifiedBody)
-            modifiedHeaders = modifiedHeaders.replace(/content-length:\s*\d+/i, `content-length: ${newLength}`)
+            const newLength = contentLength - body.length + modifiedBody.length
+            modifiedHeaders = modifiedHeaders.replace(
+              /content-length:\s*\d+/i,
+              `content-length: ${newLength}`
+            )
             contentLength = newLength
           }
-          bodyReceived = Buffer.byteLength(modifiedBody)
+          bodyReceived = modifiedBody.length
 
           // 转发请求到目标服务器
-          this.forwardRequest(modifiedHeaders, modifiedBody, hostname, port, clientSocket, contentLength, bodyReceived)
+          this.forwardRequest(
+            modifiedHeaders,
+            modifiedBody,
+            hostname,
+            port,
+            clientSocket,
+            contentLength,
+            bodyReceived,
+            pendingBody,
+            forwardState
+          )
         }
+      } else if (!forwardState.live) {
+        // Đệm lại cho tới khi đường hầm upstream sẵn sàng; forwardRequest sẽ xả mảng này ra trước
+        // khi nối trực tiếp, nên không mảnh nào bị mất và cũng không mảnh nào bị gửi hai lần.
+        pendingBody.push(chunk)
       }
+      // TODO: Sau khi một response hoàn tất, trạng thái parser (headersParsed / requestData /
+      // contentLength / bodyReceived) KHÔNG được reset, nên chỉ request ĐẦU TIÊN trên một kết nối
+      // TLS keep-alive được phân tích và viết lại machineId; các request tiếp theo chỉ được chuyển
+      // tiếp thô lên upstream. Hiện tại forwardRequest đóng clientSocket ngay khi upstream kết thúc
+      // (serverSocket 'end' → clientSocket.end()) nên client không thể dùng lại kết nối, vì vậy
+      // chưa gây lỗi thực tế. Nếu sau này giữ kết nối sống thì phải reset trạng thái ở đây.
     })
 
     clientSocket.on('error', (error) => {
@@ -328,35 +419,45 @@ export class MitmProxy {
   /**
    * 替换请求体中的 Machine ID
    */
-  private modifyBody(body: string): string {
+  private modifyBody(body: Buffer): Buffer {
     const targetDeviceId = this.config.deviceId
-    if (!targetDeviceId || !body) return body
+    if (!targetDeviceId || body.length === 0) return body
+    // Device ID là 64 ký tự hex thuần ASCII, nên latin1 (1 byte <-> 1 ký tự) cho phép
+    // tìm/thay trên chuỗi mà vẫn khứ hồi đúng từng byte cho phần body nhị phân xung quanh.
+    const text = body.toString('latin1')
     // 只在 body 中包含 64 位十六进制时才替换（避免误伤无关内容）
-    if (!MACHINE_ID_REGEX.test(body)) return body
     MACHINE_ID_REGEX.lastIndex = 0
-    const result = body.replace(MACHINE_ID_REGEX, (match) => {
+    if (!MACHINE_ID_REGEX.test(text)) {
+      MACHINE_ID_REGEX.lastIndex = 0
+      return body
+    }
+    MACHINE_ID_REGEX.lastIndex = 0
+    const result = text.replace(MACHINE_ID_REGEX, (match) => {
       // 不替换已经是目标 ID 的
       if (match.toLowerCase() === targetDeviceId.toLowerCase()) return match
       if (this.config.logRequests) {
-        console.log(`[MitmProxy] Replaced Machine ID in body: ${match.substring(0, 16)}... -> ${targetDeviceId.substring(0, 16)}...`)
+        console.log(
+          `[MitmProxy] Replaced Machine ID in body: ${match.substring(0, 16)}... -> ${targetDeviceId.substring(0, 16)}...`
+        )
       }
       return targetDeviceId
     })
     MACHINE_ID_REGEX.lastIndex = 0
-    return result
+    if (result === text) return body
+    return Buffer.from(result, 'latin1')
   }
 
   /**
    * 修改请求头（替换 Machine ID）
    */
   private modifyHeaders(
-    headers: string, 
+    headers: string,
     hostname: string
   ): { modified: boolean; newHeaders: string; info: KProxyRequestInfo } {
     const lines = headers.split('\r\n')
     const firstLine = lines[0]
     const [method, path] = firstLine.split(' ')
-    
+
     let modified = false
     let originalDeviceId: string | undefined
     let newDeviceId: string | undefined
@@ -377,7 +478,7 @@ export class MitmProxy {
 
     const modifiedLines = lines.map((line) => {
       const lowerLine = line.toLowerCase()
-      
+
       // 检查 user-agent 和 x-amz-user-agent
       if (lowerLine.startsWith('user-agent:') || lowerLine.startsWith('x-amz-user-agent:')) {
         const match = line.match(KIRO_UA_REGEX)
@@ -406,10 +507,10 @@ export class MitmProxy {
       info.newDeviceId = newDeviceId
     }
 
-    return { 
-      modified, 
+    return {
+      modified,
       newHeaders: modifiedLines.join('\r\n'),
-      info 
+      info
     }
   }
 
@@ -418,38 +519,55 @@ export class MitmProxy {
    */
   private forwardRequest(
     headers: string,
-    initialBody: string,
+    initialBody: Buffer,
     hostname: string,
     port: number,
     clientSocket: tls.TLSSocket,
     contentLength: number,
-    bodyReceived: number
+    bodyReceived: number,
+    pendingBody: Buffer[],
+    forwardState: { live: boolean }
   ): void {
     const startTime = Date.now()
 
     // 连接到目标服务器
-    const serverSocket = tls.connect({
-      host: hostname,
-      port,
-      servername: hostname,
-      rejectUnauthorized: true
-    }, () => {
-      // 发送修改后的请求头
-      serverSocket.write(headers + '\r\n\r\n')
-      
-      // 发送已接收的请求体
-      if (initialBody) {
-        serverSocket.write(initialBody)
-      }
+    const serverSocket = tls.connect(
+      {
+        host: hostname,
+        port,
+        servername: hostname,
+        rejectUnauthorized: true
+      },
+      () => {
+        // 发送修改后的请求头 — ghi dưới dạng latin1 để số byte trên dây khớp đúng với
+        // những gì modifyHeaders đã tính (write() mặc định utf8 sẽ phình ký tự >127).
+        serverSocket.write(Buffer.from(headers + '\r\n\r\n', 'latin1'))
 
-      // 如果还有更多数据，继续转发
-      if (bodyReceived < contentLength) {
+        // 发送已接收的请求体
+        if (initialBody.length > 0) {
+          serverSocket.write(initialBody)
+        }
+
+        // Xả các mảnh body đã đệm trong lúc bắt tay TLS TRƯỚC khi nối listener trực tiếp,
+        // để thứ tự byte trên đường hầm giữ nguyên như client đã gửi.
+        for (const chunk of pendingBody) {
+          serverSocket.write(chunk)
+          bodyReceived += chunk.length
+        }
+        pendingBody.length = 0
+
+        if (this.config.logRequests && bodyReceived < contentLength) {
+          console.log(`[MitmProxy] Còn chờ body: ${bodyReceived}/${contentLength} byte`)
+        }
+
+        // Từ đây chuyển tiếp trực tiếp, handler ở handleDecryptedConnection ngừng đệm
+        forwardState.live = true
         clientSocket.on('data', (chunk: Buffer) => {
           serverSocket.write(chunk)
           bodyReceived += chunk.length
         })
       }
-    })
+    )
 
     // Phase 14: Response interception — buffer response if configured
     if (this.config.interceptResponses) {
@@ -523,7 +641,7 @@ export class MitmProxy {
    */
   getDeviceIdForAccount(accountId: string): string | undefined {
     if (!this.config.deviceIdMappings) return this.config.deviceId
-    const mapping = this.config.deviceIdMappings.find(m => m.accountId === accountId)
+    const mapping = this.config.deviceIdMappings.find((m) => m.accountId === accountId)
     return mapping?.deviceId || this.config.deviceId
   }
 
@@ -573,6 +691,6 @@ export class MitmProxy {
    * 检查是否运行中
    */
   isRunning(): boolean {
-    return this.server !== null
+    return this.server !== null && this.listening
   }
 }

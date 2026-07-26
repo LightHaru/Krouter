@@ -70,6 +70,7 @@ function runSqlite(dbPath: string, sql: string): void {
     return
   } catch (cliError) {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- node:sqlite là API thử nghiệm, có thể không tồn tại; bắt buộc require trong try/catch
       const sqlite = require('node:sqlite') as {
         DatabaseSync: new (filename: string) => { exec: (sql: string) => void; close: () => void }
       }

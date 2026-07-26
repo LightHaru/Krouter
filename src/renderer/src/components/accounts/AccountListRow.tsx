@@ -21,7 +21,7 @@ import {
   FolderOpen,
   Copy
 } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, copyText } from '@/lib/utils'
 import {
   toRgba,
   generateRowGlowStyle,
@@ -271,7 +271,7 @@ function AccountListRowComponent({
     e.stopPropagation()
     const text = account.email || account.userId || ''
     if (text) {
-      navigator.clipboard.writeText(text)
+      copyText(text)
       setEmailCopied(true)
       setTimeout(() => setEmailCopied(false), 1500)
     }

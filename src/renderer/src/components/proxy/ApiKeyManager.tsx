@@ -8,7 +8,7 @@ import {
   BarChart3, Clock, Zap, MessageSquare, ExternalLink
 } from 'lucide-react'
 import { Select } from '@/components/ui'
-import { cn } from '@/lib/utils'
+import { cn, copyText } from '@/lib/utils'
 import { useAccountsStore } from '@/store/accounts'
 import { ApiKeyUsageDialog } from './ApiKeyUsageDialog'
 
@@ -146,7 +146,7 @@ export function ApiKeyManager() {
   }
 
   const copyToClipboard = (id: string, key: string) => {
-    navigator.clipboard.writeText(key)
+    copyText(key)
     setCopiedId(id)
     setTimeout(() => setCopiedId(null), 2000)
   }

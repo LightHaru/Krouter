@@ -15,6 +15,16 @@ interface TestResult {
   error?: string
 }
 
+/** Method chỉ có ở runtime web; khai báo kiểu hẹp thay cho . */
+type BedrockExtraApi = {
+  proxyGetBedrockStatus?: () => Promise<BedrockStatus | undefined>
+  proxyTestBedrock?: (opts: Record<string, unknown>) => Promise<TestResult | undefined>
+}
+
+function bedrockExtraApi(): BedrockExtraApi {
+  return (window.api ?? {}) as unknown as BedrockExtraApi
+}
+
 export function BedrockPanel({ isEn }: { isEn: boolean }) {
   const [status, setStatus] = useState<BedrockStatus | null>(null)
   const [testing, setTesting] = useState(false)
@@ -26,7 +36,7 @@ export function BedrockPanel({ isEn }: { isEn: boolean }) {
 
   async function loadStatus() {
     try {
-      const res = await (window as any).api?.proxyGetBedrockStatus?.()
+      const res = await bedrockExtraApi().proxyGetBedrockStatus?.()
       if (res) setStatus(res)
     } catch { /* ignore */ }
   }
@@ -35,8 +45,8 @@ export function BedrockPanel({ isEn }: { isEn: boolean }) {
     setTesting(true)
     setTestResult(null)
     try {
-      const res = await (window as any).api?.proxyTestBedrock?.({})
-      setTestResult(res)
+      const res = await bedrockExtraApi().proxyTestBedrock?.({})
+      setTestResult(res ?? null)
       if (res?.success) {
         setStatus({ configured: true })
       }

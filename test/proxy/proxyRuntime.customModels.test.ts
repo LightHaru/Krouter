@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { promises as fs } from 'fs'
+import http from 'http'
 import net from 'net'
 import os from 'os'
 import path from 'path'
@@ -14,6 +15,7 @@ const originalEnv = {
 
 const tempDirs: string[] = []
 const runtimes: ProxyRuntime[] = []
+const upstreams: http.Server[] = []
 
 function restoreEnv(key: keyof typeof originalEnv): void {
   const value = originalEnv[key]
@@ -63,6 +65,9 @@ afterEach(async () => {
   for (const runtime of runtimes.splice(0)) {
     await runtime.stop().catch(() => undefined)
   }
+  for (const upstream of upstreams.splice(0)) {
+    await new Promise<void>((resolve) => upstream.close(() => resolve()))
+  }
   restoreEnv('KROUTER_DATA_DIR')
   restoreEnv('KROUTER_ADMIN_EMAIL')
   restoreEnv('KROUTER_ADMIN_PASSWORD')
@@ -103,5 +108,61 @@ describe('ProxyRuntime custom models persistence', () => {
     const runtime = createRuntime(store, userId)
     const status = await runtime.getStatus()
     expect((status.config as { customModels?: unknown[] }).customModels).toEqual([])
+  })
+
+  it('automatically imports and persists Custom API models during provider creation', async () => {
+    const upstreamPort = await getFreePort()
+    const upstream = http.createServer((request, response) => {
+      response.setHeader('content-type', 'application/json')
+      if (request.url === '/v1/models') {
+        response.end(JSON.stringify({ data: [{ id: 'gpt-auto' }, { id: 'reasoner-auto' }] }))
+        return
+      }
+      response.end(JSON.stringify({ error: 'unexpected route' }))
+    })
+    await new Promise<void>((resolve) => upstream.listen(upstreamPort, '127.0.0.1', resolve))
+    upstreams.push(upstream)
+
+    const { store, userId } = await createStore()
+    const runtime = createRuntime(store, userId)
+    const proxyPort = await getFreePort()
+    const result = await runtime.updateConfig({
+      port: proxyPort,
+      customApiProviders: [{
+        id: 'auto-provider',
+        name: 'Auto Provider',
+        enabled: true,
+        protocol: 'openai',
+        apiKey: 'sk-auto',
+        baseUrl: `http://127.0.0.1:${upstreamPort}`,
+        routePrefix: 'auto',
+        models: []
+      }]
+    } as never)
+
+    expect(result.success).toBe(true)
+    const status = await runtime.getStatus()
+    const providers = (status.config as {
+      customApiProviders?: Array<{ models?: string[]; keys?: unknown[]; modelsSyncedAt?: number }>
+    }).customApiProviders || []
+    expect(providers[0]).toMatchObject({
+      models: ['gpt-auto', 'reasoner-auto'],
+      keys: [expect.objectContaining({ name: 'Key 1', enabled: true })]
+    })
+    expect(providers[0].modelsSyncedAt).toEqual(expect.any(Number))
+
+    const catalog = await runtime.getModels()
+    expect(catalog.success).toBe(true)
+    expect(catalog.models).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'auto/gpt-auto', supportsThinking: true }),
+      expect.objectContaining({ id: 'auto/reasoner-auto', supportsThinking: true })
+    ]))
+
+    await runtime.stop()
+    const reloaded = createRuntime(store, userId)
+    const reloadedStatus = await reloaded.getStatus()
+    expect((reloadedStatus.config as {
+      customApiProviders?: Array<{ models?: string[] }>
+    }).customApiProviders?.[0].models).toEqual(['gpt-auto', 'reasoner-auto'])
   })
 })

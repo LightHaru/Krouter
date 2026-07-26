@@ -185,9 +185,25 @@ export function LogsPage() {
   }
 
   return (
-    <div className="flex h-full min-w-0 flex-col gap-2 p-3 sm:p-4">
+    <div className="logs-console flex h-full min-w-0 flex-col gap-2 p-3 sm:p-4">
+      <header className="logs-head">
+        <div>
+          <span><Bug /> RUNTIME OBSERVABILITY</span>
+          <h1>{isEn ? 'System event stream' : 'Luu su kien he thong'}</h1>
+          <p>{isEn ? 'Live proxy, account and provider diagnostics in one searchable timeline.' : 'Chan doan proxy, tai khoan va provider tren mot timeline co the tim kiem.'}</p>
+        </div>
+        <Badge variant={isAtBottom ? 'success' : 'secondary'}>{isAtBottom ? 'LIVE TAIL' : `${newLogCount} NEW`}</Badge>
+      </header>
+
+      <section className="logs-signal-rail">
+        <div><small>{isEn ? 'TOTAL EVENTS' : 'TONG SU KIEN'}</small><strong>{totalCount.toLocaleString()}</strong><span>{isEn ? 'stored' : 'da luu'}</span></div>
+        <div className="error"><small>ERROR</small><strong>{levelCounts.ERROR}</strong><span>{isEn ? 'requires attention' : 'can chu y'}</span></div>
+        <div className="warning"><small>WARN</small><strong>{levelCounts.WARN}</strong><span>{isEn ? 'degraded signals' : 'tin hieu bat thuong'}</span></div>
+        <div><small>{isEn ? 'CATEGORIES' : 'NHOM LOG'}</small><strong>{categories.length}</strong><span>{isEn ? 'sources' : 'nguon'}</span></div>
+        <div className={isAtBottom ? 'live' : ''}><small>STREAM</small><strong>{isAtBottom ? 'LIVE' : 'PAUSED'}</strong><span>{isEn ? 'tail follower' : 'theo doi log'}</span></div>
+      </section>
       {/* 工具栏 */}
-      <div className="flex flex-shrink-0 flex-wrap items-center gap-2">
+      <div className="logs-toolbar flex flex-shrink-0 flex-wrap items-center gap-2">
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <div className="p-1.5 rounded-lg bg-primary/10">
             <Bug className="h-4 w-4 text-primary" />
@@ -208,7 +224,7 @@ export function LogsPage() {
       </div>
 
       {/* 搜索 + 筛选 */}
-      <div className="flex flex-shrink-0 flex-wrap items-center gap-2">
+      <div className="logs-filter-bar flex flex-shrink-0 flex-wrap items-center gap-2">
         <div className="relative w-full min-w-0 sm:flex-1 sm:max-w-sm">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
           <Input
@@ -280,7 +296,7 @@ export function LogsPage() {
       </div>
 
       {/* 日志列表（虚拟滚动） */}
-      <div className="flex-1 min-h-0 relative rounded-lg border border-border/50 bg-card/50 overflow-hidden">
+      <div className="logs-stream flex-1 min-h-0 relative rounded-lg border border-border/50 bg-card/50 overflow-hidden">
         {filteredLogs.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-muted-foreground gap-2">
             <Filter className="h-8 w-8 opacity-20" />

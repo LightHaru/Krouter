@@ -2,6 +2,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, Button, Input, Label, Switch, Badge } from '../ui'
 import { ChevronDown, ChevronRight, Shield, AlertTriangle, RefreshCw, Download, Copy, CheckCircle2, FileText, Activity } from 'lucide-react'
+import { copyText } from '@/lib/utils'
 
 interface ProxyConfigSecurity {
   host: string
@@ -116,7 +117,7 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
 
   const handleCopyCert = useCallback(async () => {
     if (!certInfo?.cert) return
-    await navigator.clipboard.writeText(certInfo.cert)
+    await copyText(certInfo.cert)
     setCopiedCert(true)
     setTimeout(() => setCopiedCert(false), 2000)
   }, [certInfo])

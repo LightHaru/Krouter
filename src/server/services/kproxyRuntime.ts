@@ -11,6 +11,7 @@ import {
 } from '../../main/kproxy'
 import { getRuntimeUserDataPath } from '../../main/runtimePaths'
 import type { WebStore } from '../store'
+import type { MitmHttpsServer } from '../../main/kproxy/mitmHttpsServer'
 
 type EmitFn = (channel: string, ...args: unknown[]) => void
 
@@ -167,7 +168,13 @@ export class KProxyRuntime {
   async exportCaCert(exportPath?: string): Promise<{ success: boolean; path?: string; error?: string }> {
     const cert = await this.getCaCert()
     if (!cert.success || !cert.certPem) return { success: false, error: cert.error || 'CA certificate not available' }
-    const targetPath = exportPath || path.join(getRuntimeUserDataPath(), 'kproxy-ca.crt')
+    const baseDir = path.resolve(getRuntimeUserDataPath())
+    const targetPath = path.resolve(exportPath || path.join(baseDir, 'kproxy-ca.crt'))
+    // Đường dẫn do client gửi lên phải nằm trong thư mục dữ liệu runtime, nếu
+    // không một request có thể ghi đè bất kỳ file nào (kể cả store.json).
+    if (!targetPath.startsWith(baseDir + path.sep)) {
+      return { success: false, error: `Export path must stay inside ${baseDir}` }
+    }
     await fs.mkdir(path.dirname(targetPath), { recursive: true })
     await fs.writeFile(targetPath, cert.certPem, 'utf8')
     return { success: true, path: targetPath }
@@ -253,6 +260,7 @@ export class KProxyRuntime {
   // Phase 12: Model mappings
   getModelMappings(): { mappings: unknown[] } {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ module kproxy: bản server chỉ tải khi người dùng thật sự bật K-Proxy
       const { modelMapper } = require('../../main/kproxy/modelMapper')
       return { mappings: modelMapper.getMappings() }
     } catch {
@@ -262,6 +270,7 @@ export class KProxyRuntime {
 
   saveModelMappings(mappings: unknown[]): { success: boolean } {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ module kproxy: bản server chỉ tải khi người dùng thật sự bật K-Proxy
       const { modelMapper } = require('../../main/kproxy/modelMapper')
       modelMapper.setMappings(mappings)
       return { success: true }
@@ -270,46 +279,99 @@ export class KProxyRuntime {
     }
   }
 
-  private mitmServer: any = null
+  private mitmServer: MitmHttpsServer | null = null
 
   // Phase 12: MITM HTTPS Server
-  async mitmGetStatus(): Promise<{ running: boolean; port: number; connections: number; interceptedRequests: number }> {
+  async mitmGetStatus(): Promise<{
+    running: boolean
+    port: number
+    listenerReachable: boolean
+    routerReachable: boolean
+    lastDiagnosticAt: number | null
+    lastDiagnosticError: string | null
+    connections: number
+    interceptedRequests: number
+    passthroughRequests: number
+    byIdeType: Record<string, number>
+    routerSuccesses: number
+    routerFailures: number
+    lastRequestAt: number | null
+    lastInterceptAt: number | null
+    lastRouterStatus: number | null
+    recentDecisions: Array<Record<string, unknown>>
+  }> {
+    const empty = {
+      running: false,
+      port: 443,
+      listenerReachable: false,
+      routerReachable: false,
+      lastDiagnosticAt: null,
+      lastDiagnosticError: null,
+      connections: 0,
+      interceptedRequests: 0,
+      passthroughRequests: 0,
+      byIdeType: {},
+      routerSuccesses: 0,
+      routerFailures: 0,
+      lastRequestAt: null,
+      lastInterceptAt: null,
+      lastRouterStatus: null,
+      recentDecisions: []
+    }
     try {
       if (this.mitmServer) {
         const stats = this.mitmServer.getStats()
-        return { running: stats.running, port: stats.port, connections: stats.connections, interceptedRequests: stats.interceptedRequests }
+        return { ...empty, ...stats, recentDecisions: Array.isArray(stats.recentDecisions) ? (stats.recentDecisions as unknown as Record<string, unknown>[]) : [] }
       }
-      return { running: false, port: 443, connections: 0, interceptedRequests: 0 }
+      return empty
     } catch {
-      return { running: false, port: 443, connections: 0, interceptedRequests: 0 }
+      return empty
     }
   }
 
   async mitmStart(opts?: { port?: number }): Promise<{ success: boolean; error?: string }> {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ module kproxy: bản server chỉ tải khi người dùng thật sự bật K-Proxy
       const { MitmHttpsServer } = require('../../main/kproxy/mitmHttpsServer')
       const service = this.getOrCreateService()
       const caInfo = await service.initialize()
       if (!caInfo) return { success: false, error: 'Failed to initialize certificates' }
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ module kproxy: bản server chỉ tải khi người dùng thật sự bật K-Proxy
       const { createCertManager } = require('../../main/kproxy/certManager')
-      const certMgr = (service as any).certManager || createCertManager(getRuntimeUserDataPath() + '/kproxy')
+      const certMgr = service.getCertManager() || createCertManager(getRuntimeUserDataPath() + '/kproxy')
 
+      // Chỉ nhánh "chưa có instance" mới đọc opts.port, nên lần start thứ hai với cổng khác
+      // trước đây bị bỏ qua im lặng. Dựng lại instance khi cổng yêu cầu khác cổng hiện tại
+      // (server đang chạy thì giữ nguyên — muốn đổi cổng phải stop trước).
+      if (this.mitmServer && opts?.port && !this.mitmServer.isRunning() && this.mitmServer.getStats().port !== opts.port) {
+        this.mitmServer = null
+      }
       if (!this.mitmServer) {
         const config = opts?.port ? { port: opts.port } : undefined
-        this.mitmServer = new MitmHttpsServer(config)
+        this.mitmServer = new MitmHttpsServer(config) as MitmHttpsServer
       }
-      this.mitmServer.setCertManager(certMgr)
-      this.mitmServer.setOnRequest((info: any) => this.emit('mitm-request', info))
+      // Giữ tham chiếu cục bộ để TS thu hẹp được kiểu (this.mitmServer là nullable và là
+      // thuộc tính có thể thay đổi, nên TS không giữ được kết quả thu hẹp qua các lời gọi).
+      const mitmServer: MitmHttpsServer = this.mitmServer
+      mitmServer.setCertManager(certMgr)
+      mitmServer.setOnRequest((info) => this.emit('mitm-request', info))
 
       // Set the router API key from proxy config so MITM can forward authenticated requests
-      const proxyConfig = this.store.getUserSetting<any>(this.userId, 'proxyConfig', {})
-      const apiKeys: any[] = proxyConfig?.apiKeys || []
-      const activeKey = apiKeys.find((k: any) => k.enabled)
-      if (activeKey?.key) {
-        this.mitmServer.setRouterApiKey(activeKey.key)
+      const proxyConfig = this.store.getUserSetting<{ port?: number; apiKey?: string; apiKeys?: Array<{ key?: string; enabled?: boolean }> }>(this.userId, 'proxyConfig', {})
+      const apiKeys = proxyConfig?.apiKeys || []
+      const activeKey = apiKeys.find((k) => k.enabled)
+      const routerApiKey = activeKey?.key || proxyConfig?.apiKey
+      if (routerApiKey) {
+        mitmServer.setRouterApiKey(routerApiKey)
       }
 
-      await this.mitmServer.start()
+      // Parity với main/index.ts (mitm-start): phải bơm cổng proxy đang cấu hình vào MITM.
+      // Không gọi thì routerBase giữ mặc định 127.0.0.1:5580, runStartupDiagnostics ->
+      // probeRouter fail và start() reject — nghĩa là KHÔNG thể bật MITM từ dashboard web
+      // khi proxy chạy ở cổng khác, kèm thông báo lỗi trỏ vào cổng người dùng chưa từng đặt.
+      mitmServer.setRouterBase(`http://127.0.0.1:${proxyConfig?.port || 5580}`)
+
+      await mitmServer.start()
       return { success: true }
     } catch (e) {
       return { success: false, error: (e as Error).message }
@@ -330,6 +392,7 @@ export class KProxyRuntime {
   // Phase 12: Hosts file management
   async getHostsStatus(): Promise<{ enabled: boolean; entries: unknown[] }> {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ module kproxy: bản server chỉ tải khi người dùng thật sự bật K-Proxy
       const { hostsManager } = require('../../main/kproxy/hostsManager')
       return await hostsManager.getStatus()
     } catch {
@@ -339,6 +402,7 @@ export class KProxyRuntime {
 
   async toggleHosts(enabled: boolean): Promise<{ success: boolean; error?: string }> {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ module kproxy: bản server chỉ tải khi người dùng thật sự bật K-Proxy
       const { hostsManager } = require('../../main/kproxy/hostsManager')
       if (enabled) {
         await hostsManager.addEntries(hostsManager.getDefaultEntries())
@@ -346,6 +410,17 @@ export class KProxyRuntime {
         await hostsManager.removeEntries()
       }
       return { success: true }
+    } catch (e) {
+      return { success: false, error: (e as Error).message }
+    }
+  }
+
+  async setHostsIdeTypes(ideTypes: string[]): Promise<{ success: boolean; enabled?: boolean; entries?: unknown[]; error?: string }> {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ module kproxy: bản server chỉ tải khi người dùng thật sự bật K-Proxy
+      const { hostsManager } = require('../../main/kproxy/hostsManager')
+      const status = await hostsManager.setEnabledIdeTypes(ideTypes)
+      return { success: true, ...status }
     } catch (e) {
       return { success: false, error: (e as Error).message }
     }

@@ -564,6 +564,7 @@ async function loginUi(page) {
 }
 
 const viBatch = {
+  nav: 'Đăng ký',
   title: 'Đăng ký hàng loạt',
   start: 'Bắt đầu hàng loạt',
   stop: 'Dừng hàng loạt',
@@ -579,6 +580,21 @@ const viBatch = {
   progress: (done, total) => `Tiến độ: ${done}/${total}`,
   success: (count) => `Thành công: ${count}`,
   failed: (count) => `Thất bại: ${count}`
+}
+
+async function openBatchRegistration(page) {
+  await page.locator(`nav button[title="${viBatch.nav}"]`).click()
+  await page.getByText(viBatch.title, { exact: true }).waitFor()
+}
+
+async function serveSeededAccountData(route, body, seededData) {
+  if (body?.method !== 'loadAccounts') return false
+  await route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(seededData)
+  })
+  return true
 }
 
 function viBatchLabel(label) {
@@ -626,6 +642,7 @@ await test('ui', 'all application pages render without a page crash', async () =
     await loginUi(page)
     const navButtons = page.locator('nav button')
     const renderedPages = await navButtons.count()
+    const routeUrls = []
     assert.ok(renderedPages >= 15, `Expected at least 15 application pages, got ${renderedPages}`)
     for (let index = 0; index < renderedPages; index++) {
       await navButtons.nth(index).click()
@@ -633,9 +650,29 @@ await test('ui', 'all application pages render without a page crash', async () =
       await waitFor(async () => (await page.locator('main').innerText()).trim().length > 5, 5000, 100)
       const text = (await page.locator('main').innerText()).trim()
       assert.ok(text.length > 5, `Page ${index} rendered blank`)
+      assert.match(page.url(), /#\//, `Page ${index} did not expose a durable hash route`)
+      routeUrls.push(page.url())
+    }
+
+    const accountsUrl = routeUrls.find((url) => url.endsWith('#/accounts'))
+    assert.ok(accountsUrl, 'Accounts route was not registered')
+    await page.goto(accountsUrl)
+    await page.reload()
+    await page.getByRole('heading', { name: /Accounts|Tài khoản|账户/ }).waitFor({ timeout: 10000 })
+    assert.equal(page.url(), accountsUrl, 'Refresh did not preserve the Accounts route')
+
+    await page.setViewportSize({ width: 390, height: 844 })
+    for (const routeUrl of routeUrls) {
+      await page.goto(routeUrl)
+      await waitFor(async () => (await page.locator('main').innerText()).trim().length > 5, 7000, 100)
+      const layout = await page.evaluate(() => ({
+        clientWidth: document.documentElement.clientWidth,
+        scrollWidth: document.documentElement.scrollWidth
+      }))
+      assert.ok(layout.scrollWidth <= layout.clientWidth, `Mobile horizontal overflow at ${routeUrl}: ${layout.scrollWidth}px > ${layout.clientWidth}px`)
     }
     assert.deepEqual(pageErrors, [])
-    return { renderedPages }
+    return { renderedPages, mobilePages: routeUrls.length, refreshRoute: accountsUrl }
   } finally {
     await context.close()
     await browser.close()
@@ -684,6 +721,7 @@ await test('batch', 'controlled batch retry, concurrency, pause, resume, stop an
   }
   await page.route('**/api/ipc', async (route) => {
     const body = route.request().postDataJSON?.()
+    if (await serveSeededAccountData(route, body, seededData)) return
     if (body?.method === 'networkRouteValidate') {
       await route.fulfill({
         status: 200,
@@ -773,7 +811,9 @@ await test('batch', 'controlled batch retry, concurrency, pause, resume, stop an
               status: 'success',
               email: state.scenario === 'autoimportBlocked' ? 'blocked@example.invalid' : 'autoimport@example.invalid',
               password: 'controlled',
-              refreshToken: 'controlled-refresh-token',
+              refreshToken: state.scenario === 'autoimportBlocked'
+                ? 'controlled-blocked-refresh-token'
+                : 'controlled-refresh-token',
               clientId: 'controlled-client-id',
               clientSecret: 'controlled-client-secret',
               accessToken: 'controlled-access-token',
@@ -798,7 +838,7 @@ await test('batch', 'controlled batch retry, concurrency, pause, resume, stop an
 
   try {
     await loginUi(page)
-    await page.locator('nav button').nth(7).click()
+    await openBatchRegistration(page)
     await page.getByText(viBatch.title, { exact: true }).waitFor()
     await setBatchField('Count', 4)
     await setBatchField('Interval (s)', 0)
@@ -904,6 +944,7 @@ await test('batch', 'terminal 403 stops batch without retrying or launching rema
       batchAutoImport: false,
       batchRetries: 2,
       batchConcurrency: 1,
+      batchContinueOnError: false,
       autoFetchProLink: false,
       tingamefiMailApiUrl: 'https://mail.invalid',
       tingamefiMailAdminPassword: 'controlled-test',
@@ -916,6 +957,7 @@ await test('batch', 'terminal 403 stops batch without retrying or launching rema
   const state = { calls: 0, cancelCalls: 0 }
   await page.route('**/api/ipc', async (route) => {
     const body = route.request().postDataJSON?.()
+    if (await serveSeededAccountData(route, body, seededData)) return
     if (body?.method === 'networkRouteValidate') {
       await route.fulfill({
         status: 200,
@@ -955,13 +997,14 @@ await test('batch', 'terminal 403 stops batch without retrying or launching rema
 
   try {
     await loginUi(page)
-    await page.locator('nav button').nth(7).click()
+    await openBatchRegistration(page)
     await page.getByText(viBatch.title, { exact: true }).waitFor()
     await setBatchField('Count', 4)
     await setBatchField('Interval (s)', 0)
     await setBatchField('Retries', 2)
     await setBatchField('Concurrency', 1)
     await clickBatchStart(page)
+    await waitFor(() => state.calls >= 1)
     await waitForBatchStartButton(page)
     assert.equal(state.calls, 1)
     assert.ok(state.cancelCalls >= 1)
@@ -1008,6 +1051,7 @@ await test('batch', 'repeated SubmitEmail 403 trips the safety circuit even when
   const state = { calls: 0, cancelCalls: 0 }
   await page.route('**/api/ipc', async (route) => {
     const body = route.request().postDataJSON?.()
+    if (await serveSeededAccountData(route, body, seededData)) return
     if (body?.method === 'networkRouteValidate') {
       await route.fulfill({
         status: 200,
@@ -1042,7 +1086,7 @@ await test('batch', 'repeated SubmitEmail 403 trips the safety circuit even when
 
   try {
     await loginUi(page)
-    await page.locator('nav button').nth(7).click()
+    await openBatchRegistration(page)
     await page.getByText(viBatch.title, { exact: true }).waitFor()
     await clickBatchStart(page)
     await waitFor(() => state.calls >= 1)
@@ -1079,6 +1123,7 @@ await test('batch', 'TES/BLOCKED SendOTP error stops batch without retrying or l
       batchAutoImport: false,
       batchRetries: 2,
       batchConcurrency: 1,
+      batchContinueOnError: false,
       autoFetchProLink: false,
       tingamefiMailApiUrl: 'https://mail.invalid',
       tingamefiMailAdminPassword: 'controlled-test',
@@ -1091,6 +1136,7 @@ await test('batch', 'TES/BLOCKED SendOTP error stops batch without retrying or l
   const state = { calls: 0, cancelCalls: 0 }
   await page.route('**/api/ipc', async (route) => {
     const body = route.request().postDataJSON?.()
+    if (await serveSeededAccountData(route, body, seededData)) return
     if (body?.method === 'networkRouteValidate') {
       await route.fulfill({
         status: 200,
@@ -1130,7 +1176,7 @@ await test('batch', 'TES/BLOCKED SendOTP error stops batch without retrying or l
 
   try {
     await loginUi(page)
-    await page.locator('nav button').nth(7).click()
+    await openBatchRegistration(page)
     await page.getByText(viBatch.title, { exact: true }).waitFor()
     await setBatchField('Count', 4)
     await setBatchField('Interval (s)', 0)
@@ -1198,6 +1244,7 @@ await test('batch', 'empty enabled proxy pool blocks batch before launching item
   const state = { calls: 0 }
   await page.route('**/api/ipc', async (route) => {
     const body = route.request().postDataJSON?.()
+    if (await serveSeededAccountData(route, body, seededData)) return
     if (body?.method === 'registrationStartAuto') {
       state.calls++
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: false, error: 'should not launch' }) })
@@ -1208,7 +1255,7 @@ await test('batch', 'empty enabled proxy pool blocks batch before launching item
 
   try {
     await loginUi(page)
-    await page.locator('nav button').nth(7).click()
+    await openBatchRegistration(page)
     await page.getByText(viBatch.title, { exact: true }).waitFor()
     await clickBatchStart(page)
     await page.waitForTimeout(500)
@@ -1240,6 +1287,7 @@ await test('batch', 'controlled proxy pool is passed to auto registration', asyn
       label: 'e2e session proxy',
       source: 'e2e',
       status: 'alive',
+      latencyMs: 12,
       usedCount: 0,
       failCount: 0,
       enabled: true,
@@ -1285,6 +1333,7 @@ await test('batch', 'controlled proxy pool is passed to auto registration', asyn
   const state = { calls: 0, registrationConfig: null }
   await page.route('**/api/ipc', async (route) => {
     const body = route.request().postDataJSON?.()
+    if (await serveSeededAccountData(route, body, seededData)) return
     if (body?.method === 'proxyPoolValidate') {
       await route.fulfill({
         status: 200,
@@ -1323,7 +1372,7 @@ await test('batch', 'controlled proxy pool is passed to auto registration', asyn
 
   try {
     await loginUi(page)
-    await page.locator('nav button').nth(7).click()
+    await openBatchRegistration(page)
     await page.getByText(viBatch.title, { exact: true }).waitFor()
     await clickBatchStart(page)
     await page.getByText(viBatch.progress(1, 1), { exact: true }).waitFor({ timeout: 10000 })
@@ -1381,6 +1430,7 @@ await test('batch', 'client proxy source is passed to auto registration in stric
   const state = { calls: 0, registrationConfig: null, validatedProxy: null, validatedUpstream: null }
   await page.route('**/api/ipc', async (route) => {
     const body = route.request().postDataJSON?.()
+    if (await serveSeededAccountData(route, body, seededData)) return
     if (body?.method === 'proxyPoolValidate') {
       state.validatedProxy = body.args?.[0]?.url || null
       state.validatedUpstream = body.args?.[0]?.upstreamProxy || null
@@ -1416,7 +1466,7 @@ await test('batch', 'client proxy source is passed to auto registration in stric
 
   try {
     await loginUi(page)
-    await page.locator('nav button').nth(7).click()
+    await openBatchRegistration(page)
     await page.getByText(viBatch.title, { exact: true }).waitFor()
     await clickBatchStart(page)
     await page.getByText(viBatch.progress(1, 1), { exact: true }).waitFor({ timeout: 10000 })

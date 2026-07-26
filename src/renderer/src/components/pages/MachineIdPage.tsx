@@ -24,7 +24,7 @@ import {
   Users,
   Search
 } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, copyText } from '@/lib/utils'
 
 export function MachineIdPage() {
   const {
@@ -82,7 +82,7 @@ export function MachineIdPage() {
 
   // 复制机器码到剪贴板
   const copyToClipboard = (text: string, id: string = 'default') => {
-    navigator.clipboard.writeText(text)
+    copyText(text)
     setCopiedId(id)
     setTimeout(() => setCopiedId(null), 1500)
   }

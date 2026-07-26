@@ -2,7 +2,9 @@
 // 含 SOCKS5/SOCKS4 代理支持（通过 socks 包 + undici Agent.connect 钩子）
 
 import { ProxyAgent, Agent, type Dispatcher } from 'undici'
+import * as net from 'net'
 import * as tls from 'tls'
+import { execSync } from 'child_process'
 
 let _cachedSystemProxy: string | null = null
 let _systemProxyCacheTime = 0
@@ -69,7 +71,6 @@ export function getSystemProxy(): string | null {
   }
   try {
     if (process.platform === 'win32') {
-      const { execSync } = require('child_process')
       const result = execSync(
         'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyEnable',
         { encoding: 'utf8', timeout: 3000, windowsHide: true }
@@ -88,7 +89,6 @@ export function getSystemProxy(): string | null {
         }
       }
     } else if (process.platform === 'darwin') {
-      const { execSync } = require('child_process')
       const result = execSync('scutil --proxy', { encoding: 'utf8', timeout: 3000 })
       // 优先 HTTPS 代理，回退到 HTTP 代理（仅 undici 支持的 http/https 协议）
       const httpsEnabled = /HTTPSEnable\s*:\s*1/.test(result)
@@ -115,7 +115,9 @@ export function getSystemProxy(): string | null {
       }
       // macOS 仅配 SOCKS 时 undici 不支持，静默回退直连（safeCreateProxyAgent 也会兜底）
     }
-  } catch { /* 检测失败静默回退直连 */ }
+  } catch {
+    /* 检测失败静默回退直连 */
+  }
   _cachedSystemProxy = null
   _systemProxyCacheTime = now
   return null
@@ -131,9 +133,7 @@ export function getSystemProxy(): string | null {
  * URL 无效或协议无法支持时返回 undefined，让调用方回退直连，
  * 而不会让异常向上传播阻塞业务流程。
  */
-export function safeCreateProxyAgent(
-  proxyUrl: string | null | undefined
-): Dispatcher | undefined {
+export function safeCreateProxyAgent(proxyUrl: string | null | undefined): Dispatcher | undefined {
   if (!proxyUrl) return undefined
 
   // 校验 URL
@@ -150,7 +150,13 @@ export function safeCreateProxyAgent(
   // http / https 走原生 ProxyAgent
   if (protocol === 'http:' || protocol === 'https:') {
     try {
-      return new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+      // Bảo mật: KHÔNG đặt requestTls.rejectUnauthorized = false ở đây.
+      // Đây là factory dispatcher duy nhất dùng cho registrar, dịch vụ email, dò IP đầu ra và
+      // các provider; tắt xác thực đồng nghĩa bất kỳ ai đứng giữa tại proxy đều có thể trình
+      // chứng chỉ giả cho login.microsoftonline.com / oidc.us-east-1.amazonaws.com và thu thập
+      // refresh token OAuth cùng mật khẩu admin x-admin-auth ở dạng rõ.
+      // Bỏ trống requestTls để undici dùng mặc định an toàn (rejectUnauthorized = true).
+      return new ProxyAgent({ uri: proxyUrl })
     } catch (err) {
       console.warn(`[Proxy] 创建 HTTP ProxyAgent 失败，回退直连: ${proxyUrl}`, err)
       return undefined
@@ -158,7 +164,12 @@ export function safeCreateProxyAgent(
   }
 
   // SOCKS 走自定义 connect
-  if (protocol === 'socks5:' || protocol === 'socks5h:' || protocol === 'socks4:' || protocol === 'socks4a:') {
+  if (
+    protocol === 'socks5:' ||
+    protocol === 'socks5h:' ||
+    protocol === 'socks4:' ||
+    protocol === 'socks4a:'
+  ) {
     try {
       return createSocksDispatcher(u)
     } catch (err) {
@@ -183,17 +194,28 @@ function createSocksDispatcher(u: URL): Agent {
   const userId = u.username ? decodeURIComponent(u.username) : undefined
   const password = u.password ? decodeURIComponent(u.password) : undefined
 
-  // undici Agent.connect callback 的类型签名是 (err: Error, socket: null) | (err: null, socket: Socket)
-  // 用宽松 any 包装避免严格类型不匹配，运行时行为完全正确
+  // Chữ ký callback của undici Agent.connect là union
+  // (err: Error, socket: null) | (err: null, socket: Socket) — TS không diễn đạt được kiểu
+  // đó ở vị trí tham số, nên khai báo tường minh phần thật sự dùng thay vì `any`.
+  type ConnectOptions = {
+    hostname?: string
+    host?: string
+    port?: number | string
+    protocol?: string
+    servername?: string
+    rejectUnauthorized?: boolean
+  }
+  type ConnectCallback = (err: Error | null, socket: net.Socket | tls.TLSSocket | null) => void
+
   return new Agent({
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    connect: ((options: any, callback: any): void => {
+    connect: ((options: ConnectOptions, callback: ConnectCallback): void => {
       const targetHost = options.hostname || options.host || ''
       const targetPort = Number(options.port) || (options.protocol === 'https:' ? 443 : 80)
 
       // 动态导入 socks 库
       let SocksClient: typeof import('socks').SocksClient
       try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports -- nạp trễ: socks là phụ thuộc tuỳ chọn, chỉ cần khi proxy dùng SOCKS
         SocksClient = require('socks').SocksClient
       } catch (err) {
         callback(err as Error, null)
@@ -211,7 +233,10 @@ function createSocksDispatcher(u: URL): Agent {
             const tlsSocket = tls.connect({
               socket,
               servername: options.servername || targetHost,
-              rejectUnauthorized: options.rejectUnauthorized ?? false
+              // Mặc định an toàn: undici không bao giờ truyền rejectUnauthorized xuống connect hook,
+              // nên `?? false` trước đây khiến MỌI kết nối HTTPS qua SOCKS bỏ qua xác thực chứng chỉ.
+              // Chỉ tôn trọng giá trị false khi caller truyền vào một cách tường minh.
+              rejectUnauthorized: options.rejectUnauthorized ?? true
             })
             tlsSocket.once('secureConnect', () => callback(null, tlsSocket))
             tlsSocket.once('error', (err) => callback(err, null))
@@ -220,7 +245,8 @@ function createSocksDispatcher(u: URL): Agent {
           }
         })
         .catch((err: Error) => callback(err, null))
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    }) as any
+      // Ép kiểu ở đúng một chỗ: hàm ở trên khớp hợp đồng lúc chạy của undici, chỉ khác cách
+      // undici khai báo union err/socket ở mức kiểu.
+    }) as unknown as Agent.Options['connect']
   })
 }

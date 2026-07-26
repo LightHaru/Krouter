@@ -3,6 +3,7 @@ import { Button, Badge, Input } from '../ui'
 import { Trash2, RefreshCw, Download, Search, X, Copy, ChevronDown, ChevronUp, ChevronsDown, ArrowDown, Filter } from 'lucide-react'
 import { useTranslation } from '../../hooks/useTranslation'
 import { useVirtualizer } from '@tanstack/react-virtual'
+import { copyText } from '@/lib/utils'
 
 interface LogEntry {
   timestamp: string
@@ -196,7 +197,7 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
   const handleCopyLog = (log: LogEntry) => {
     const dataStr = log.data ? `\nData: ${JSON.stringify(log.data, null, 2)}` : ''
     const content = `[${log.timestamp}] [${log.level}] [${log.category}]\n${log.message}${dataStr}`
-    navigator.clipboard.writeText(content)
+    copyText(content)
   }
 
   const toggleExpand = (index: number) => {

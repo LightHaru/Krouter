@@ -7,7 +7,7 @@ import {
 import { useTranslation } from '@/hooks/useTranslation'
 import { useAccountsStore } from '@/store/accounts'
 import { Card, CardContent, CardHeader, CardTitle, Button, Badge, Label, Input } from '../ui'
-import { cn } from '@/lib/utils'
+import { cn, copyText } from '@/lib/utils'
 
 /** 账号测活：常用模型候选（可在输入框自定义其它模型 ID） */
 const LIVENESS_MODELS = [
@@ -179,36 +179,81 @@ export function DiagnosePage(): React.ReactNode {
   })
   const [modelsLoading, setModelsLoading] = useState(false)
   // datalist 选项 = 缓存的真实模型 ∪ 内置常用候选（去重，缓存优先）
-  const modelOptions = useMemo(() => Array.from(new Set([...cachedModels, ...LIVENESS_MODELS])), [cachedModels])
+  // Real account models are authoritative. Built-ins are only an offline fallback.
+  const modelOptions = useMemo(
+    () => cachedModels.length > 0 ? cachedModels : LIVENESS_MODELS,
+    [cachedModels]
+  )
+
+  const modelTargetAccounts = useMemo(() => {
+    if (livenessMode === 'selected') return selectedAccounts
+    const account = accounts.get(livenessAccountId)
+    return account ? [account] : []
+  }, [livenessMode, selectedAccounts, accounts, livenessAccountId])
 
   // 模型选择持久化
   useEffect(() => {
     try { localStorage.setItem('kiro-liveness-model', livenessModel) } catch { /* ignore */ }
   }, [livenessModel])
 
-  /** 拉取真实可用模型并缓存：优先代理缓存模型，回退 Kiro 可用模型；失败保留上次缓存 */
+  /** Fetch models for target accounts; batch mode uses models shared by all accounts. */
   const loadModels = useCallback(async (): Promise<void> => {
     setModelsLoading(true)
     try {
       let models: string[] = []
-      try {
-        const r = await window.api.proxyGetModels()
-        if (r.success && r.models?.length) models = r.models.map((m) => m.id)
-      } catch { /* 代理未启动则忽略，走下面回退 */ }
+      if (modelTargetAccounts.length > 0) {
+        const perAccountModels = await Promise.all(modelTargetAccounts.map(async (account) => {
+          const cred = account.credentials
+          if (!cred.accessToken) return [] as string[]
+          try {
+            const result = await window.api.accountGetModels(
+              cred.accessToken,
+              cred.region,
+              account.profileArn,
+              account.machineId,
+              cred.provider || account.idp,
+              cred.authMethod,
+              account.id
+            )
+            return result.success ? result.models.map((item) => item.id) : []
+          } catch {
+            return [] as string[]
+          }
+        }))
+        const successfulLists = perAccountModels.filter((items) => items.length > 0)
+        if (successfulLists.length > 0) {
+          models = successfulLists.slice(1).reduce(
+            (shared, items) => shared.filter((id) => items.includes(id)),
+            successfulLists[0]
+          )
+        }
+      }
+      if (models.length === 0) {
+        try {
+          const r = await window.api.proxyGetModels()
+          if (r.success && r.models?.length) models = r.models.map((m) => m.id)
+        } catch { /* Proxy may not be running. */ }
+      }
       if (models.length === 0) {
         try {
           const r = await window.api.getKiroAvailableModels()
           if (r.models?.length) models = r.models.map((m) => m.id)
-        } catch { /* 无 active 账号则忽略 */ }
+        } catch { /* No active account. */ }
       }
       if (models.length > 0) {
-        setCachedModels(models)
-        try { localStorage.setItem('kiro-liveness-models-cache', JSON.stringify(models)) } catch { /* ignore */ }
+        const uniqueModels = Array.from(new Set(models))
+        setCachedModels(uniqueModels)
+        setLivenessModel((current) => {
+          if (uniqueModels.includes(current)) return current
+          return ['claude-sonnet-4.5', 'claude-sonnet-4', 'claude-haiku-4.5', 'auto']
+            .find((id) => uniqueModels.includes(id)) || uniqueModels[0]
+        })
+        try { localStorage.setItem('kiro-liveness-models-cache', JSON.stringify(uniqueModels)) } catch { /* ignore */ }
       }
     } finally {
       setModelsLoading(false)
     }
-  }, [])
+  }, [modelTargetAccounts])
 
   // 进入页面后台刷新一次模型列表（成功则更新缓存，失败则保留上次）
   useEffect(() => { void loadModels() }, [loadModels])
@@ -502,8 +547,15 @@ export function DiagnosePage(): React.ReactNode {
       }
       lines.push('')
     }
-    void navigator.clipboard.writeText(lines.join('\n'))
-    alert(isEn ? 'Report copied to clipboard' : '诊断报告已复制到剪贴板')
+    // Chỉ báo thành công khi thật sự chép được: trên dashboard chạy HTTP thuần, clipboard
+    // API không khả dụng nên trước đây alert này luôn nói dối (hoặc không bao giờ chạy).
+    void copyText(lines.join('\n')).then((ok) => {
+      if (ok) {
+        alert(isEn ? 'Report copied to clipboard' : '诊断报告已复制到剪贴板')
+      } else {
+        alert(isEn ? 'Could not access the clipboard. Select the report text and copy manually.' : '无法访问剪贴板，请手动选择文本复制。')
+      }
+    })
   }, [buildTargets, results, useProxy, selectedProxyId, proxyPool, isEn])
 
   const stats = (() => {

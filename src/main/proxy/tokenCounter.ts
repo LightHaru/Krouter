@@ -64,8 +64,8 @@ function normalizeModelId(id: string): string {
   return id
     .toLowerCase()
     .replace(/[-._]/g, '')
-    .replace(/\d{8}/g, '')   // 移除日期 (20251001)
-    .replace(/v\d+$/g, '')    // 移除尾部版本号 (v1)
+    .replace(/\d{8}/g, '') // 移除日期 (20251001)
+    .replace(/v\d+$/g, '') // 移除尾部版本号 (v1)
     .replace(/v\d+_\d+$/g, '') // 移除 v1_0 形式
 }
 
@@ -84,11 +84,30 @@ function guessContextFromCache(modelId: string): number | undefined {
     if (normalizeModelId(id) === queryNorm) return ctx
   }
   // 双向子串匹配（处理别名简短形式）
+  // Lấy entry ĐẦU TIÊN theo thứ tự chèn là sai: nếu `claude-sonnet-4` → 200000 được chèn trước
+  // `claude-sonnet-4.5` → 1000000 thì truy vấn cho 4.5 nhận 200000, và getEffectiveTokenLimit
+  // cắt lịch sử xuống 180K trên model có context 1M. Chọn ứng viên có id chuẩn hoá DÀI NHẤT
+  // (khớp sát nhất), ưu tiên khớp tiền tố hơn khớp chuỗi con thường khi cả hai cùng tồn tại.
+  let bestCtx: number | undefined
+  let bestLen = -1
+  let bestIsPrefix = false
   for (const [id, ctx] of modelContextWindowCache) {
     const idNorm = normalizeModelId(id)
-    if (idNorm.includes(queryNorm) || queryNorm.includes(idNorm)) return ctx
+    if (!idNorm) continue
+    if (!idNorm.includes(queryNorm) && !queryNorm.includes(idNorm)) continue
+    const isPrefix = idNorm.startsWith(queryNorm) || queryNorm.startsWith(idNorm)
+    if (isPrefix && !bestIsPrefix) {
+      bestCtx = ctx
+      bestLen = idNorm.length
+      bestIsPrefix = true
+      continue
+    }
+    if (isPrefix === bestIsPrefix && idNorm.length > bestLen) {
+      bestCtx = ctx
+      bestLen = idNorm.length
+    }
   }
-  return undefined
+  return bestCtx
 }
 
 /**
@@ -114,7 +133,12 @@ export function getModelContextLength(modelId: string | undefined | null): numbe
   const id = modelId.toLowerCase()
 
   // Claude 系列（默认 200K）
-  if (id.includes('claude-opus-4') || id.includes('claude-sonnet-4') || id.includes('claude-haiku-4')) return 200000
+  if (
+    id.includes('claude-opus-4') ||
+    id.includes('claude-sonnet-4') ||
+    id.includes('claude-haiku-4')
+  )
+    return 200000
   if (id.includes('claude-3-7') || id.includes('claude-3.7')) return 200000
   if (id.includes('claude-3-5') || id.includes('claude-3.5')) return 200000
   if (id.includes('claude-3')) return 200000
@@ -132,7 +156,8 @@ export function getModelContextLength(modelId: string | undefined | null): numbe
   if (id.includes('o1') || id.includes('o3')) return 128000
 
   // Gemini 系列
-  if (id.includes('gemini-2.5') || id.includes('gemini-2.0') || id.includes('gemini-1.5')) return 1000000
+  if (id.includes('gemini-2.5') || id.includes('gemini-2.0') || id.includes('gemini-1.5'))
+    return 1000000
   if (id.includes('gemini')) return 32768
 
   // Amazon Titan / Nova 系列

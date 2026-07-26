@@ -8,7 +8,7 @@ import {
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { Card, CardContent, CardHeader, CardTitle, Button, Input, Label, Switch, Badge } from '../ui'
-import { cn } from '@/lib/utils'
+import { cn, copyText } from '@/lib/utils'
 import type { ProxyEntry, ProxyPoolStrategy } from '@/types/proxy'
 import { IP_DETECT_ENDPOINTS } from '@/types/proxy'
 
@@ -111,6 +111,7 @@ function ChainDiagnosisCard({
 interface PoolHealthStats {
   total: number
   enabled: number
+  reachable: number
   alive: number
   slow: number
   dead: number
@@ -128,7 +129,7 @@ interface PoolHealthStats {
 function computePoolHealth(proxies: ProxyEntry[], maxUsableLatencyMs: number): PoolHealthStats {
   const stats: PoolHealthStats = {
     total: proxies.length,
-    enabled: 0, alive: 0, slow: 0, dead: 0, untested: 0, testing: 0,
+    enabled: 0, reachable: 0, alive: 0, slow: 0, dead: 0, untested: 0, testing: 0,
     totalUsed: 0, totalFailed: 0, totalSuccess: 0,
     successRate: null,
     avgLatencyMs: null,
@@ -142,7 +143,8 @@ function computePoolHealth(proxies: ProxyEntry[], maxUsableLatencyMs: number): P
       Number.isFinite(p.latencyMs) &&
       p.latencyMs >= 0 &&
       p.latencyMs <= maxUsableLatencyMs
-    if (p.status === 'alive' && latencyIsUsable) stats.alive++
+    if (p.status === 'alive' || p.status === 'slow') stats.reachable++
+    if (p.enabled && p.status === 'alive' && latencyIsUsable) stats.alive++
     else if (p.status === 'alive' || p.status === 'slow') stats.slow++
     else if (p.status === 'dead') stats.dead++
     else if (p.status === 'untested') stats.untested++
@@ -201,7 +203,7 @@ function StatTile({
 
 function HealthDashboard({ stats, isEn }: { stats: PoolHealthStats; isEn: boolean }): React.ReactNode {
   if (stats.total === 0) return null
-  const availabilityRate = stats.total > 0 ? stats.alive / stats.total : 0
+  const availabilityRate = stats.total > 0 ? stats.reachable / stats.total : 0
   const successPct = stats.successRate !== null ? Math.round(stats.successRate * 100) : null
   const successTone: 'green' | 'amber' | 'red' | 'default' = successPct === null ? 'default'
     : successPct >= 80 ? 'green' : successPct >= 50 ? 'amber' : 'red'
@@ -222,10 +224,16 @@ function HealthDashboard({ stats, isEn }: { stats: PoolHealthStats; isEn: boolea
             value={<>{stats.total}<span className="text-muted-foreground text-base"> / {stats.enabled}</span></>}
           />
           <StatTile
-            label={isEn ? 'Availability' : '可用率'}
+            label={isEn ? 'Reachable' : '可连接'}
             value={`${Math.round(availabilityRate * 100)}%`}
-            sub={`${stats.alive} ${isEn ? 'fast and usable' : '快速可用'}`}
+            sub={`${stats.reachable} ${isEn ? 'live connections' : '可用连接'}`}
             tone={availTone}
+          />
+          <StatTile
+            label={isEn ? 'Registration-ready' : '可用于注册'}
+            value={stats.alive}
+            sub={`${stats.slow} ${isEn ? 'live but over latency limit' : '超过延迟限制'}`}
+            tone={stats.alive > 0 ? 'green' : 'amber'}
           />
           <StatTile
             label={isEn ? 'Success Rate' : '成功率'}
@@ -242,11 +250,6 @@ function HealthDashboard({ stats, isEn }: { stats: PoolHealthStats; isEn: boolea
             label={isEn ? 'Dead' : '失效'}
             value={stats.dead}
             tone={stats.dead > 0 ? 'red' : 'default'}
-          />
-          <StatTile
-            label={isEn ? 'Untested' : '未测试'}
-            value={stats.untested + stats.testing}
-            tone={stats.untested > 0 ? 'amber' : 'default'}
           />
         </div>
 
@@ -544,7 +547,7 @@ export function ProxyPoolPage(): React.ReactNode {
       }
       // 全文搜索（host / port / protocol / username / label / lastBoundEmail / url / tags）
       if (filterText) {
-        const q = filterText.toLowerCase().trim()
+        const terms = filterText.toLowerCase().trim().split(/\s+/).filter(Boolean)
         const haystack = [
           p.host,
           String(p.port),
@@ -556,7 +559,7 @@ export function ProxyPoolPage(): React.ReactNode {
           (p.tags || []).join(' '),
           p.source || ''
         ].join(' ').toLowerCase()
-        if (!haystack.includes(q)) return false
+        if (!terms.every((term) => haystack.includes(term))) return false
       }
       return true
     })
@@ -795,6 +798,9 @@ export function ProxyPoolPage(): React.ReactNode {
                 }}
                 className="h-8 text-xs"
               />
+              <p className="text-[10px] text-muted-foreground">
+                {isEn ? 'Reachable proxies above this limit remain visible as Slow; they are not counted as routing-ready.' : '可连接但超过该限制的代理会保留为 Slow，不参与自动路由。'}
+              </p>
             </div>
           </div>
 
@@ -872,10 +878,10 @@ export function ProxyPoolPage(): React.ReactNode {
               </label>
               <label className="flex items-center gap-2 text-xs">
                 <Switch
-                  checked
-                  disabled
+                  checked={proxyPoolConfig.sourceRemoveDead}
+                  onCheckedChange={(v) => setProxyPoolConfig({ sourceRemoveDead: v })}
                 />
-                <span>{isEn ? 'Remove slow/dead source proxies' : 'Xóa proxy nguồn chậm/die'}</span>
+                <span>{isEn ? 'Remove unreachable source proxies' : 'Xóa proxy nguồn không thể kết nối'}</span>
               </label>
               <label className="flex items-center gap-2 text-xs">
                 <Switch
@@ -937,10 +943,10 @@ export function ProxyPoolPage(): React.ReactNode {
             <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-2 text-[11px]">
               <div><span className="text-muted-foreground">{isEn ? 'Source' : 'Nguồn'}</span><div className="font-mono">{maintenanceStatus?.sourceCandidates ?? 0}</div></div>
               <div><span className="text-muted-foreground">{isEn ? 'Checked' : 'Đã check'}</span><div className="font-mono">{maintenanceStatus?.proxiesChecked ?? 0}</div></div>
-              <div><span className="text-muted-foreground">{isEn ? 'Live' : 'Live'}</span><div className="font-mono text-green-600 dark:text-green-400">{maintenanceStatus?.proxiesAlive ?? 0}</div></div>
+              <div><span className="text-muted-foreground">{isEn ? 'Reachable' : 'Kết nối được'}</span><div className="font-mono text-green-600 dark:text-green-400">{maintenanceStatus?.proxiesAlive ?? 0}</div></div>
               <div><span className="text-muted-foreground">{isEn ? 'Added' : 'Đã thêm'}</span><div className="font-mono">{maintenanceStatus?.proxiesAdded ?? 0}</div></div>
               <div><span className="text-muted-foreground">{isEn ? 'Removed' : 'Đã xóa'}</span><div className="font-mono">{maintenanceStatus?.proxiesRemoved ?? 0}</div></div>
-              <div><span className="text-muted-foreground">{isEn ? 'Accounts' : 'Tài khoản'}</span><div className="font-mono">{maintenanceStatus?.accountsChecked ?? 0}</div></div>
+              <div><span className="text-muted-foreground">{isEn ? 'Accounts checked' : 'Tài khoản đã kiểm tra'}</span><div className="font-mono">{maintenanceStatus?.accountsChecked ?? 0}</div></div>
               <div><span className="text-muted-foreground">{isEn ? 'Dead accounts' : 'TK die'}</span><div className="font-mono text-red-600 dark:text-red-400">{maintenanceStatus?.accountsRemoved ?? 0}</div></div>
               <div><span className="text-muted-foreground">{isEn ? 'Last' : 'Lần cuối'}</span><div className="font-mono truncate">{formatMaintenanceTime(maintenanceStatus?.lastCompletedAt)}</div></div>
             </div>
@@ -1496,11 +1502,11 @@ function ProxyRow({ proxy, selected, onSelect, onToggle, onTest, onDelete, onSav
   // 脱敏密码部分
   const displayUrl = useMemo(() => {
     if (!proxy.password) return proxy.url
-    return proxy.url.replace(/:([^:@\/]+)@/, ':***@')
+    return proxy.url.replace(/:([^:@/]+)@/, ':***@')
   }, [proxy.url, proxy.password])
 
   const handleCopy = (): void => {
-    void navigator.clipboard.writeText(proxy.url)
+    void copyText(proxy.url)
   }
 
   // 备注 inline 编辑：点击铅笔/徽章进入编辑，回车/失焦保存，ESC 取消

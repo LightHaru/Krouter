@@ -2,7 +2,7 @@
 // Protocol: MCP (Model Context Protocol) over stdio or HTTP SSE
 import * as http from 'http'
 import type { AccountPool } from './accountPool'
-import type { ProxyAccount, ProxyConfig } from './types'
+import type { ProxyConfig } from './types'
 
 export interface McpTool {
   name: string
@@ -33,13 +33,17 @@ export interface McpServerDeps {
     accountStats: Map<string, unknown>
   }
   refreshAccount?: (accountId: string) => Promise<boolean>
-  registerAccount?: (opts: { emailProvider?: string; proxy?: string }) => Promise<{ success: boolean; message: string }>
+  registerAccount?: (opts: {
+    emailProvider?: string
+    proxy?: string
+  }) => Promise<{ success: boolean; message: string }>
 }
 
 const MCP_TOOLS: McpTool[] = [
   {
     name: 'krouter_pool_status',
-    description: 'Get account pool health summary: total accounts, active, suspended, cooling down, exhausted, and per-tier breakdown',
+    description:
+      'Get account pool health summary: total accounts, active, suspended, cooling down, exhausted, and per-tier breakdown',
     inputSchema: {
       type: 'object',
       properties: {}
@@ -74,7 +78,8 @@ const MCP_TOOLS: McpTool[] = [
   },
   {
     name: 'krouter_usage_stats',
-    description: 'Get usage statistics: total requests, tokens consumed, error rates, uptime, and per-account breakdown',
+    description:
+      'Get usage statistics: total requests, tokens consumed, error rates, uptime, and per-account breakdown',
     inputSchema: {
       type: 'object',
       properties: {
@@ -109,7 +114,6 @@ const MCP_TOOLS: McpTool[] = [
 export class McpServer {
   private deps: McpServerDeps
   private httpServer: http.Server | null = null
-  private stdioPipe: boolean = false
 
   constructor(deps: McpServerDeps) {
     this.deps = deps
@@ -126,11 +130,14 @@ export class McpServer {
       case 'krouter_account_health':
         return this.handleAccountHealth(args.account as string)
       case 'krouter_force_refresh':
-        return this.handleForceRefresh(args.account_id as string | undefined)
+        return await this.handleForceRefresh(args.account_id as string | undefined)
       case 'krouter_usage_stats':
         return this.handleUsageStats(args.period as string | undefined)
       case 'krouter_register':
-        return this.handleRegister(args.email_provider as string | undefined, args.proxy as string | undefined)
+        return await this.handleRegister(
+          args.email_provider as string | undefined,
+          args.proxy as string | undefined
+        )
       default:
         return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true }
     }
@@ -140,7 +147,11 @@ export class McpServer {
     const accounts = this.deps.accountPool.getAllAccounts()
     const now = Date.now()
 
-    let active = 0, suspended = 0, cooling = 0, exhausted = 0, expired = 0
+    let active = 0,
+      suspended = 0,
+      cooling = 0,
+      exhausted = 0,
+      expired = 0
 
     const tierBreakdown: Record<string, { total: number; active: number }> = {}
 
@@ -151,7 +162,11 @@ export class McpServer {
 
       if (acc.suspendedAt && acc.suspendedAt > 0) {
         suspended++
-      } else if (acc.quotaExhaustedAt && acc.quotaExhaustedAt > 0 && (!acc.quotaResetAt || acc.quotaResetAt > now)) {
+      } else if (
+        acc.quotaExhaustedAt &&
+        acc.quotaExhaustedAt > 0 &&
+        (!acc.quotaResetAt || acc.quotaResetAt > now)
+      ) {
         exhausted++
       } else if (acc.cooldownUntil && acc.cooldownUntil > now) {
         cooling++
@@ -182,10 +197,13 @@ export class McpServer {
 
   private handleAccountHealth(accountQuery: string): McpToolResult {
     const accounts = this.deps.accountPool.getAllAccounts()
-    const account = accounts.find(a => a.id === accountQuery || a.email === accountQuery)
+    const account = accounts.find((a) => a.id === accountQuery || a.email === accountQuery)
 
     if (!account) {
-      return { content: [{ type: 'text', text: `Account not found: ${accountQuery}` }], isError: true }
+      return {
+        content: [{ type: 'text', text: `Account not found: ${accountQuery}` }],
+        isError: true
+      }
     }
 
     const now = Date.now()
@@ -216,13 +234,20 @@ export class McpServer {
 
   private async handleForceRefresh(accountId?: string): Promise<McpToolResult> {
     if (!this.deps.refreshAccount) {
-      return { content: [{ type: 'text', text: 'Token refresh not available (no refresh callback configured)' }], isError: true }
+      return {
+        content: [
+          { type: 'text', text: 'Token refresh not available (no refresh callback configured)' }
+        ],
+        isError: true
+      }
     }
 
     if (accountId) {
       const success = await this.deps.refreshAccount(accountId)
       return {
-        content: [{ type: 'text', text: JSON.stringify({ account_id: accountId, refreshed: success }) }],
+        content: [
+          { type: 'text', text: JSON.stringify({ account_id: accountId, refreshed: success }) }
+        ],
         isError: !success
       }
     }
@@ -242,7 +267,7 @@ export class McpServer {
     }
   }
 
-  private handleUsageStats(period?: string): McpToolResult {
+  private handleUsageStats(_period?: string): McpToolResult {
     const stats = this.deps.getStats()
     const accounts = this.deps.accountPool.getAllAccounts()
 
@@ -253,9 +278,10 @@ export class McpServer {
         total: stats.totalRequests,
         success: stats.successRequests,
         failed: stats.failedRequests,
-        success_rate: stats.totalRequests > 0
-          ? Math.round((stats.successRequests / stats.totalRequests) * 1000) / 10
-          : 100
+        success_rate:
+          stats.totalRequests > 0
+            ? Math.round((stats.successRequests / stats.totalRequests) * 1000) / 10
+            : 100
       },
       tokens: {
         total: stats.totalTokens,
@@ -264,7 +290,7 @@ export class McpServer {
       },
       pool: {
         total_accounts: accounts.length,
-        active_accounts: accounts.filter(a => a.isAvailable !== false && !a.suspendedAt).length
+        active_accounts: accounts.filter((a) => a.isAvailable !== false && !a.suspendedAt).length
       }
     }
 
@@ -273,7 +299,12 @@ export class McpServer {
 
   private async handleRegister(emailProvider?: string, proxy?: string): Promise<McpToolResult> {
     if (!this.deps.registerAccount) {
-      return { content: [{ type: 'text', text: 'Registration not available (no registration callback configured)' }], isError: true }
+      return {
+        content: [
+          { type: 'text', text: 'Registration not available (no registration callback configured)' }
+        ],
+        isError: true
+      }
     }
 
     const result = await this.deps.registerAccount({ emailProvider, proxy })
@@ -296,7 +327,21 @@ export class McpServer {
   startHttpTransport(port: number, host: string = '127.0.0.1'): Promise<void> {
     return new Promise((resolve, reject) => {
       this.httpServer = http.createServer((req, res) => {
-        this.handleMcpHttpRequest(req, res)
+        // handleMcpHttpRequest là async: bỏ promise trần ở đây thì mọi lỗi lọt ra khỏi
+        // try/catch bên trong nó sẽ thành unhandledRejection và không ai đóng response,
+        // client treo cho tới khi tự timeout.
+        void this.handleMcpHttpRequest(req, res).catch((error) => {
+          const message = error instanceof Error ? error.message : String(error)
+          console.error('[MCP] Lỗi không bắt được khi xử lý request:', message)
+          try {
+            if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' })
+            if (!res.writableEnded) {
+              res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message } }))
+            }
+          } catch {
+            /* response đã hỏng, không còn gì để làm */
+          }
+        })
       })
 
       this.httpServer.on('error', reject)
@@ -316,7 +361,6 @@ export class McpServer {
 
   // Handle MCP over stdio (for `openclaw mcp add --transport stdio`)
   startStdioTransport(): void {
-    this.stdioPipe = true
     let buffer = ''
 
     process.stdin.setEncoding('utf8')
@@ -327,28 +371,45 @@ export class McpServer {
 
       for (const line of lines) {
         if (line.trim()) {
-          this.handleJsonRpcMessage(line.trim()).then(response => {
-            if (response) {
-              process.stdout.write(JSON.stringify(response) + '\n')
+          // Thiếu nhánh reject thì một message hỏng làm chết im lặng cả stdio transport:
+          // client MCP ngồi chờ phản hồi mãi mãi mà không có lỗi nào được in ra.
+          void this.handleJsonRpcMessage(line.trim()).then(
+            (response) => {
+              if (response) {
+                process.stdout.write(JSON.stringify(response) + '\n')
+              }
+            },
+            (error) => {
+              console.error('[MCP] Xử lý message thất bại:', error instanceof Error ? error.message : error)
             }
-          })
+          )
         }
       }
     })
 
-    process.stdin.on('end', () => {
-      this.stdioPipe = false
-    })
+    process.stdin.on('end', () => {})
   }
 
   // Handle HTTP endpoint for MCP (integrated into proxy server)
   async handleMcpHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = req.url || '/'
+    // proxyServer chỉ route vào đây khi path bắt đầu bằng "/mcp/" (hoặc bằng "/mcp") và KHÔNG
+    // cắt tiền tố, nên req.url luôn là "/mcp/..." → so sánh với "/sse" trần luôn trượt và trả
+    // 404 cho mọi request: toàn bộ tích hợp MCP chết trên HTTP. Bỏ query string, cắt tiền tố
+    // /mcp, đồng thời vẫn nhận path trần để mount độc lập của startHttpTransport() chạy được.
+    const rawPath = (req.url || '/').split('?')[0]
+    const mcpPrefix = /^\/mcp(?=\/|$)/.test(rawPath) ? '/mcp' : ''
+    const path = rawPath.replace(/^\/mcp(?=\/|$)/, '') || '/'
     const method = req.method || 'GET'
 
-    res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    // Handler này không có lớp xác thực riêng: khi mount qua proxy server thì được API-key của
+    // server đó bảo vệ, nhưng mount độc lập thì không. Vì vậy chỉ phát CORS wildcard cho
+    // request đến từ loopback; nguồn khác thì bỏ hẳn header CORS để trình duyệt không cho
+    // trang web bất kỳ đọc danh sách account qua các tool quản lý pool.
+    if (this.isLoopbackRequest(req)) {
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    }
 
     if (method === 'OPTIONS') {
       res.writeHead(204)
@@ -356,12 +417,12 @@ export class McpServer {
       return
     }
 
-    if (url === '/sse' && method === 'GET') {
-      this.handleSseConnection(res)
+    if (path === '/sse' && method === 'GET') {
+      this.handleSseConnection(res, mcpPrefix)
       return
     }
 
-    if (url === '/message' && method === 'POST') {
+    if (path === '/message' && method === 'POST') {
       const body = await this.readRequestBody(req)
       const response = await this.handleJsonRpcMessage(body)
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -373,14 +434,23 @@ export class McpServer {
     res.end('Not Found')
   }
 
-  private handleSseConnection(res: http.ServerResponse): void {
+  // Chỉ coi là loopback khi kết nối đến từ chính máy này (IPv4 127.x, IPv6 ::1 và ::ffff:127.x)
+  private isLoopbackRequest(req: http.IncomingMessage): boolean {
+    const addr = req.socket?.remoteAddress
+    if (!addr) return false
+    const normalized = addr.replace(/^::ffff:/, '')
+    return normalized === '::1' || normalized === '127.0.0.1' || normalized.startsWith('127.')
+  }
+
+  private handleSseConnection(res: http.ServerResponse, pathPrefix: string = ''): void {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive'
+      Connection: 'keep-alive'
     })
 
-    const endpointEvent = `data: ${JSON.stringify({ endpoint: '/message' })}\n\n`
+    // Endpoint phải kèm tiền tố mount, nếu không client sẽ POST vào /message và trượt route
+    const endpointEvent = `data: ${JSON.stringify({ endpoint: `${pathPrefix}/message` })}\n\n`
     res.write(`event: endpoint\n${endpointEvent}`)
 
     const keepAlive = setInterval(() => {
@@ -424,7 +494,7 @@ export class McpServer {
           jsonrpc: '2.0',
           id,
           result: {
-            tools: MCP_TOOLS.map(t => ({
+            tools: MCP_TOOLS.map((t) => ({
               name: t.name,
               description: t.description,
               inputSchema: t.inputSchema
@@ -446,14 +516,20 @@ export class McpServer {
         return { jsonrpc: '2.0', id, result: {} }
 
       default:
-        return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } }
+        return {
+          jsonrpc: '2.0',
+          id,
+          error: { code: -32601, message: `Method not found: ${method}` }
+        }
     }
   }
 
   private readRequestBody(req: http.IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
       let body = ''
-      req.on('data', (chunk: Buffer) => { body += chunk.toString() })
+      req.on('data', (chunk: Buffer) => {
+        body += chunk.toString()
+      })
       req.on('end', () => resolve(body))
       req.on('error', reject)
     })

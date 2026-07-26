@@ -6,23 +6,23 @@ import { createHash } from 'crypto'
 import { estimateTokens } from './kiroApi'
 
 // 常量
-const DEFAULT_CACHE_TTL = 5 * 60 * 1000       // 5 分钟（Anthropic 默认 ephemeral TTL）
-const ONE_HOUR_CACHE_TTL = 60 * 60 * 1000     // 1 小时
-const DEFAULT_MIN_CACHEABLE_TOKENS = 1024      // 最小可缓存 token 数
-const OPUS_MIN_CACHEABLE_TOKENS = 4096         // Opus 模型最小缓存阈值
-const MAX_CACHE_RATIO = 0.85                   // 最新内容不可能 100% 缓存命中
-const MAX_ENTRIES_PER_ACCOUNT = 200            // 每个账号最大缓存条目数
-const PRUNE_INTERVAL = 60 * 1000              // 清理间隔 1 分钟
+const DEFAULT_CACHE_TTL = 5 * 60 * 1000 // 5 分钟（Anthropic 默认 ephemeral TTL）
+const ONE_HOUR_CACHE_TTL = 60 * 60 * 1000 // 1 小时
+const DEFAULT_MIN_CACHEABLE_TOKENS = 1024 // 最小可缓存 token 数
+const OPUS_MIN_CACHEABLE_TOKENS = 4096 // Opus 模型最小缓存阈值
+const MAX_CACHE_RATIO = 0.85 // 最新内容不可能 100% 缓存命中
+const MAX_ENTRIES_PER_ACCOUNT = 200 // 每个账号最大缓存条目数
+const PRUNE_INTERVAL = 60 * 1000 // 清理间隔 1 分钟
 
 // ============ 类型定义 ============
 
 interface CacheBreakpoint {
-  fingerprint: string       // SHA-256 累积 hash
-  cumulativeTokens: number  // 到此断点的累积 token 数
-  ttl: number               // 缓存 TTL（毫秒）
+  fingerprint: string // SHA-256 累积 hash
+  cumulativeTokens: number // 到此断点的累积 token 数
+  ttl: number // 缓存 TTL（毫秒）
 }
 
-interface CacheProfile {
+export interface CacheProfile {
   breakpoints: CacheBreakpoint[]
   totalInputTokens: number
   model: string
@@ -41,9 +41,9 @@ interface CacheEntry {
 }
 
 interface CacheableBlock {
-  value: string             // 规范化 JSON 字符串
+  value: string // 规范化 JSON 字符串
   tokens: number
-  ttl: number               // 0 表示非断点
+  ttl: number // 0 表示非断点
   isMessageEnd: boolean
 }
 
@@ -57,7 +57,14 @@ export class PromptCacheTracker {
   buildClaudeProfile(
     system: unknown,
     messages: { role: string; content: unknown; cache_control?: { type: string; ttl?: string } }[],
-    tools: { name: string; description: string; input_schema: unknown; cache_control?: { type: string; ttl?: string } }[] | undefined,
+    tools:
+      | {
+          name: string
+          description: string
+          input_schema: unknown
+          cache_control?: { type: string; ttl?: string }
+        }[]
+      | undefined,
     totalInputTokens: number,
     model: string
   ): CacheProfile | null {
@@ -104,7 +111,12 @@ export class PromptCacheTracker {
   // 计算缓存命中情况
   compute(accountId: string, profile: CacheProfile | null): CacheUsage {
     if (!profile || profile.breakpoints.length === 0 || !accountId) {
-      return { cacheCreationInputTokens: 0, cacheReadInputTokens: 0, cacheCreation5mTokens: 0, cacheCreation1hTokens: 0 }
+      return {
+        cacheCreationInputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreation5mTokens: 0,
+        cacheCreation1hTokens: 0
+      }
     }
 
     const minTokens = this.minCacheableTokens(profile.model)
@@ -205,14 +217,26 @@ export class PromptCacheTracker {
   private flattenCacheBlocks(
     system: unknown,
     messages: { role: string; content: unknown; cache_control?: { type: string; ttl?: string } }[],
-    tools: { name: string; description: string; input_schema: unknown; cache_control?: { type: string; ttl?: string } }[] | undefined
+    tools:
+      | {
+          name: string
+          description: string
+          input_schema: unknown
+          cache_control?: { type: string; ttl?: string }
+        }[]
+      | undefined
   ): CacheableBlock[] {
     const blocks: CacheableBlock[] = []
 
     // 工具定义
     if (tools) {
       for (const tool of tools) {
-        const value = this.canonicalize({ kind: 'tool', name: tool.name, description: tool.description, input_schema: tool.input_schema })
+        const value = this.canonicalize({
+          kind: 'tool',
+          name: tool.name,
+          description: tool.description,
+          input_schema: tool.input_schema
+        })
         blocks.push({
           value,
           tokens: estimateTokens(value),
@@ -242,7 +266,7 @@ export class PromptCacheTracker {
       for (const block of system) {
         const obj = typeof block === 'string' ? { type: 'text', text: block } : block
         const value = this.canonicalize({ kind: 'system', block: obj })
-        const text = (obj as Record<string, unknown>).text as string || ''
+        const text = ((obj as Record<string, unknown>).text as string) || ''
         blocks.push({
           value,
           tokens: estimateTokens(text || JSON.stringify(obj)),
@@ -260,7 +284,13 @@ export class PromptCacheTracker {
   ): void {
     const content = msg.content
     if (typeof content === 'string') {
-      const value = this.canonicalize({ kind: 'message', role: msg.role, index: messageIndex, type: 'text', text: content })
+      const value = this.canonicalize({
+        kind: 'message',
+        role: msg.role,
+        index: messageIndex,
+        type: 'text',
+        text: content
+      })
       blocks.push({
         value,
         tokens: estimateTokens(content),
@@ -272,7 +302,13 @@ export class PromptCacheTracker {
       for (let i = 0; i < content.length; i++) {
         const block = content[i] as Record<string, unknown>
         const text = (block.text as string) || (block.thinking as string) || ''
-        const value = this.canonicalize({ kind: 'message', role: msg.role, index: messageIndex, blockIndex: i, block })
+        const value = this.canonicalize({
+          kind: 'message',
+          role: msg.role,
+          index: messageIndex,
+          blockIndex: i,
+          block
+        })
         blocks.push({
           value,
           tokens: estimateTokens(text || JSON.stringify(block)),
@@ -296,8 +332,21 @@ export class PromptCacheTracker {
     return DEFAULT_CACHE_TTL
   }
 
+  // Tuần tự hoá tất định, sắp xếp key ở MỌI cấp.
+  // Bản cũ dùng JSON.stringify(obj, keysArray): mảng key là allow-list ĐỆ QUY nên mọi object
+  // lồng nhau serialize thành {} — hai hội thoại khác hẳn nhau nhưng cùng hình dạng block lại
+  // ra cùng một hash, khiến hội thoại thứ hai bị báo là ~100% cache-read; đổi tham số của một
+  // tool cũng không làm mất hiệu lực cache entry của tool đó.
   private canonicalize(obj: unknown): string {
-    return JSON.stringify(obj, Object.keys(obj as object).sort())
+    const walk = (v: unknown): unknown => {
+      if (v === null || typeof v !== 'object') return v
+      if (Array.isArray(v)) return v.map(walk)
+      const src = v as Record<string, unknown>
+      const out: Record<string, unknown> = {}
+      for (const k of Object.keys(src).sort()) out[k] = walk(src[k])
+      return out
+    }
+    return JSON.stringify(walk(obj))
   }
 
   private hashChunk(hasher: ReturnType<typeof createHash>, chunk: string): void {
@@ -305,7 +354,9 @@ export class PromptCacheTracker {
   }
 
   private minCacheableTokens(model: string): number {
-    return model.toLowerCase().includes('opus') ? OPUS_MIN_CACHEABLE_TOKENS : DEFAULT_MIN_CACHEABLE_TOKENS
+    return model.toLowerCase().includes('opus')
+      ? OPUS_MIN_CACHEABLE_TOKENS
+      : DEFAULT_MIN_CACHEABLE_TOKENS
   }
 
   private computeTTLBreakdown(profile: CacheProfile, matchedTokens: number): [number, number] {
@@ -353,7 +404,10 @@ export function buildCachedClaudeUsage(
   cache_read_input_tokens?: number
   cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }
 } {
-  const billed = Math.max(inputTokens - cacheUsage.cacheCreationInputTokens - cacheUsage.cacheReadInputTokens, 0)
+  const billed = Math.max(
+    inputTokens - cacheUsage.cacheCreationInputTokens - cacheUsage.cacheReadInputTokens,
+    0
+  )
   const result: Record<string, unknown> = {
     input_tokens: billed,
     output_tokens: outputTokens
@@ -366,8 +420,12 @@ export function buildCachedClaudeUsage(
   }
   if (cacheUsage.cacheCreation5mTokens > 0 || cacheUsage.cacheCreation1hTokens > 0) {
     result.cache_creation = {
-      ...(cacheUsage.cacheCreation5mTokens > 0 ? { ephemeral_5m_input_tokens: cacheUsage.cacheCreation5mTokens } : {}),
-      ...(cacheUsage.cacheCreation1hTokens > 0 ? { ephemeral_1h_input_tokens: cacheUsage.cacheCreation1hTokens } : {})
+      ...(cacheUsage.cacheCreation5mTokens > 0
+        ? { ephemeral_5m_input_tokens: cacheUsage.cacheCreation5mTokens }
+        : {}),
+      ...(cacheUsage.cacheCreation1hTokens > 0
+        ? { ephemeral_1h_input_tokens: cacheUsage.cacheCreation1hTokens }
+        : {})
     }
   }
   return result as ReturnType<typeof buildCachedClaudeUsage>

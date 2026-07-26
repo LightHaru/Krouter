@@ -10,6 +10,7 @@ import {
 } from '../ui'
 import { useTranslation } from '../../hooks/useTranslation'
 import { cn } from '../../lib/utils'
+import { copyText } from '@/lib/utils'
 
 interface KProxyConfig {
   enabled: boolean
@@ -63,6 +64,22 @@ function ensureKproxyRequestListenerRegistered(): void {
     }, ..._kproxyRecentRequests].slice(0, 50)
     _refSetKproxyRecentRequests?.(_kproxyRecentRequests)
   })
+}
+
+/**
+ * Các method chỉ tồn tại ở runtime web (server), không có trong preload của Electron.
+ * Khai báo kiểu hẹp tại chỗ thay vì ép  — cùng cách ProxyPage.tsx đang làm —
+ * để optional call vẫn được kiểm tra kiểu thay vì mất sạch thông tin.
+ */
+type KProxyExtraApi = {
+  kproxyGetHostsStatus?: () => Promise<{ enabled: boolean; entries?: { ip: string; hostname: string }[] } | undefined>
+  kproxyToggleHosts?: (enable: boolean) => Promise<{ success?: boolean; error?: string } | undefined>
+  kproxyGetModelMappings?: () => Promise<{ mappings?: { ideModel: string; krouterModel: string; ide: string }[] } | undefined>
+  kproxySaveModelMappings?: (mappings: { ideModel: string; krouterModel: string; ide: string }[]) => Promise<unknown>
+}
+
+function kproxyExtraApi(): KProxyExtraApi {
+  return (window.api ?? {}) as unknown as KProxyExtraApi
 }
 
 export function KProxyPanel() {
@@ -233,7 +250,7 @@ export function KProxyPanel() {
   // 复制代理地址
   const copyProxyAddress = () => {
     const address = `${config.host}:${config.port}`
-    navigator.clipboard.writeText(address)
+    copyText(address)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }
@@ -241,7 +258,7 @@ export function KProxyPanel() {
   // 复制设备 ID
   const copyDeviceId = () => {
     if (config.deviceId) {
-      navigator.clipboard.writeText(config.deviceId)
+      copyText(config.deviceId)
       setDeviceIdCopied(true)
       setTimeout(() => setDeviceIdCopied(false), 2000)
     }
@@ -670,7 +687,7 @@ function HostsToggleCard({ isEn }: { isEn: boolean }) {
 
   async function loadStatus() {
     try {
-      const res = await (window as any).api?.kproxyGetHostsStatus?.()
+      const res = await kproxyExtraApi().kproxyGetHostsStatus?.()
       if (res) {
         setEnabled(res.enabled)
         setEntries(res.entries || [])
@@ -681,7 +698,7 @@ function HostsToggleCard({ isEn }: { isEn: boolean }) {
   async function toggle() {
     setLoading(true)
     try {
-      const res = await (window as any).api?.kproxyToggleHosts?.(!enabled)
+      const res = await kproxyExtraApi().kproxyToggleHosts?.(!enabled)
       if (res?.success) {
         setEnabled(!enabled)
         await loadStatus()
@@ -743,14 +760,14 @@ function ModelMappingsCard({ isEn }: { isEn: boolean }) {
 
   async function loadMappings() {
     try {
-      const res = await (window as any).api?.kproxyGetModelMappings?.()
+      const res = await kproxyExtraApi().kproxyGetModelMappings?.()
       if (res?.mappings) setMappings(res.mappings)
     } catch { /* ignore */ }
   }
 
   async function saveMappings() {
     try {
-      await (window as any).api?.kproxySaveModelMappings?.(mappings)
+      await kproxyExtraApi().kproxySaveModelMappings?.(mappings)
       setEditing(false)
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Save failed')

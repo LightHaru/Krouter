@@ -6,6 +6,11 @@ import {
   Server,
   Bot,
   Network,
+  Route,
+  Radio,
+  UserPlus,
+  WandSparkles,
+  Stethoscope,
   ImageOff,
   type LucideIcon
 } from 'lucide-react'
@@ -19,6 +24,11 @@ const SECTION_ICONS: Record<string, LucideIcon> = {
   accounts: Users,
   proxy: Server,
   openclaw: Bot,
+  mitm: Radio,
+  pool: Route,
+  registration: UserPlus,
+  skills: WandSparkles,
+  troubleshooting: Stethoscope,
   tunnel: Network
 }
 
@@ -67,7 +77,7 @@ export function DocsPage(): React.ReactNode {
           <div className="min-w-0">
             <h1 className="text-2xl font-bold text-primary md:text-3xl">Hướng dẫn sử dụng {APP_NAME}</h1>
             <p className="mt-1 max-w-2xl text-sm text-muted-foreground md:text-base">
-              Hướng dẫn từng bước kèm ảnh chụp thật từ dashboard: thiết lập, thêm tài khoản, bật API proxy, import client và dùng tunnel.
+              Quy trình từng bước cho tài khoản, Routing, MITM từng IDE, Proxy Pool, đăng ký Tingamefi, Skills và xử lý lỗi kết nối.
             </p>
           </div>
         </div>

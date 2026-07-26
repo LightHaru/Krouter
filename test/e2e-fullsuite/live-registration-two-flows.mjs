@@ -78,19 +78,26 @@ async function openRegistrationPage(context) {
   const pageErrors = []
   page.on('pageerror', (error) => pageErrors.push(error.message))
   await page.goto(baseURL, { waitUntil: 'domcontentloaded' })
-  await page.locator('#email').fill(adminEmail)
   await page.locator('#password').fill(adminPassword)
   await page.locator('form button[type="submit"]').click()
   await page.locator('nav').waitFor({ timeout: 15000 })
-  await page.locator('nav button').nth(7).click()
+  await page.locator('nav button[title="Đăng ký"]').click()
   await page.getByText('Đăng ký tài khoản', { exact: true }).waitFor({ timeout: 15000 })
   return { page, pageErrors }
 }
 
 async function finishFlow(page, pageErrors, before, flowName) {
+  let observedInProgress = false
   const after = await waitFor(async () => {
     const snapshot = await accountSnapshot()
-    return snapshot.count > before.count ? snapshot : null
+    if (snapshot.count > before.count) return snapshot
+    const registration = await ipc('registrationStatus')
+    if (registration?.inProgress) observedInProgress = true
+    if (observedInProgress && !registration?.inProgress) {
+      const detail = (await page.locator('main').innerText().catch(() => '')).slice(-1200)
+      throw new Error(`Registration stopped before an account was imported${detail ? `: ${detail}` : ''}`)
+    }
+    return null
   })
   const addedEmails = newEmails(before, after)
   await page.screenshot({ path: path.join(outputDir, `${flowName}-success.png`), fullPage: true })
@@ -111,8 +118,10 @@ async function runSingle(browser) {
   const before = await accountSnapshot()
   console.log(`[single] starting with ${before.count} accounts`)
   const context = await createContext(browser)
-  const { page, pageErrors } = await openRegistrationPage(context)
+  let page
+  let pageErrors = []
   try {
+    ;({ page, pageErrors } = await openRegistrationPage(context))
     const start = page.getByRole('button', { name: 'Bắt đầu đăng ký', exact: true })
     await start.waitFor({ timeout: 15000 })
     assert.equal(await start.isDisabled(), false)
@@ -121,13 +130,13 @@ async function runSingle(browser) {
     console.log(`[single] passed: ${result.addedEmails.join(', ')}`)
     return result
   } catch (error) {
-    await page.screenshot({ path: path.join(outputDir, 'single-failure.png'), fullPage: true }).catch(() => undefined)
+    await page?.screenshot({ path: path.join(outputDir, 'single-failure.png'), fullPage: true }).catch(() => undefined)
     return {
       status: 'failed',
       beforeCount: before.count,
       afterCount: (await accountSnapshot()).count,
       error: error instanceof Error ? error.message : String(error),
-      mainText: (await page.locator('main').innerText().catch(() => '')).slice(-8000)
+      mainText: (await page?.locator('main').innerText().catch(() => '') || '').slice(-8000)
     }
   } finally {
     await context.close()

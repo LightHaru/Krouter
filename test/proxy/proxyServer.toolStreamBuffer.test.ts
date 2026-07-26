@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ProxyServer } from '../../src/main/proxy/proxyServer'
 import type { ProxyAccount, KiroPayload, KiroToolUse, KiroUsage } from '../../src/main/proxy/types'
 
@@ -37,12 +37,17 @@ function createToolPayload(): KiroPayload {
   } as unknown as KiroPayload
 }
 
-function createResponseRecorder(): { res: any; output: () => string } {
+function createResponseRecorder(): { res: any; output: () => string; headers: () => Record<string, string> } {
   const chunks: string[] = []
+  let responseHeaders: Record<string, string> = {}
   const res = {
     writableEnded: false,
     destroyed: false,
-    writeHead: () => res,
+    writeHead: (_status: number, headers?: Record<string, string>) => {
+      responseHeaders = headers || {}
+      return res
+    },
+    flushHeaders: vi.fn(),
     write: (chunk: string) => {
       chunks.push(chunk)
       return true
@@ -52,10 +57,12 @@ function createResponseRecorder(): { res: any; output: () => string } {
       return res
     }
   }
-  return { res, output: () => chunks.join('') }
+  return { res, output: () => chunks.join(''), headers: () => responseHeaders }
 }
 
 describe('ProxyServer tool stream buffering', () => {
+  afterEach(() => vi.useRealTimers())
+
   it('suppresses assistant text that precedes an OpenAI tool_call chunk', async () => {
     const server = new ProxyServer({}) as any
     const account = createAccount()
@@ -108,5 +115,42 @@ describe('ProxyServer tool stream buffering', () => {
     expect(raw).toContain('"content":"pong"')
     expect(raw).toContain('"finish_reason":"stop"')
     expect(raw).toContain('data: [DONE]')
+  })
+
+  it('keeps sending SSE heartbeats after the first content chunk', async () => {
+    vi.useFakeTimers()
+    const server = new ProxyServer({
+      streamInitialBufferBytes: 1,
+      streamHeartbeatIntervalMs: 1000
+    }) as any
+    const account = createAccount()
+    const { res, output, headers } = createResponseRecorder()
+    let finish: (() => void) | undefined
+
+    server.callStreamWithFailover = (
+      usedAccount: ProxyAccount,
+      _payload: KiroPayload,
+      onTextOrTool: (account: ProxyAccount, text?: string, toolUse?: KiroToolUse, isThinking?: boolean) => void,
+      onEnd: (account: ProxyAccount, usage: KiroUsage) => void
+    ) => {
+      onTextOrTool(usedAccount, 'first chunk', undefined, false)
+      return new Promise<void>((resolve) => {
+        finish = () => {
+          onEnd(usedAccount, { inputTokens: 10, outputTokens: 2, credits: 0.01 })
+          resolve()
+        }
+      })
+    }
+
+    const streaming = server.handleOpenAIStream(res, account, createToolPayload(), 'claude-sonnet-4.5', Date.now())
+    await vi.advanceTimersByTimeAsync(2100)
+
+    expect(output()).toContain(': krouter-stream-open\n\n')
+    expect(output().match(/: ping\n\n/g)?.length).toBeGreaterThanOrEqual(2)
+    expect(headers()['X-Accel-Buffering']).toBe('no')
+
+    finish?.()
+    await streaming
+    expect(output()).toContain('data: [DONE]')
   })
 })

@@ -348,21 +348,6 @@ const api = {
     return ipcRenderer.invoke('poll-iam-sso-auth', region || 'us-east-1')
   },
 
-  // 完成 IAM SSO 登录 (用授权码换取 token)
-  completeIamSsoLogin: (code: string): Promise<{
-    success: boolean
-    completed?: boolean
-    accessToken?: string
-    refreshToken?: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    expiresIn?: number
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('complete-iam-sso-login', code)
-  },
-
   // 取消 IAM SSO 登录
   cancelIamSsoLogin: (): Promise<{ success: boolean }> => {
     return ipcRenderer.invoke('cancel-iam-sso-login')
@@ -654,19 +639,21 @@ const api = {
     return ipcRenderer.invoke('proxy-get-status')
   },
 
+  proxyGetUsageAnalytics: (input?: { period?: 'today' | '24h' | '7d' | '30d' | '60d' | 'all'; recentLimit?: number }): Promise<unknown> => {
+    return ipcRenderer.invoke('proxy-get-usage-analytics', input)
+  },
+
+  proxyClearUsageAnalytics: (): Promise<{ success: boolean }> => {
+    return ipcRenderer.invoke('proxy-clear-usage-analytics')
+  },
+
+  // Đã gỡ dashboardTunnelStart / dashboardTunnelGetStatus / dashboardTunnelStop:
+  // các kênh 'dashboard-tunnel-*' không có ipcMain handler nào trong src/main
+  // (phần cài đặt chỉ nằm ở src/server, không nạp được trong Electron).
+  // Renderer dò bằng `typeof window.api.dashboardTunnelStart !== 'function'`, nên giữ
+  // lại chỉ khiến tính năng chết trông như đang sống và hiện lỗi "No handler registered".
+
   // 重置累计 credits
-  dashboardTunnelGetStatus: (): Promise<{ running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }> => {
-    return ipcRenderer.invoke('dashboard-tunnel-get-status')
-  },
-
-  dashboardTunnelStart: (input?: { localUrl?: string; binary?: string }): Promise<{ success: boolean; status: { running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }; error?: string }> => {
-    return ipcRenderer.invoke('dashboard-tunnel-start', input)
-  },
-
-  dashboardTunnelStop: (): Promise<{ success: boolean; status: { running: boolean; requested: boolean; localUrl: string; publicUrl?: string; startedAt?: number; pid?: number; binary: string; error?: string; logs: string[] }; error?: string }> => {
-    return ipcRenderer.invoke('dashboard-tunnel-stop')
-  },
-
   proxyResetCredits: (): Promise<{ success: boolean }> => {
     return ipcRenderer.invoke('proxy-reset-credits')
   },
@@ -773,9 +760,16 @@ const api = {
   },
 
   // 获取可用模型列表
-  proxyGetModels: (): Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }>; fromCache?: boolean }> => {
+  proxyGetModels: (): Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string; supportsThinking?: boolean; thinkingEfforts?: string[]; modelProvider?: string }>; fromCache?: boolean }> => {
     return ipcRenderer.invoke('proxy-get-models')
   },
+
+  chatgptOAuthGetStatus: () => ipcRenderer.invoke('chatgpt-oauth-get-status'),
+  chatgptOAuthStart: () => ipcRenderer.invoke('chatgpt-oauth-start'),
+  chatgptOAuthSubmitCallback: (callbackUrl: string) => ipcRenderer.invoke('chatgpt-oauth-submit-callback', callbackUrl),
+  chatgptOAuthRefresh: (accountId?: string) => ipcRenderer.invoke('chatgpt-oauth-refresh', accountId),
+  chatgptOAuthCancel: () => ipcRenderer.invoke('chatgpt-oauth-cancel'),
+  chatgptOAuthLogout: (accountId?: string) => ipcRenderer.invoke('chatgpt-oauth-logout', accountId),
 
   // "Test thật": live-probe từng model theo tier
   proxyProbeModels: (input?: { modelIds?: string[]; concurrency?: number }): Promise<{ success: boolean; error?: string; results?: Array<{ modelId: string; tier: string; ok: boolean; error?: string; latencyMs?: number; accountId?: string; checkedAt: number }> }> => {
@@ -810,7 +804,11 @@ const api = {
     return ipcRenderer.invoke('proxy-test-xpixi', input)
   },
 
-  proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null }> }): Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; apiKey?: { id?: string; name?: string; key: string }; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }> => {
+  proxyTestCustomApi: (input: { id: string; name: string; enabled: boolean; protocol: 'openai' | 'anthropic'; authType?: 'bearer' | 'x-api-key'; apiKey?: string; baseUrl: string; routePrefix?: string; models?: string[]; customHeaders?: Record<string, string>; keys?: Array<{ id: string; name: string; apiKey: string; enabled: boolean; createdAt?: number; lastTestedAt?: number; lastError?: string }>; reasoningEffort?: 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'; modelDiscoveryMode?: 'auto' | 'manual'; modelsSyncedAt?: number; modelsSyncError?: string }): Promise<{ success: boolean; error?: string; models?: Array<{ id: string; upstreamId: string; name?: string; providerId: string; providerName: string }> }> => {
+    return ipcRenderer.invoke('proxy-test-custom-api', input)
+  },
+
+  proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; supportsThinking?: boolean; thinkingEfforts?: string[]; modelProvider?: string }>; reasoningEffort?: string }): Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; apiKey?: { id?: string; name?: string; key: string }; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }> => {
     return ipcRenderer.invoke('proxy-configure-clients', input)
   },
 
@@ -958,6 +956,38 @@ const api = {
     return ipcRenderer.invoke('kproxy-get-status')
   },
 
+  kproxyGetHostsStatus: (): Promise<{ enabled: boolean; entries: Array<{ ip: string; hostname: string; enabled: boolean; ideType?: string }>; error?: string }> => {
+    return ipcRenderer.invoke('kproxy-get-hosts-status')
+  },
+
+  kproxyToggleHosts: (enabled: boolean): Promise<{ success: boolean; enabled?: boolean; entries?: Array<{ ip: string; hostname: string; enabled: boolean; ideType?: string }>; error?: string }> => {
+    return ipcRenderer.invoke('kproxy-toggle-hosts', enabled)
+  },
+
+  kproxySetHostsIdeTypes: (ideTypes: Array<'kiro' | 'copilot' | 'antigravity' | 'cursor'>): Promise<{ success: boolean; enabled?: boolean; entries?: Array<{ ip: string; hostname: string; enabled: boolean; ideType?: string }>; error?: string }> => {
+    return ipcRenderer.invoke('kproxy-set-hosts-ide-types', ideTypes)
+  },
+
+  kproxyGetModelMappings: (): Promise<{ success: boolean; mappings: Array<{ ideModel: string; krouterModel: string; ideType: 'kiro' | 'copilot' | 'antigravity' | 'cursor' | 'custom'; enabled: boolean }> }> => {
+    return ipcRenderer.invoke('kproxy-get-model-mappings')
+  },
+
+  kproxySaveModelMappings: (mappings: Array<{ ideModel: string; krouterModel: string; ideType: 'kiro' | 'copilot' | 'antigravity' | 'cursor' | 'custom'; enabled: boolean }>): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('kproxy-save-model-mappings', mappings)
+  },
+
+  mitmGetStatus: (): Promise<{ running: boolean; port: number; listenerReachable?: boolean; routerReachable?: boolean; lastDiagnosticAt?: number | null; lastDiagnosticError?: string | null; connections: number; interceptedRequests: number; passthroughRequests?: number; byIdeType?: Record<string, number>; routerSuccesses?: number; routerFailures?: number; lastRequestAt?: number | null; lastInterceptAt?: number | null; lastRouterStatus?: number | null; recentDecisions?: Array<{ timestamp: number; hostname: string; method: string; path: string; ideType: string; action: 'intercept' | 'passthrough' | 'router-success' | 'router-failure'; reason?: string; sourceModel?: string; mappedModel?: string; status?: number }> }> => {
+    return ipcRenderer.invoke('mitm-get-status')
+  },
+
+  mitmStart: (): Promise<{ success: boolean; port?: number; error?: string }> => {
+    return ipcRenderer.invoke('mitm-start')
+  },
+
+  mitmStop: (): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('mitm-stop')
+  },
+
   // 更新 K-Proxy 配置
   kproxyUpdateConfig: (config: { port?: number; host?: string; mitmDomains?: string[]; deviceId?: string; autoStart?: boolean; logRequests?: boolean }): Promise<{ success: boolean; config?: unknown; error?: string }> => {
     return ipcRenderer.invoke('kproxy-update-config', config)
@@ -994,6 +1024,8 @@ const api = {
   },
 
   // 导出 CA 证书
+  // Lưu ý: main process BỎ QUA exportPath (ghi đè file tùy ý theo đường dẫn từ renderer)
+  // và luôn mở hộp thoại lưu file. Tham số được giữ lại chỉ để không đổi chữ ký.
   kproxyExportCaCert: (exportPath?: string): Promise<{ success: boolean; path?: string; error?: string }> => {
     return ipcRenderer.invoke('kproxy-export-ca-cert', exportPath)
   },
@@ -1108,7 +1140,7 @@ const api = {
     isMaximized: (): Promise<boolean> => ipcRenderer.invoke('window-is-maximized'),
     getPlatform: (): Promise<NodeJS.Platform> => ipcRenderer.invoke('window-get-platform'),
     onMaximizeChange: (callback: (isMaximized: boolean) => void): (() => void) => {
-      const handler = (_event: any, isMaximized: boolean): void => callback(isMaximized)
+      const handler = (_event: Electron.IpcRendererEvent, isMaximized: boolean): void => callback(isMaximized)
       ipcRenderer.on('window-maximize-changed', handler)
       return () => ipcRenderer.removeListener('window-maximize-changed', handler)
     }

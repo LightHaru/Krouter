@@ -2,12 +2,20 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { AccountManager } from './components/accounts'
 import { Sidebar, TitleBar, type PageType } from './components/layout'
-import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, ProxyPage, KProxyPage, ProxyPoolPage, WebhooksPage, DiagnosePage, ConfigSyncPage, SkillsPage, MITMPage, RegisterPage, SubscriptionPage, LogsPage, DocsPage } from './components/pages'
+import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, ProxyPage, UsageAnalyticsPage, KProxyPage, ProxyPoolPage, WebhooksPage, DiagnosePage, ConfigSyncPage, SkillsPage, MITMPage, RegisterPage, SubscriptionPage, LogsPage, DocsPage } from './components/pages'
 import { useWebhookStore } from './store/webhooks'
 import { UpdateDialog } from './components/UpdateDialog'
 import { CloseConfirmDialog } from './components/CloseConfirmDialog'
 import { useAccountsStore } from './store/accounts'
-import { pageFromPath } from './lib/docsRoute'
+import {
+  accountProviderFromLocation,
+  accountProviderToHash,
+  customApiProviderIdFromLocation,
+  customApiProviderToHash,
+  pageFromLocation,
+  pageToHash,
+  type AccountProviderRoute
+} from './lib/docsRoute'
 import { useIsMobile } from './hooks/useIsMobile'
 
 // 托盘信息防抖延迟：后台刷新风暴时合并多次跨进程 IPC 为单次
@@ -18,10 +26,22 @@ const BACKEND_ACCOUNT_SYNC_INTERVAL_MS = 10000
 const BACKEND_ACCOUNT_SYNC_DEBOUNCE_MS = 800
 
 function App(): React.JSX.Element {
-  const [currentPage, setCurrentPage] = useState<PageType>('home')
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(true)
+  const [currentPage, setCurrentPage] = useState<PageType>(() => (
+    pageFromLocation(window.location.pathname, window.location.hash) || 'home'
+  ))
+  const [accountProvider, setAccountProvider] = useState<AccountProviderRoute>(() => (
+    accountProviderFromLocation(window.location.pathname, window.location.hash)
+  ))
+  const [customApiProviderId, setCustomApiProviderId] = useState<string | null>(() => (
+    customApiProviderIdFromLocation(window.location.pathname, window.location.hash)
+  ))
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('krouter_sidebar_collapsed') === 'true')
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const isMobile = useIsMobile()
+
+  useEffect(() => {
+    localStorage.setItem('krouter_sidebar_collapsed', String(sidebarCollapsed))
+  }, [sidebarCollapsed])
 
   // Đóng drawer khi thoát chế độ mobile (tránh kẹt overlay khi phóng to cửa sổ).
   useEffect(() => {
@@ -38,20 +58,18 @@ function App(): React.JSX.Element {
     return () => window.removeEventListener('keydown', onKey)
   }, [mobileNavOpen])
 
-  const {
-    loadFromStorage,
-    startAutoTokenRefresh,
-    stopAutoTokenRefresh,
-    applyBackgroundRefreshResults,
-    applyBackgroundCheckResults,
-    applyProxyAccountUpdate,
-    flushSaveImmediately,
-    accounts,
-    activeAccountId,
-    setActiveAccount,
-    checkAndRefreshExpiringTokens,
-    updateAccountStatus
-  } = useAccountsStore()
+  const loadFromStorage = useAccountsStore(state => state.loadFromStorage)
+  const startAutoTokenRefresh = useAccountsStore(state => state.startAutoTokenRefresh)
+  const stopAutoTokenRefresh = useAccountsStore(state => state.stopAutoTokenRefresh)
+  const applyBackgroundRefreshResults = useAccountsStore(state => state.applyBackgroundRefreshResults)
+  const applyBackgroundCheckResults = useAccountsStore(state => state.applyBackgroundCheckResults)
+  const applyProxyAccountUpdate = useAccountsStore(state => state.applyProxyAccountUpdate)
+  const flushSaveImmediately = useAccountsStore(state => state.flushSaveImmediately)
+  const accounts = useAccountsStore(state => state.accounts)
+  const activeAccountId = useAccountsStore(state => state.activeAccountId)
+  const setActiveAccount = useAccountsStore(state => state.setActiveAccount)
+  const checkAndRefreshExpiringTokens = useAccountsStore(state => state.checkAndRefreshExpiringTokens)
+  const updateAccountStatus = useAccountsStore(state => state.updateAccountStatus)
 
   // 切换到下一个可用账户
   const switchToNextAccount = useCallback(() => {
@@ -205,43 +223,68 @@ function App(): React.JSX.Element {
     return () => { unsubscribe?.() }
   }, [])
 
-  // Đồng bộ URL cho deep-link /docs (không dùng router; chỉ History API).
-  // Mount: nếu vào thẳng /docs thì mở trang docs. popstate: đồng bộ back/forward.
-  useEffect(() => {
-    if (pageFromPath(window.location.pathname) === 'docs') {
-      setCurrentPage('docs')
+  const navigateToPage = useCallback((page: PageType): void => {
+    setCurrentPage(page)
+    if (page === 'accounts') setAccountProvider('kiro')
+    const nextHash = pageToHash(page)
+    if (window.location.hash === nextHash) return
+    try {
+      window.history.pushState({ page }, '', nextHash)
+    } catch {
+      window.location.hash = nextHash
     }
-    const onPop = (): void => {
-      const isDocs = pageFromPath(window.location.pathname) === 'docs'
-      setCurrentPage((prev) => (isDocs ? 'docs' : prev === 'docs' ? 'home' : prev))
-    }
-    window.addEventListener('popstate', onPop)
-    return () => window.removeEventListener('popstate', onPop)
   }, [])
 
-  // Khi currentPage đổi: đồng bộ URL /docs <-> /. Giới hạn ở /docs để tránh hồi quy.
-  useEffect(() => {
+  const navigateToAccountProvider = useCallback((provider: AccountProviderRoute): void => {
+    setCurrentPage('accounts')
+    setAccountProvider(provider)
+    setCustomApiProviderId(null)
+    const nextHash = accountProviderToHash(provider)
+    if (window.location.hash === nextHash) return
     try {
-      const isDocsPath = pageFromPath(window.location.pathname) === 'docs'
-      if (currentPage === 'docs' && !isDocsPath) {
-        window.history.pushState(null, '', '/docs')
-      } else if (currentPage !== 'docs' && isDocsPath) {
-        window.history.pushState(null, '', '/')
-      }
+      window.history.pushState({ page: 'accounts', provider }, '', nextHash)
     } catch {
-      // pushState best-effort; điều hướng state vẫn hoạt động nếu URL không đổi.
+      window.location.hash = nextHash
     }
-  }, [currentPage])
+  }, [])
+
+  const navigateToCustomApiProvider = useCallback((providerId: string | null): void => {
+    setCurrentPage('accounts')
+    setAccountProvider('customApi')
+    setCustomApiProviderId(providerId)
+    const nextHash = providerId ? customApiProviderToHash(providerId) : accountProviderToHash('customApi')
+    if (window.location.hash === nextHash) return
+    try {
+      window.history.pushState({ page: 'accounts', provider: 'customApi', providerId }, '', nextHash)
+    } catch {
+      window.location.hash = nextHash
+    }
+  }, [])
+
+  // Restore the selected page on refresh and support browser/Electron back-forward.
+  useEffect(() => {
+    const syncPageFromUrl = (): void => {
+      setCurrentPage(pageFromLocation(window.location.pathname, window.location.hash) || 'home')
+      setAccountProvider(accountProviderFromLocation(window.location.pathname, window.location.hash))
+      setCustomApiProviderId(customApiProviderIdFromLocation(window.location.pathname, window.location.hash))
+    }
+    window.addEventListener('popstate', syncPageFromUrl)
+    window.addEventListener('hashchange', syncPageFromUrl)
+    return () => {
+      window.removeEventListener('popstate', syncPageFromUrl)
+      window.removeEventListener('hashchange', syncPageFromUrl)
+    }
+  }, [])
 
   // 应用内页面跳转（轻量 CustomEvent，供深层组件无需 prop 钻取即可切页）
   useEffect(() => {
     const handler = (e: Event): void => {
       const detail = (e as CustomEvent<PageType>).detail
-      if (detail) setCurrentPage(detail)
+      if (detail) navigateToPage(detail)
     }
     window.addEventListener('navigate-page', handler)
     return () => window.removeEventListener('navigate-page', handler)
-  }, [])
+  }, [navigateToPage])
 
   // 关闭/刷新前强制 flush 防抖中的待保存数据，防止数据丢失
   useEffect(() => {
@@ -363,13 +406,22 @@ function App(): React.JSX.Element {
       case 'home':
         return <HomePage />
       case 'accounts':
-        return <AccountManager />
+        return (
+          <AccountManager
+            provider={accountProvider}
+            customApiProviderId={customApiProviderId}
+            onProviderChange={navigateToAccountProvider}
+            onCustomApiProviderChange={navigateToCustomApiProvider}
+          />
+        )
       case 'machineId':
         return <MachineIdPage />
       case 'kiroSettings':
         return <KiroSettingsPage />
       case 'proxy':
         return <ProxyPage />
+      case 'usage':
+        return <UsageAnalyticsPage />
       case 'kproxy':
         return <KProxyPage />
       case 'mitm':
@@ -402,14 +454,14 @@ function App(): React.JSX.Element {
   }
 
   return (
-    <div className="app-shell ambient-bg">
-      <TitleBar showMenuButton={isMobile} onMenuClick={() => setMobileNavOpen(true)} />
+    <div className={`app-shell ambient-bg${currentPage === 'mitm' ? ' ambient-static' : ''}`}>
+      <TitleBar currentPage={currentPage} showMenuButton={isMobile} onMenuClick={() => setMobileNavOpen(true)} />
       <div className="app-workspace">
         {/* Desktop: sidebar tĩnh. Mobile: ẩn, thay bằng drawer bên dưới. */}
         {!isMobile && (
           <Sidebar
             currentPage={currentPage}
-            onPageChange={setCurrentPage}
+            onPageChange={navigateToPage}
             collapsed={sidebarCollapsed}
             onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
           />
@@ -452,7 +504,7 @@ function App(): React.JSX.Element {
               <Sidebar
                 variant="drawer"
                 currentPage={currentPage}
-                onPageChange={setCurrentPage}
+                onPageChange={navigateToPage}
                 collapsed={false}
                 onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
                 onNavigate={() => setMobileNavOpen(false)}

@@ -24,7 +24,13 @@ import {
   ListChecks,
   X
 } from 'lucide-react'
-import { cn, randomUuid } from '@/lib/utils'
+import { cn, copyText, randomUuid } from '@/lib/utils'
+import {
+  getSubscriptionLinks,
+  setSubscriptionLinks,
+  setSubscriptionLinksNotifier,
+  type SubscriptionLink
+} from './subscriptionLinkStore'
 import { useTranslation } from '@/hooks/useTranslation'
 
 /**
@@ -75,17 +81,6 @@ interface SubscriptionPlan {
   pricing: { amount: number; currency: string }
 }
 
-interface SubscriptionLink {
-  accountId: string
-  email: string
-  status: 'pending' | 'loading' | 'success' | 'error' | 'expired'
-  url?: string
-  error?: string
-  /** 链接生成时间（用于估算有效期） */
-  generatedAt?: number
-  /** 链接是否经过本地有效性探测且通过 */
-  validated?: boolean
-}
 
 interface OverageItem {
   accountId: string
@@ -95,18 +90,6 @@ interface OverageItem {
 }
 
 // 模块级状态：组件卸载后仍保留（同一会话内）
-let _links: SubscriptionLink[] = []
-let _linksNotify: ((links: SubscriptionLink[]) => void) | null = null
-
-export function appendSubscriptionLink(link: SubscriptionLink): void {
-  _links = [..._links, link]
-  _linksNotify?.(_links)
-}
-
-export function updateSubscriptionLink(accountId: string, update: Partial<SubscriptionLink>): void {
-  _links = _links.map(l => l.accountId === accountId ? { ...l, ...update } : l)
-  _linksNotify?.(_links)
-}
 let _availablePlans: SubscriptionPlan[] = []
 let _selectedPlanType = ''
 let _selectedLinkIds: Set<string> = new Set()
@@ -141,7 +124,7 @@ export function SubscriptionPage() {
   const [activeTab, setActiveTabState] = useState<SubTab>(_activeTab)
   const setActiveTab = (v: SubTab) => { _activeTab = v; setActiveTabState(v) }
   
-  const [links, setLinksState] = useState<SubscriptionLink[]>(_links)
+  const [links, setLinksState] = useState<SubscriptionLink[]>(getSubscriptionLinks())
   const [isFetching, setIsFetching] = useState(false)
   const [selectedLinkIds, setSelectedLinkIdsState] = useState<Set<string>>(_selectedLinkIds)
   // 批量导入链接对话框
@@ -165,7 +148,7 @@ export function SubscriptionPage() {
   const setLinks = (val: SubscriptionLink[] | ((prev: SubscriptionLink[]) => SubscriptionLink[])) => {
     setLinksState(prev => {
       const next = typeof val === 'function' ? val(prev) : val
-      _links = next
+      setSubscriptionLinks(next)
       return next
     })
   }
@@ -194,8 +177,8 @@ export function SubscriptionPage() {
 
   // 注册外部写入回调（让 appendSubscriptionLink/updateSubscriptionLink 同步 React state）
   useEffect(() => {
-    _linksNotify = setLinksState
-    return () => { _linksNotify = null }
+    setSubscriptionLinksNotifier(setLinksState)
+    return () => setSubscriptionLinksNotifier(null)
   }, [])
 
   // 超额列表自动滚动到底部
@@ -599,14 +582,14 @@ export function SubscriptionPage() {
 
   // 复制单个链接
   const handleCopyLink = async (url: string) => {
-    await navigator.clipboard.writeText(url)
+    await copyText(url)
   }
 
   // 导出链接
   const handleExport = async (mode: 'selected' | 'all') => {
     const targetLinks = getTargetLinks(mode)
     const text = targetLinks.map(l => l.url).join('\n')
-    await navigator.clipboard.writeText(text)
+    await copyText(text)
   }
 
   // ===== 一键超额功能 =====
@@ -1012,6 +995,7 @@ export function SubscriptionPage() {
         />
       )}
 
+      {/* eslint-disable-next-line no-constant-binary-expression -- dead code cố ý giữ lại để tham chiếu, xem chú thích bên dưới */}
       {false && false && (
         <>
           {/* 说明（被新的 ManageSubscriptionsTab 替代，保留作为 dead code 防止意外删除 - eslint 已忽略） */}
@@ -2034,6 +2018,7 @@ function ManageSubscriptionsTab({ getAllSubscribed, updateAccount, concurrency, 
           />
 
           {/* 占位防止下面 dead code 被误删（实际渲染走 SubscribedAccountsVirtualList） */}
+          {/* eslint-disable-next-line no-constant-binary-expression -- dead code cố ý giữ lại để tham chiếu, xem chú thích bên trên */}
           {false && (
             <div className="max-h-[60vh] overflow-y-auto">
               {subscribed.map((acc, idx) => {

@@ -148,7 +148,7 @@ const DEFAULT_CONFIG: ProxyMaintenanceConfig = {
   accountCheckConcurrency: 8,
   testUrl: 'https://api.iplocate.io/ip',
   testTimeoutMs: 6000,
-  maxUsableLatencyMs: 1000,
+  maxUsableLatencyMs: 2500,
   upstreamProxy: ''
 }
 
@@ -307,15 +307,14 @@ function isFastProxyOutcome(validation: ProxyValidationOutcome, maxLatencyMs: nu
     validation.latencyMs <= maxLatencyMs
 }
 
-function isStoredProxyFast(proxy: StoredProxy, maxLatencyMs: number): boolean {
-  return proxy.enabled === true &&
-    proxy.status === 'alive' &&
-    typeof proxy.latencyMs === 'number' &&
-    Number.isFinite(proxy.latencyMs) &&
-    proxy.latencyMs <= maxLatencyMs
+function isReachableProxyOutcome(validation: ProxyValidationOutcome): boolean {
+  return validation.success === true &&
+    typeof validation.latencyMs === 'number' &&
+    Number.isFinite(validation.latencyMs) &&
+    validation.latencyMs >= 0
 }
 
-function buildProxyEntry(proxy: ParsedProxy, validation: ProxyValidationOutcome, now: number): StoredProxy {
+function buildProxyEntry(proxy: ParsedProxy, validation: ProxyValidationOutcome, now: number, maxLatencyMs: number): StoredProxy {
   return {
     id: crypto.randomUUID(),
     url: proxy.url,
@@ -327,7 +326,7 @@ function buildProxyEntry(proxy: ParsedProxy, validation: ProxyValidationOutcome,
     label: 'IPLocate',
     source: IPLOCATE_PROXY_SOURCE,
     tags: ['iplocate', 'free-proxy'],
-    status: 'alive',
+    status: isFastProxyOutcome(validation, maxLatencyMs) ? 'alive' : 'slow',
     latencyMs: validation.latencyMs,
     lastTestedAt: now,
     usedCount: 0,
@@ -337,7 +336,7 @@ function buildProxyEntry(proxy: ParsedProxy, validation: ProxyValidationOutcome,
   }
 }
 
-function updateProxyEntry(entry: StoredProxy, validation: ProxyValidationOutcome, now: number): StoredProxy {
+function updateProxyEntry(entry: StoredProxy, validation: ProxyValidationOutcome, now: number, maxLatencyMs: number): StoredProxy {
   if (!validation.success) {
     return {
       ...entry,
@@ -350,7 +349,7 @@ function updateProxyEntry(entry: StoredProxy, validation: ProxyValidationOutcome
   }
   return {
     ...entry,
-    status: 'alive',
+    status: isFastProxyOutcome(validation, maxLatencyMs) ? 'alive' : 'slow',
     latencyMs: validation.latencyMs,
     lastTestedAt: now,
     lastError: undefined,
@@ -379,6 +378,9 @@ function initialStatus(config: ProxyMaintenanceConfig): ProxyMaintenanceStatus {
 export class ProxyMaintenanceRuntime {
   private intervalTimer?: ReturnType<typeof setInterval>
   private initialTimer?: ReturnType<typeof setTimeout>
+  /** Cấu hình mà interval timer hiện tại đang phục vụ — để configure() nhận ra khi không có gì đổi. */
+  private activeIntervalMin?: number
+  private activeEnabled?: boolean
   private runningPromise?: Promise<ProxyMaintenanceStatus>
   private status: ProxyMaintenanceStatus
   private readonly fetchSourceText: (url: string) => Promise<string>
@@ -422,8 +424,18 @@ export class ProxyMaintenanceRuntime {
   }
 
   configure(runOnBoot = false): ProxyMaintenanceStatus {
-    this.clearTimers()
     const config = this.getConfig()
+
+    // configure() được gọi lại sau mỗi saveAccounts/mergePeerAccounts, mà dashboard autosave
+    // 30 giây/lần. Dựng lại interval vô điều kiện đồng nghĩa chu kỳ 30 phút không bao giờ
+    // chạm mốc. Giữ nguyên timer đang chạy khi cấu hình không đổi.
+    const unchanged =
+      this.intervalTimer !== undefined &&
+      this.activeIntervalMin === config.backendMaintenanceIntervalMin &&
+      this.activeEnabled === config.backendMaintenanceEnabled
+    if (unchanged && !runOnBoot) return this.getStatus()
+
+    this.clearTimers()
     this.status = {
       ...this.status,
       enabled: config.backendMaintenanceEnabled,
@@ -435,6 +447,8 @@ export class ProxyMaintenanceRuntime {
     }
 
     if (!config.backendMaintenanceEnabled) {
+      this.activeEnabled = false
+      this.activeIntervalMin = undefined
       void this.persistStatus()
       return this.getStatus()
     }
@@ -444,6 +458,8 @@ export class ProxyMaintenanceRuntime {
       void this.runNow('interval')
     }, intervalMs)
     this.intervalTimer.unref?.()
+    this.activeEnabled = true
+    this.activeIntervalMin = config.backendMaintenanceIntervalMin
 
     if (runOnBoot) {
       this.initialTimer = setTimeout(() => {
@@ -474,6 +490,8 @@ export class ProxyMaintenanceRuntime {
     if (this.initialTimer) clearTimeout(this.initialTimer)
     this.intervalTimer = undefined
     this.initialTimer = undefined
+    this.activeIntervalMin = undefined
+    this.activeEnabled = undefined
   }
 
   private async persistStatus(): Promise<void> {
@@ -522,7 +540,7 @@ export class ProxyMaintenanceRuntime {
               outcome = { proxy, success: false, error: errorText(error) }
             }
             proxiesChecked++
-            if (isFastProxyOutcome(outcome, config.maxUsableLatencyMs)) proxiesAlive++
+            if (isReachableProxyOutcome(outcome)) proxiesAlive++
             this.status.proxiesChecked = proxiesChecked
             this.status.proxiesAlive = proxiesAlive
             if (proxiesChecked % 50 === 0 || proxiesChecked === candidates.length) {
@@ -532,7 +550,7 @@ export class ProxyMaintenanceRuntime {
           }
         )
         this.status.proxiesChecked = proxyOutcomes.length
-        this.status.proxiesAlive = proxyOutcomes.filter((item) => isFastProxyOutcome(item, config.maxUsableLatencyMs)).length
+        this.status.proxiesAlive = proxyOutcomes.filter(isReachableProxyOutcome).length
       }
 
       const accountDataAtStart = this.getAccountData()
@@ -662,21 +680,11 @@ export class ProxyMaintenanceRuntime {
     const now = this.now()
 
     if (config.sourceSyncEnabled && proxyOutcomes.length > 0) {
-      const reachable = proxyOutcomes.filter((item) => item.success)
-      const alive = proxyOutcomes.filter((item) => isFastProxyOutcome(item, config.maxUsableLatencyMs))
+      const reachable = proxyOutcomes.filter(isReachableProxyOutcome)
       const minimumAlive = Math.min(3, proxyOutcomes.length)
       const systemicFailure = reachable.length < minimumAlive && reachable.length / proxyOutcomes.length < 0.01
       if (systemicFailure) {
-        for (const [id, entry] of Object.entries(proxyPool)) {
-          if (entry.source !== IPLOCATE_PROXY_SOURCE || isStoredProxyFast(entry, config.maxUsableLatencyMs)) continue
-          delete proxyPool[id]
-          deletedProxyIds.add(id)
-          this.status.proxiesRemoved++
-          for (const [accountId, proxyId] of Object.entries(bindings)) {
-            if (proxyId === id) delete bindings[accountId]
-          }
-        }
-        const message = `Source validation returned only ${reachable.length}/${proxyOutcomes.length} reachable proxies; only previously verified fast proxies were preserved`
+        const message = `Source validation returned only ${reachable.length}/${proxyOutcomes.length} reachable proxies; previously verified reachable proxies were preserved`
         this.status.recentErrors = [message, ...this.status.recentErrors].slice(0, 10)
       } else {
         const outcomesByUrl = new Map(proxyOutcomes.map((item) => [item.proxy.url, item]))
@@ -688,7 +696,11 @@ export class ProxyMaintenanceRuntime {
         for (const [id, entry] of Object.entries(proxyPool)) {
           if (entry.source !== IPLOCATE_PROXY_SOURCE) continue
           const outcome = outcomesByUrl.get(entry.url)
-          if (!outcome || !isFastProxyOutcome(outcome, config.maxUsableLatencyMs)) {
+          if (!outcome || !isReachableProxyOutcome(outcome)) {
+            if (!config.sourceRemoveDead) {
+              if (outcome) proxyPool[id] = updateProxyEntry(entry, outcome, now, config.maxUsableLatencyMs)
+              continue
+            }
             delete proxyPool[id]
             deletedProxyIds.add(id)
             this.status.proxiesRemoved++
@@ -696,27 +708,17 @@ export class ProxyMaintenanceRuntime {
               if (proxyId === id) delete bindings[accountId]
             }
           } else {
-            proxyPool[id] = updateProxyEntry(entry, outcome, now)
+            proxyPool[id] = updateProxyEntry(entry, outcome, now, config.maxUsableLatencyMs)
           }
         }
 
-        for (const outcome of alive) {
+        for (const outcome of reachable) {
           const existing = existingByUrl.get(outcome.proxy.url)
           if (existing && proxyPool[existing.id]) continue
-          const entry = buildProxyEntry(outcome.proxy, outcome, now)
+          const entry = buildProxyEntry(outcome.proxy, outcome, now, config.maxUsableLatencyMs)
           proxyPool[entry.id] = entry
           this.status.proxiesAdded++
         }
-      }
-    }
-
-    for (const [id, entry] of Object.entries(proxyPool)) {
-      if (isStoredProxyFast(entry, config.maxUsableLatencyMs)) continue
-      delete proxyPool[id]
-      deletedProxyIds.add(id)
-      this.status.proxiesRemoved++
-      for (const [accountId, proxyId] of Object.entries(bindings)) {
-        if (proxyId === id || proxyId === entry.url) delete bindings[accountId]
       }
     }
 
@@ -802,7 +804,6 @@ export class ProxyMaintenanceRuntime {
         ? accountData.proxyPoolConfig as Record<string, unknown>
         : {}),
       ...config,
-      sourceRemoveDead: true,
       maxUsableLatencyMs: config.maxUsableLatencyMs
     }
     accountData.accountProxyBindings = bindings

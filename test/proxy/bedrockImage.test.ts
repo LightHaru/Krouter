@@ -1,8 +1,12 @@
 // Phase 11 tests: Nova Canvas image generation
 import { describe, it, expect } from 'vitest'
-import { buildNovaCanvasRequest } from '../../src/main/proxy/bedrockImage'
+import { buildNovaCanvasInvokePath, buildNovaCanvasRequest } from '../../src/main/proxy/bedrockImage'
 
 describe('Phase 11: Nova Canvas Image Generation', () => {
+  it('URL-encodes the model ID in the Bedrock invoke path', () => {
+    expect(buildNovaCanvasInvokePath()).toBe('/model/amazon.nova-canvas-v1%3A0/invoke')
+  })
+
   describe('buildNovaCanvasRequest', () => {
     it('builds a basic request with defaults', () => {
       const req = buildNovaCanvasRequest({ prompt: 'A cat sitting on a table' })

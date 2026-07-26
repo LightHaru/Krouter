@@ -13,6 +13,21 @@ const CERT_CACHE_DIR = 'kproxy-certs'
 const certCache = new Map<string, { cert: string; key: string }>()
 
 /**
+ * Giới hạn số mục trong certCache.
+ * Giá trị SNI do client điều khiển hoàn toàn, cache không chặn sẽ phình vô hạn (~3KB mỗi mục).
+ * Map giữ nguyên thứ tự chèn nên xóa key đầu tiên = loại bỏ mục ít được dùng gần đây nhất.
+ */
+const CERT_CACHE_MAX = 64
+
+/**
+ * Cặp khóa RSA dùng chung cho MỌI chứng chỉ leaf.
+ * forge.pki.rsa.generateKeyPair(2048) là thuần JS và hoàn toàn đồng bộ (100-1000ms mỗi lần);
+ * chạy lại cho từng hostname sẽ khóa cứng main thread của Electron. Dùng chung một khóa leaf là
+ * thông lệ chuẩn của proxy MITM. Khóa CA nằm riêng trong CertManager và không liên quan tới biến này.
+ */
+let sharedLeafKeys: ReturnType<typeof forge.pki.rsa.generateKeyPair> | null = null
+
+/**
  * CA 证书管理器
  */
 export class CertManager {
@@ -43,7 +58,7 @@ export class CertManager {
       try {
         const certPem = fs.readFileSync(certPath, 'utf8')
         const keyPem = fs.readFileSync(keyPath, 'utf8')
-        
+
         this.caCert = forge.pki.certificateFromPem(certPem)
         this.caKey = forge.pki.privateKeyFromPem(keyPem)
 
@@ -72,12 +87,12 @@ export class CertManager {
 
     // 生成 RSA 密钥对
     const keys = forge.pki.rsa.generateKeyPair(2048)
-    
+
     // 创建证书
     const cert = forge.pki.createCertificate()
     cert.publicKey = keys.publicKey
     cert.serialNumber = this.generateSerialNumber()
-    
+
     // 设置有效期（10年）
     cert.validity.notBefore = new Date()
     cert.validity.notAfter = new Date()
@@ -117,9 +132,15 @@ export class CertManager {
     const certPem = forge.pki.certificateToPem(cert)
     const keyPem = forge.pki.privateKeyToPem(keys.privateKey)
 
-    // 保存到文件
+    // 保存到文件（私钥必须为 0600，避免同机其他用户读取后签发受信任证书）
     fs.writeFileSync(certPath, certPem)
-    fs.writeFileSync(keyPath, keyPem)
+    fs.writeFileSync(keyPath, keyPem, { mode: 0o600 })
+    try {
+      // writeFileSync 的 mode 仅在创建时生效；旧版本写出的 key 需要在此修复
+      fs.chmodSync(keyPath, 0o600)
+    } catch {
+      /* Windows 上 chmod 无实际作用，忽略 */
+    }
 
     this.caCert = cert
     this.caKey = keys.privateKey
@@ -136,6 +157,9 @@ export class CertManager {
     // 检查缓存
     const cached = certCache.get(hostname)
     if (cached) {
+      // Chạm lại mục vừa dùng để nó về cuối hàng đợi LRU
+      certCache.delete(hostname)
+      certCache.set(hostname, cached)
       return cached
     }
 
@@ -143,14 +167,17 @@ export class CertManager {
       throw new Error('CA certificate not initialized')
     }
 
-    // 生成密钥对
-    const keys = forge.pki.rsa.generateKeyPair(2048)
-    
+    // Sinh cặp khóa leaf đúng MỘT lần rồi dùng lại cho mọi hostname (xem chú thích sharedLeafKeys)
+    if (!sharedLeafKeys) {
+      sharedLeafKeys = forge.pki.rsa.generateKeyPair(2048)
+    }
+    const keys = sharedLeafKeys
+
     // 创建证书
     const cert = forge.pki.createCertificate()
     cert.publicKey = keys.publicKey
     cert.serialNumber = this.generateSerialNumber()
-    
+
     // 设置有效期（1年）
     cert.validity.notBefore = new Date()
     cert.validity.notAfter = new Date()
@@ -196,8 +223,13 @@ export class CertManager {
       key: forge.pki.privateKeyToPem(keys.privateKey)
     }
 
-    // 缓存证书
+    // 缓存证书（có giới hạn: vượt ngưỡng thì loại bỏ mục cũ nhất theo kiểu LRU）
     certCache.set(hostname, result)
+    while (certCache.size > CERT_CACHE_MAX) {
+      const oldestKey = certCache.keys().next().value
+      if (oldestKey === undefined) break
+      certCache.delete(oldestKey)
+    }
 
     return result
   }
@@ -233,9 +265,15 @@ export class CertManager {
   /**
    * 提取证书信息
    */
-  private extractCertInfo(certPath: string, keyPath: string, certPem: string, keyPem: string): CACertInfo {
+  private extractCertInfo(
+    certPath: string,
+    keyPath: string,
+    certPem: string,
+    keyPem: string
+  ): CACertInfo {
     const cert = forge.pki.certificateFromPem(certPem)
-    const fingerprint = forge.md.sha256.create()
+    const fingerprint = forge.md.sha256
+      .create()
       .update(forge.asn1.toDer(forge.pki.certificateToAsn1(cert)).getBytes())
       .digest()
       .toHex()

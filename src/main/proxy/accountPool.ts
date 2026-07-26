@@ -4,16 +4,21 @@ import type { ProxyAccount, AccountStats } from './types'
 
 // 错误类型分类（决定 failover 策略）
 export enum ErrorType {
-  FATAL = 'fatal',           // 请求本身有问题 → 直接返回客户端，不切号
+  FATAL = 'fatal', // 请求本身有问题 → 直接返回客户端，不切号
   RECOVERABLE = 'recoverable' // 账号问题 → 切换到下一个账号
 }
 
 // 根据 HTTP 状态码和错误原因分类错误
 export function classifyError(statusCode: number, reason?: string): ErrorType {
-  if (reason && (isThrottleError(reason) || isBillingOrQuotaError(reason))) return ErrorType.RECOVERABLE
+  if (reason && (isThrottleError(reason) || isBillingOrQuotaError(reason)))
+    return ErrorType.RECOVERABLE
   // RECOVERABLE: 配额/计费问题
   if (statusCode === 402) return ErrorType.RECOVERABLE
   // RECOVERABLE: Token 过期/无效
+  // 401 cũng là lỗi của account (refresh token bị thu hồi), không phải lỗi của request.
+  // Nếu để FATAL thì recordError return sớm: errorCount không tăng, cooldownUntil không đặt
+  // → isAccountAvailable vẫn true và round-robin phát lại account chết đó mãi mãi.
+  if (statusCode === 401) return ErrorType.RECOVERABLE
   if (statusCode === 403) return ErrorType.RECOVERABLE
   // RECOVERABLE: 限流
   if (statusCode === 429) return ErrorType.RECOVERABLE
@@ -25,6 +30,19 @@ export function classifyError(statusCode: number, reason?: string): ErrorType {
   }
   // 422: 请求格式错误
   if (statusCode === 422) return ErrorType.FATAL
+  // Timeout luồng và lỗi tầng mạng là vấn đề của account/kết nối, không phải của request.
+  // Caller (recordAccountFailure) đoán status bằng regex \b(\d{3})\b nên "Stream idle timeout
+  // after 300000ms" không cho ra status nào và bị đoán thành 500 → FATAL → recordError bỏ qua:
+  // account treo 300s vẫn được coi là khả dụng cho request kế tiếp.
+  // Đặt trước nhánh 5xx để phân loại đúng bất kể caller đoán status là gì.
+  if (
+    reason &&
+    /stream (first-byte|idle) timeout|socket hang up|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed/i.test(
+      reason
+    )
+  ) {
+    return ErrorType.RECOVERABLE
+  }
   // 5xx: 服务端错误
   if (statusCode >= 500) return ErrorType.FATAL
   return ErrorType.FATAL
@@ -33,39 +51,51 @@ export function classifyError(statusCode: number, reason?: string): ErrorType {
 /** Account-specific billing/quota failures that should immediately fail over. */
 export function isBillingOrQuotaError(message: string): boolean {
   if (isEndpointRateLimitError(message)) return false
-  return /\b402\b|payment required|billing (?:error|issue|problem)|out of credits?|run out of credits?|insufficient (?:credits?|balance)|credit balance|no (?:remaining )?credits?|credits? (?:exhausted|depleted)|quota (?:exhausted|exceeded|reached)|servicequotaexceededexception|service quota exceeded|reached (?:the|your) (?:usage )?limit|usage limit (?:reached|exceeded)|monthly limit (?:reached|exceeded)/i.test(message)
+  return /\b402\b|payment required|billing (?:error|issue|problem)|out of credits?|run out of credits?|insufficient (?:credits?|balance)|credit balance|no (?:remaining )?credits?|credits? (?:exhausted|depleted)|quota (?:exhausted|exceeded|reached)|servicequotaexceededexception|service quota exceeded|reached (?:the|your) (?:usage )?limit|usage limit (?:reached|exceeded)|monthly limit (?:reached|exceeded)/i.test(
+    message
+  )
 }
 
 /** Temporary account/endpoint throttling that should use a short cooldown. */
 export function isThrottleError(message: string): boolean {
-  return isEndpointRateLimitError(message) || /\b429\b|throttl|too many requests|rate[ _-]?limit/i.test(message)
+  return (
+    isEndpointRateLimitError(message) ||
+    /\b429\b|throttl|too many requests|rate[ _-]?limit/i.test(message)
+  )
 }
 
 function isEndpointRateLimitError(message: string): boolean {
-  return /quota exhausted on (?:amazonq|codewhisperer|amazonqcli)|endpoint .*rate[ _-]?limited/i.test(message)
+  return /quota exhausted on (?:amazonq|codewhisperer|amazonqcli)|endpoint .*rate[ _-]?limited/i.test(
+    message
+  )
 }
 
 export interface AccountPoolConfig {
-  baseCooldownMs: number      // 基础冷却时间（指数退避的基数）
+  baseCooldownMs: number // 基础冷却时间（指数退避的基数）
   throttleCooldownMs: number
   maxThrottleCooldownMs: number
   maxBackoffMultiplier: number // 最大退避倍数
-  quotaResetMs: number        // 配额耗尽冷却时间
+  quotaResetMs: number // 配额耗尽冷却时间
   probabilisticRetryChance: number // 概率重试几率（0-1）
   // Phase 1: Enhanced smart rotation
-  smartTopN: number            // 从 top-N 候选中加权随机选择（默认 3）
-  slidingWindowSize: number    // 滑动窗口大小（记录最近 N 次请求结果）
+  smartTopN: number // 从 top-N 候选中加权随机选择（默认 3）
+  slidingWindowSize: number // 滑动窗口大小（记录最近 N 次请求结果）
   // Phase 2: Throttling mitigation
-  tpmWindowMs: number          // TPM 滑动窗口（毫秒，默认 60s）
-  adaptiveRateFactor: number   // 自适应限流因子（0.5-1.0，从 throttling 中学习）
+  tpmWindowMs: number // TPM 滑动窗口（毫秒，默认 60s）
+  adaptiveRateFactor: number // 自适应限流因子（0.5-1.0，从 throttling 中学习）
 }
 
 const DEFAULT_CONFIG: AccountPoolConfig = {
-  baseCooldownMs: 60000,        // 60s 基础冷却
-  throttleCooldownMs: 5000,
-  maxThrottleCooldownMs: 10_000,
-  maxBackoffMultiplier: 1440,   // 最大 1440 倍 = 24h
-  quotaResetMs: 3600000,        // 1h 配额重置
+  baseCooldownMs: 60000, // 60s 基础冷却
+  throttleCooldownMs: 5000, // 首次限流仍然快速恢复
+  // 429 冷却上限 15 分钟（原 10s）
+  // Trần cũ 10s bị chạm ngay ở errorCount = 2: min(5000 * 2^(n-1), 10000) khiến lần throttle
+  // thứ 2, thứ 5 và thứ 50 đều chờ đúng 10s → pool nhỏ đập lại AWS mỗi ~10s vô hạn và làm
+  // leo thang cờ "suspicious activity". Nâng trần để backoff mũ thực sự tăng được
+  // (5s → 10s → 20s → ... → tối đa 15 phút), lần throttle đầu vẫn hồi phục nhanh.
+  maxThrottleCooldownMs: 15 * 60_000,
+  maxBackoffMultiplier: 1440, // 最大 1440 倍 = 24h
+  quotaResetMs: 3600000, // 1h 配额重置
   probabilisticRetryChance: 0.1, // 10% 概率重试
   smartTopN: 3,
   slidingWindowSize: 100,
@@ -90,8 +120,15 @@ interface RateLimitBudget {
   adaptiveFactor: number
 }
 
-function getCooldownMs(config: AccountPoolConfig, statusCode: number | undefined, errorCount: number): number {
-  const backoffMultiplier = Math.min(Math.pow(2, Math.max(0, errorCount - 1)), config.maxBackoffMultiplier)
+function getCooldownMs(
+  config: AccountPoolConfig,
+  statusCode: number | undefined,
+  errorCount: number
+): number {
+  const backoffMultiplier = Math.min(
+    Math.pow(2, Math.max(0, errorCount - 1)),
+    config.maxBackoffMultiplier
+  )
   if (statusCode === 429) {
     return Math.min(config.throttleCooldownMs * backoffMultiplier, config.maxThrottleCooldownMs)
   }
@@ -101,7 +138,14 @@ function getCooldownMs(config: AccountPoolConfig, statusCode: number | undefined
 function isApiKeyAccount(account: ProxyAccount): boolean {
   const authMethod = account.authMethod?.toLowerCase()
   const provider = account.provider?.toLowerCase().replace(/[\s_-]/g, '')
-  return Boolean(account.kiroApiKey) || Boolean(account.accessToken?.trim().startsWith('ksk_')) || authMethod === 'api_key' || authMethod === 'apikey' || provider === 'kiroapikey' || provider === 'apikey'
+  return (
+    Boolean(account.kiroApiKey) ||
+    Boolean(account.accessToken?.trim().startsWith('ksk_')) ||
+    authMethod === 'api_key' ||
+    authMethod === 'apikey' ||
+    provider === 'kiroapikey' ||
+    provider === 'apikey'
+  )
 }
 
 export type AccountSelectionStrategy = 'smart' | 'round-robin' | 'sticky' | 'least-used'
@@ -141,7 +185,7 @@ export class AccountPool {
     const suspended = this.isSuspended(account)
     this.accounts.set(account.id, {
       ...account,
-      isAvailable: suspended ? false : account.isAvailable ?? true,
+      isAvailable: suspended ? false : (account.isAvailable ?? true),
       requestCount: account.requestCount ?? 0,
       errorCount: account.errorCount ?? 0,
       lastUsed: account.lastUsed ?? 0
@@ -157,7 +201,9 @@ export class AccountPool {
       totalResponseTime: 0
     })
     if (suspended) {
-      console.warn(`[AccountPool] Added SUSPENDED account: ${account.email || account.id} (${account.suspendReason})`)
+      console.warn(
+        `[AccountPool] Added SUSPENDED account: ${account.email || account.id} (${account.suspendReason})`
+      )
     } else {
       console.log(`[AccountPool] Added account: ${account.email || account.id}`)
     }
@@ -167,6 +213,12 @@ export class AccountPool {
   removeAccount(accountId: string): void {
     this.accounts.delete(accountId)
     this.accountStats.delete(accountId)
+    // Xoá nốt state theo id, nếu không: (1) rò rỉ ~100 SlidingWindowEntry + 1 RateLimitBudget
+    // cho mỗi id từng thấy — đáng kể trên VPS liên tục tạo/xoá account; (2) một account
+    // được thêm lại cùng id sẽ kế thừa lastThrottleAt cũ và bị smart-routing bỏ qua ngay
+    // dù nó hoàn toàn khoẻ.
+    this.rateLimitBudgets.delete(accountId)
+    this.slidingWindows.delete(accountId)
     console.log(`[AccountPool] Removed account: ${accountId}`)
   }
 
@@ -225,12 +277,13 @@ export class AccountPool {
     }
 
     // 没有可用账号：检查是否全部因配额耗尽
-    const candidates = excludeIds
-      ? accountList.filter(a => !excludeIds.has(a.id))
-      : accountList
-    const allExhausted = candidates.length > 0 && candidates.every(a => this.isQuotaExhausted(a, now))
+    const candidates = excludeIds ? accountList.filter((a) => !excludeIds.has(a.id)) : accountList
+    const allExhausted =
+      candidates.length > 0 && candidates.every((a) => this.isQuotaExhausted(a, now))
     if (allExhausted) {
-      console.log(`[AccountPool] All ${candidates.length} accounts quota exhausted, no fallback available`)
+      console.log(
+        `[AccountPool] All ${candidates.length} accounts quota exhausted, no fallback available`
+      )
       return null
     }
 
@@ -250,7 +303,10 @@ export class AccountPool {
    * （selected+1），因此不会像旧的分组循环那样因反复调用而打乱全局指针（bug #5）。
    * candidateIds 为空 => 返回 null。excludeIds 为本请求已试过的账号。
    */
-  getNextAccountFromCandidates(candidateIds: Set<string>, excludeIds?: Set<string>): ProxyAccount | null {
+  getNextAccountFromCandidates(
+    candidateIds: Set<string>,
+    excludeIds?: Set<string>
+  ): ProxyAccount | null {
     if (candidateIds.size === 0) return null
     const now = Date.now()
     const fullList = Array.from(this.accounts.values())
@@ -331,7 +387,12 @@ export class AccountPool {
     // - 有 refreshToken 时让账号通过 —— proxyServer.getAvailableAccount 会检测
     //   isTokenExpiringSoon 并主动调用 refreshToken；若刷新失败会通过 markNeedsRefresh
     //   设置 isAvailable=false，下次循环再被本函数 line 210 跳过，形成闭环
-    if (account.expiresAt && account.expiresAt < now && !account.refreshToken && !isApiKeyAccount(account)) {
+    if (
+      account.expiresAt &&
+      account.expiresAt < now &&
+      !account.refreshToken &&
+      !isApiKeyAccount(account)
+    ) {
       return false
     }
 
@@ -355,7 +416,9 @@ export class AccountPool {
         if (Math.random() > this.config.probabilisticRetryChance) {
           return false
         }
-        console.log(`[AccountPool] Probabilistic retry for ${account.email || account.id} (failures=${failures}, cooldown=${Math.round(effectiveCooldown / 1000)}s)`)
+        console.log(
+          `[AccountPool] Probabilistic retry for ${account.email || account.id} (failures=${failures}, cooldown=${Math.round(effectiveCooldown / 1000)}s)`
+        )
       }
       // else: 冷却期已过，Half-Open 状态，允许重试
     }
@@ -407,7 +470,14 @@ export class AccountPool {
   // 检查账号配额是否耗尽
   isQuotaExhausted(account: ProxyAccount, now: number = Date.now()): boolean {
     // 如果配额已重置（过了重置时间），不再视为耗尽
-    if (account.quotaResetAt && account.quotaResetAt <= now) {
+    // Không có gì xoá quotaResetAt đã qua, còn recordSuccess đặt quotaExhaustedAt mà không đặt
+    // quotaResetAt mới → một quotaResetAt cũ vĩnh viễn vô hiệu hoá mọi kiểm tra bên dưới.
+    // Chỉ cho phép mốc reset đã qua xoá cờ khi nó MỚI HƠN mốc đánh dấu cạn quota.
+    if (
+      account.quotaResetAt &&
+      account.quotaResetAt <= now &&
+      (!account.quotaExhaustedAt || account.quotaExhaustedAt < account.quotaResetAt)
+    ) {
       return false
     }
     // 有明确的耗尽标记
@@ -415,7 +485,11 @@ export class AccountPool {
       return true
     }
     // 有配额数据且已用尽
-    if (account.quotaLimit && account.quotaLimit > 0 && (account.quotaUsed ?? 0) >= account.quotaLimit) {
+    if (
+      account.quotaLimit &&
+      account.quotaLimit > 0 &&
+      (account.quotaUsed ?? 0) >= account.quotaLimit
+    ) {
       return true
     }
     return false
@@ -427,7 +501,11 @@ export class AccountPool {
     }
   }
 
-  private getLeastUsedAccount(accountList: ProxyAccount[], now: number, excludeIds?: Set<string>): ProxyAccount | null {
+  private getLeastUsedAccount(
+    accountList: ProxyAccount[],
+    now: number,
+    excludeIds?: Set<string>
+  ): ProxyAccount | null {
     let best: ProxyAccount | null = null
 
     for (const account of accountList) {
@@ -443,7 +521,10 @@ export class AccountPool {
       const bestRequests = best.requestCount || 0
       if (accountRequests < bestRequests) {
         best = account
-      } else if (accountRequests === bestRequests && (account.lastUsed || 0) < (best.lastUsed || 0)) {
+      } else if (
+        accountRequests === bestRequests &&
+        (account.lastUsed || 0) < (best.lastUsed || 0)
+      ) {
         best = account
       }
     }
@@ -455,7 +536,11 @@ export class AccountPool {
     return best
   }
 
-  private getSmartBalancedAccount(accountList: ProxyAccount[], now: number, excludeIds?: Set<string>): ProxyAccount | null {
+  private getSmartBalancedAccount(
+    accountList: ProxyAccount[],
+    now: number,
+    excludeIds?: Set<string>
+  ): ProxyAccount | null {
     // Phase 1: Score all available accounts, then weighted-random from top N
     const candidates: { account: ProxyAccount; score: number }[] = []
 
@@ -503,17 +588,19 @@ export class AccountPool {
     let score = 0
 
     // 1. Success Rate (last N requests in sliding window) — weight 0.35
-    const recentWindow = window.filter(e => e.timestamp > now - 5 * 60_000) // last 5 min
-    const successRate = recentWindow.length > 0
-      ? recentWindow.filter(e => e.success).length / recentWindow.length
-      : 1.0 // no history = assume good
+    const recentWindow = window.filter((e) => e.timestamp > now - 5 * 60_000) // last 5 min
+    const successRate =
+      recentWindow.length > 0
+        ? recentWindow.filter((e) => e.success).length / recentWindow.length
+        : 1.0 // no history = assume good
     score += successRate * 350
 
     // 2. Latency score (1 - avgLatency/10s) — weight 0.20
-    const recentLatencies = recentWindow.filter(e => e.latencyMs > 0)
-    const avgLatency = recentLatencies.length > 0
-      ? recentLatencies.reduce((sum, e) => sum + e.latencyMs, 0) / recentLatencies.length
-      : 0
+    const recentLatencies = recentWindow.filter((e) => e.latencyMs > 0)
+    const avgLatency =
+      recentLatencies.length > 0
+        ? recentLatencies.reduce((sum, e) => sum + e.latencyMs, 0) / recentLatencies.length
+        : 0
     const latencyScore = Math.max(0, 1 - avgLatency / 10000)
     score += latencyScore * 200
 
@@ -579,7 +666,12 @@ export class AccountPool {
   // ============ Phase 1: Sliding Window ============
 
   /** Record a request result in the sliding window for success rate tracking */
-  recordSlidingWindow(accountId: string, success: boolean, latencyMs: number, model?: string): void {
+  recordSlidingWindow(
+    accountId: string,
+    success: boolean,
+    latencyMs: number,
+    model?: string
+  ): void {
     if (!this.slidingWindows.has(accountId)) {
       this.slidingWindows.set(accountId, [])
     }
@@ -595,14 +687,14 @@ export class AccountPool {
   getSuccessRate(accountId: string): number {
     const window = this.slidingWindows.get(accountId)
     if (!window || window.length === 0) return 1.0
-    return window.filter(e => e.success).length / window.length
+    return window.filter((e) => e.success).length / window.length
   }
 
   /** Get average latency for an account from sliding window */
   getAvgLatency(accountId: string): number {
     const window = this.slidingWindows.get(accountId)
     if (!window || window.length === 0) return 0
-    const withLatency = window.filter(e => e.latencyMs > 0)
+    const withLatency = window.filter((e) => e.latencyMs > 0)
     if (withLatency.length === 0) return 0
     return withLatency.reduce((sum, e) => sum + e.latencyMs, 0) / withLatency.length
   }
@@ -614,7 +706,13 @@ export class AccountPool {
     const now = Date.now()
     let budget = this.rateLimitBudgets.get(accountId)
     if (!budget) {
-      budget = { windowStart: now, requestTimestamps: [], throttleCount: 0, lastThrottleAt: 0, adaptiveFactor: this.config.adaptiveRateFactor }
+      budget = {
+        windowStart: now,
+        requestTimestamps: [],
+        throttleCount: 0,
+        lastThrottleAt: 0,
+        adaptiveFactor: this.config.adaptiveRateFactor
+      }
       this.rateLimitBudgets.set(accountId, budget)
     }
     budget.throttleCount++
@@ -628,19 +726,25 @@ export class AccountPool {
     const now = Date.now()
     let budget = this.rateLimitBudgets.get(accountId)
     if (!budget) {
-      budget = { windowStart: now, requestTimestamps: [], throttleCount: 0, lastThrottleAt: 0, adaptiveFactor: this.config.adaptiveRateFactor }
+      budget = {
+        windowStart: now,
+        requestTimestamps: [],
+        throttleCount: 0,
+        lastThrottleAt: 0,
+        adaptiveFactor: this.config.adaptiveRateFactor
+      }
       this.rateLimitBudgets.set(accountId, budget)
     }
     budget.requestTimestamps.push(now)
     // Trim timestamps outside the window
     const windowStart = now - this.config.tpmWindowMs
-    budget.requestTimestamps = budget.requestTimestamps.filter(t => t > windowStart)
+    budget.requestTimestamps = budget.requestTimestamps.filter((t) => t > windowStart)
     // Gradually recover adaptive factor on success
     if (budget.adaptiveFactor < this.config.adaptiveRateFactor) {
       budget.adaptiveFactor = Math.min(this.config.adaptiveRateFactor, budget.adaptiveFactor + 0.02)
     }
     // Decay throttle count over time (reset after 5 min without throttle)
-    if (budget.throttleCount > 0 && (now - budget.lastThrottleAt) > 5 * 60_000) {
+    if (budget.throttleCount > 0 && now - budget.lastThrottleAt > 5 * 60_000) {
       budget.throttleCount = 0
     }
   }
@@ -650,7 +754,7 @@ export class AccountPool {
     const budget = this.rateLimitBudgets.get(accountId)
     if (!budget) return false
     // If recently throttled (within last 30s), consider budget exhausted
-    if (budget.lastThrottleAt > 0 && (now - budget.lastThrottleAt) < 30_000) {
+    if (budget.lastThrottleAt > 0 && now - budget.lastThrottleAt < 30_000) {
       return true
     }
     return false
@@ -670,7 +774,7 @@ export class AccountPool {
     const now = Date.now()
     const window = this.slidingWindows.get(accountId) || []
     const budget = this.rateLimitBudgets.get(accountId)
-    const recentWindow = window.filter(e => e.timestamp > now - 60_000)
+    const recentWindow = window.filter((e) => e.timestamp > now - 60_000)
     const account = this.accounts.get(accountId)
 
     const successRate = this.getSuccessRate(accountId)
@@ -730,7 +834,7 @@ export class AccountPool {
       // Estimate usage rate from sliding window
       const window = this.slidingWindows.get(id) || []
       const oneHourAgo = now - 3600_000
-      const recentEntries = window.filter(e => e.timestamp > oneHourAgo)
+      const recentEntries = window.filter((e) => e.timestamp > oneHourAgo)
       let estimatedExhaustionHours: number | null = null
       if (recentEntries.length > 0) {
         const hourlyRate = recentEntries.length
@@ -754,9 +858,14 @@ export class AccountPool {
     return predictions
   }
 
-
   // 记录请求成功（重置断路器 + 粘滞到当前账号 + sliding window + rate budget）
-  recordSuccess(accountId: string, tokens: number = 0, credits: number = 0, responseTimeMs: number = 0, model?: string): ProxyAccount | undefined {
+  recordSuccess(
+    accountId: string,
+    tokens: number = 0,
+    credits: number = 0,
+    responseTimeMs: number = 0,
+    model?: string
+  ): ProxyAccount | undefined {
     // Phase 1 + 2: Record in sliding window and rate budget
     this.recordSlidingWindow(accountId, true, responseTimeMs, model)
     this.recordRateLimitSuccess(accountId)
@@ -765,11 +874,14 @@ export class AccountPool {
     if (account) {
       const now = Date.now()
       const creditDelta = Number.isFinite(credits) && credits > 0 ? credits : 0
-      const quotaUsed = creditDelta > 0
-        ? Math.max(0, (account.quotaUsed || 0) + creditDelta)
-        : account.quotaUsed
+      const quotaUsed =
+        creditDelta > 0 ? Math.max(0, (account.quotaUsed || 0) + creditDelta) : account.quotaUsed
       const quotaLimit = account.quotaLimit
-      const quotaReached = typeof quotaLimit === 'number' && quotaLimit > 0 && typeof quotaUsed === 'number' && quotaUsed >= quotaLimit
+      const quotaReached =
+        typeof quotaLimit === 'number' &&
+        quotaLimit > 0 &&
+        typeof quotaUsed === 'number' &&
+        quotaUsed >= quotaLimit
       updatedAccount = {
         ...account,
         requestCount: (account.requestCount || 0) + 1,
@@ -807,7 +919,12 @@ export class AccountPool {
   }
 
   // 记录请求失败（区分错误类型）
-  recordError(accountId: string, errorType: ErrorType = ErrorType.RECOVERABLE, statusCode?: number, responseTimeMs: number = 0): void {
+  recordError(
+    accountId: string,
+    errorType: ErrorType = ErrorType.RECOVERABLE,
+    statusCode?: number,
+    responseTimeMs: number = 0
+  ): void {
     const account = this.accounts.get(accountId)
     if (!account) return
 
@@ -839,11 +956,16 @@ export class AccountPool {
 
     // 计算当前退避时间用于日志
     const effectiveCooldown = getCooldownMs(this.config, statusCode, errorCount)
-    const cooldownStr = effectiveCooldown < 60000 ? `${Math.round(effectiveCooldown / 1000)}s`
-      : effectiveCooldown < 3600000 ? `${Math.round(effectiveCooldown / 60000)}m`
-      : `${Math.round(effectiveCooldown / 3600000)}h`
+    const cooldownStr =
+      effectiveCooldown < 60000
+        ? `${Math.round(effectiveCooldown / 1000)}s`
+        : effectiveCooldown < 3600000
+          ? `${Math.round(effectiveCooldown / 60000)}m`
+          : `${Math.round(effectiveCooldown / 3600000)}h`
 
-    console.log(`[AccountPool] Account ${account.email || accountId} failure #${errorCount}: status=${statusCode || '?'}, cooldown=${cooldownStr}`)
+    console.log(
+      `[AccountPool] Account ${account.email || accountId} failure #${errorCount}: status=${statusCode || '?'}, cooldown=${cooldownStr}`
+    )
 
     this.accounts.set(accountId, {
       ...account,
@@ -851,7 +973,9 @@ export class AccountPool {
       lastErrorStatus: statusCode,
       quotaExhaustedAt,
       quotaResetAt: isQuotaError
-        ? (account.quotaResetAt && account.quotaResetAt > now ? account.quotaResetAt : now + this.config.quotaResetMs)
+        ? account.quotaResetAt && account.quotaResetAt > now
+          ? account.quotaResetAt
+          : now + this.config.quotaResetMs
         : account.quotaResetAt,
       cooldownUntil: isQuotaError ? undefined : now + effectiveCooldown,
       lastUsed: now
@@ -867,24 +991,37 @@ export class AccountPool {
 
     for (const account of accounts) {
       const previous = previousAccounts.get(account.id)
-      this.addAccount(previous ? {
-        ...account,
-        requestCount: previous.requestCount,
-        errorCount: previous.errorCount,
-        lastErrorStatus: previous.lastErrorStatus,
-        lastUsed: previous.lastUsed,
-        isAvailable: previous.isAvailable,
-        cooldownUntil: previous.cooldownUntil,
-        quotaUsed: previous.quotaUsed,
-        quotaLimit: previous.quotaLimit,
-        quotaExhaustedAt: previous.quotaExhaustedAt,
-        quotaResetAt: previous.quotaResetAt,
-        suspendedAt: previous.suspendedAt,
-        suspendReason: previous.suspendReason,
-        suspendMessage: previous.suspendMessage
-      } : account)
+      this.addAccount(
+        previous
+          ? {
+              ...account,
+              requestCount: previous.requestCount,
+              errorCount: previous.errorCount,
+              lastErrorStatus: previous.lastErrorStatus,
+              lastUsed: previous.lastUsed,
+              isAvailable: previous.isAvailable,
+              cooldownUntil: previous.cooldownUntil,
+              quotaUsed: previous.quotaUsed,
+              quotaLimit: previous.quotaLimit,
+              quotaExhaustedAt: previous.quotaExhaustedAt,
+              quotaResetAt: previous.quotaResetAt,
+              suspendedAt: previous.suspendedAt,
+              suspendReason: previous.suspendReason,
+              suspendMessage: previous.suspendMessage
+            }
+          : account
+      )
       const stats = previousStats.get(account.id)
       if (stats) this.accountStats.set(account.id, stats)
+    }
+
+    // Account nào không còn trong danh sách mới thì phải bỏ luôn state phụ theo id của nó.
+    // Account còn lại cố ý giữ nguyên (đây là "replace credentials, preserve health").
+    for (const id of [...this.rateLimitBudgets.keys()]) {
+      if (!this.accounts.has(id)) this.rateLimitBudgets.delete(id)
+    }
+    for (const id of [...this.slidingWindows.keys()]) {
+      if (!this.accounts.has(id)) this.slidingWindows.delete(id)
     }
 
     this.currentIndex = this.accounts.size > 0 ? this.currentIndex % this.accounts.size : 0
@@ -906,14 +1043,19 @@ export class AccountPool {
       quotaLimit: limit,
       quotaResetAt: resetAt,
       // 如果配额从耗尽恢复，清除耗尽标记
-      quotaExhaustedAt: (used < limit) ? undefined : account.quotaExhaustedAt,
-      lastErrorStatus: (used < limit && account.lastErrorStatus === 402) ? undefined : account.lastErrorStatus
+      quotaExhaustedAt: used < limit ? undefined : account.quotaExhaustedAt,
+      lastErrorStatus:
+        used < limit && account.lastErrorStatus === 402 ? undefined : account.lastErrorStatus
     })
 
     if (!wasExhausted && used >= limit) {
-      console.warn(`[AccountPool] Account ${account.email || accountId} QUOTA EXHAUSTED: ${used}/${limit} - Account will be skipped until reset`)
+      console.warn(
+        `[AccountPool] Account ${account.email || accountId} QUOTA EXHAUSTED: ${used}/${limit} - Account will be skipped until reset`
+      )
     } else if (wasExhausted && used < limit) {
-      console.log(`[AccountPool] Account ${account.email || accountId} quota recovered: ${used}/${limit}`)
+      console.log(
+        `[AccountPool] Account ${account.email || accountId} quota recovered: ${used}/${limit}`
+      )
     }
   }
 
@@ -939,7 +1081,10 @@ export class AccountPool {
   }
 
   // Phase 14: Conversation cache affinity — prefer same account for same conversation
-  private conversationAffinity: Map<string, { accountId: string; lastAt: number; hitCount: number }> = new Map()
+  private conversationAffinity: Map<
+    string,
+    { accountId: string; lastAt: number; hitCount: number }
+  > = new Map()
   private readonly CONVERSATION_AFFINITY_TTL = 10 * 60_000 // 10 minutes
 
   /**
@@ -976,7 +1121,7 @@ export class AccountPool {
     this.conversationAffinity.set(conversationId, {
       accountId,
       lastAt: Date.now(),
-      hitCount: (existing?.accountId === accountId ? (existing.hitCount || 0) : 0) + 1
+      hitCount: (existing?.accountId === accountId ? existing.hitCount || 0 : 0) + 1
     })
   }
 
@@ -1014,9 +1159,9 @@ export class AccountPool {
 
     // Check if too many recent errors
     const window = this.slidingWindows.get(stickyAccount.id) || []
-    const recentWindow = window.filter(e => e.timestamp > Date.now() - 60_000)
+    const recentWindow = window.filter((e) => e.timestamp > Date.now() - 60_000)
     if (recentWindow.length >= 3) {
-      const recentSuccess = recentWindow.filter(e => e.success).length / recentWindow.length
+      const recentSuccess = recentWindow.filter((e) => e.success).length / recentWindow.length
       if (recentSuccess < 0.5) return true
     }
 
@@ -1047,7 +1192,10 @@ export class AccountPool {
   }
 
   // 获取统计信息
-  getStats(): { accounts: Map<string, AccountStats>; total: { requests: number; tokens: number; errors: number } } {
+  getStats(): {
+    accounts: Map<string, AccountStats>
+    total: { requests: number; tokens: number; errors: number }
+  } {
     let totalRequests = 0
     let totalTokens = 0
     let totalErrors = 0
@@ -1083,6 +1231,12 @@ export class AccountPool {
         suspendMessage: undefined
       })
     }
+    // Reset phải xoá cả ngân sách rate-limit và sliding window. Nếu không, chiến lược
+    // `smart` vẫn bỏ qua cứng mọi account có isRateLimitBudgetExhausted (lastThrottleAt
+    // trong vòng 30 giây) — người dùng bấm "Reset pool" ngay sau một đợt 429 sẽ nhận
+    // success rồi lập tức 503 no_eligible_account.
+    this.rateLimitBudgets.clear()
+    this.slidingWindows.clear()
     this.currentIndex = 0
   }
 
@@ -1090,6 +1244,8 @@ export class AccountPool {
   clear(): void {
     this.accounts.clear()
     this.accountStats.clear()
+    this.rateLimitBudgets.clear()
+    this.slidingWindows.clear()
     this.currentIndex = 0
   }
 

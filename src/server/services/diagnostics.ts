@@ -1,6 +1,6 @@
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
 import { ChainProxyRelay } from '../../main/registration/chainProxy'
-import { callKiroApi, isPlaceholderProfileArn, resolveProfileArn } from '../../main/proxy/kiroApi'
+import { callKiroApi, fetchKiroModels, isPlaceholderProfileArn, resolveProfileArn } from '../../main/proxy/kiroApi'
 import { getSystemProxy, safeCreateProxyAgent } from '../../main/proxy/systemProxy'
 import { openaiToKiro } from '../../main/proxy/translator'
 import type { OpenAIChatRequest, ProxyAccount } from '../../main/proxy/types'
@@ -30,6 +30,23 @@ function isInvalidBearerToken(error: unknown): boolean {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase()
   return message.includes('bearer token included in the request is invalid')
     || message.includes('invalid bearer')
+}
+
+function isInvalidModelId(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase()
+  return message.includes('invalid_model_id') || message.includes('invalid model id')
+}
+
+function isProfileArnRejection(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase()
+  return message.includes('profilearn') || message.includes('profile arn') || message.includes('placeholder')
+}
+
+function chooseLivenessFallbackModel(modelIds: string[], requestedModel: string): string | undefined {
+  const available = new Set(modelIds.filter(Boolean))
+  const preferred = ['claude-sonnet-4.5', 'claude-sonnet-4', 'claude-haiku-4.5', 'auto']
+  return preferred.find((id) => id !== requestedModel && available.has(id))
+    || modelIds.find((id) => id && id !== requestedModel)
 }
 
 export async function proxyPoolValidate(params: {
@@ -159,6 +176,13 @@ async function validateAwsSigninRoute(
     const latencyMs = Date.now() - started
     const contentType = response.headers.get('content-type') || ''
     const text = await response.text().catch(() => '')
+    if (isProxyGatewayDiagnosticBody(text)) {
+      return {
+        success: false,
+        latencyMs,
+        error: 'AWS sign-in route failed: proxy gateway returned server diagnostics instead of an AWS response'
+      }
+    }
     if (response.status < 200 || response.status >= 400) {
       return { success: false, latencyMs, error: formatAwsSigninRouteError(response.status, contentType, text) }
     }
@@ -174,6 +198,11 @@ async function validateAwsSigninRoute(
   } finally {
     clearTimeout(timer)
   }
+}
+
+function isProxyGatewayDiagnosticBody(body: string): boolean {
+  const signatures = ['REMOTE_ADDR', 'REMOTE_PORT', 'REQUEST_METHOD', 'REQUEST_URI', 'HTTP_HOST']
+  return signatures.filter(signature => body.includes(signature)).length >= 3
 }
 
 function formatAwsSigninRouteError(status: number, contentType: string, body: string): string {
@@ -378,21 +407,35 @@ export async function diagnoseAccountLiveness(params: {
       max_tokens: 64
     }
 
-    let result: Awaited<ReturnType<typeof callKiroApi>> | null = null
-    try {
-      result = await callKiroApi(proxyAccount, openaiToKiro(request, resolvedProfileArn), controller.signal)
-    } catch (error) {
-      if (!controller.signal.aborted && account.refreshToken && isInvalidBearerToken(error)) {
-        const refreshedAccessToken = await refreshAccessToken()
-        if (refreshedAccessToken) {
-          proxyAccount.accessToken = refreshedAccessToken
-          result = await callKiroApi(proxyAccount, openaiToKiro(request, resolvedProfileArn), controller.signal)
-        } else {
-          throw error
+    let effectiveModel = model
+    let fallbackNote = ''
+    const invokeModel = async (modelId: string): Promise<Awaited<ReturnType<typeof callKiroApi>>> => {
+      const modelRequest = { ...request, model: modelId }
+      try {
+        return await callKiroApi(proxyAccount, openaiToKiro(modelRequest, resolvedProfileArn), controller.signal)
+      } catch (error) {
+        if (!controller.signal.aborted && account.refreshToken && isInvalidBearerToken(error)) {
+          const refreshedAccessToken = await refreshAccessToken()
+          if (refreshedAccessToken) {
+            proxyAccount.accessToken = refreshedAccessToken
+            return await callKiroApi(proxyAccount, openaiToKiro(modelRequest, resolvedProfileArn), controller.signal)
+          }
         }
-      } else {
         throw error
       }
+    }
+
+    let result: Awaited<ReturnType<typeof callKiroApi>> | null = null
+    try {
+      result = await invokeModel(model)
+    } catch (error) {
+      if (controller.signal.aborted || !isInvalidModelId(error)) throw error
+      const availableModels = await fetchKiroModels(proxyAccount, controller.signal)
+      const fallbackModel = chooseLivenessFallbackModel(availableModels.map((item) => item.modelId), model)
+      if (!fallbackModel) throw error
+      effectiveModel = fallbackModel
+      fallbackNote = `Requested model "${model}" is unavailable for this account; liveness passed with "${fallbackModel}". `
+      result = await invokeModel(fallbackModel)
     }
 
     if (!result) {
@@ -402,9 +445,9 @@ export async function diagnoseAccountLiveness(params: {
     return {
       success: true,
       latencyMs: Date.now() - started,
-      model,
+      model: effectiveModel,
       profileArn: resolvedProfileArn,
-      content: result.content.trim().slice(0, 500),
+      content: `${fallbackNote}${result.content.trim()}`.slice(0, 500),
       usage: {
         inputTokens: result.usage.inputTokens || 0,
         outputTokens: result.usage.outputTokens || 0,
@@ -423,7 +466,12 @@ export async function diagnoseAccountLiveness(params: {
             error: `Model liveness failed: ${detail}`
           }
         }
-        return await runCredentialCheck(`Builder ID model liveness fallback: Kiro did not accept the fixed placeholder profileArn (${detail}).`, { success: false })
+        const reason = isInvalidModelId(error)
+          ? `Requested model "${model}" is unavailable for this account (${detail}).`
+          : isProfileArnRejection(error)
+            ? `Builder ID model liveness fallback: Kiro rejected profileArn (${detail}).`
+            : `Builder ID model liveness failed (${detail}).`
+        return await runCredentialCheck(reason, { success: false })
       }
       throw error
     } catch (fallbackError) {

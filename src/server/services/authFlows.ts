@@ -32,6 +32,9 @@ interface LoginState {
   codeChallenge?: string
   oauthState?: string
   provider?: 'Google' | 'Github'
+  // User đã khởi tạo phiên đăng nhập này. Callback social là endpoint ẩn danh nên
+  // sự kiện kết quả phải phát ĐÚNG về user đó, không được broadcast cho mọi socket SSE.
+  ownerUserId?: string
 }
 
 interface IamSsoResult {
@@ -59,6 +62,9 @@ interface TokenBundle {
 
 let currentLoginState: LoginState | null = null
 let iamSsoResult: IamSsoResult | null = null
+// Code OAuth thật được giữ lại trên máy chủ; ra ngoài chỉ là một vé đối chiếu
+// dùng một lần, nên code không bao giờ đi qua kênh sự kiện.
+let pendingSocialCode: { ticket: string; code: string; state: string } | null = null
 
 function publicBaseUrl(): string {
   if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/$/, '')
@@ -114,7 +120,7 @@ async function enrichTokenData(bundle: TokenBundle): Promise<Record<string, unkn
     idp: bundle.provider
   }
   try {
-    const status = await checkAccountStatus({
+    const status = (await checkAccountStatus({
       id: 'auth-import',
       idp: bundle.provider,
       credentials: {
@@ -127,7 +133,7 @@ async function enrichTokenData(bundle: TokenBundle): Promise<Record<string, unkn
         provider: bundle.provider,
         expiresAt: Date.now() + (bundle.expiresIn || 3600) * 1000
       }
-    }) as any
+    })) as { success?: boolean; data?: Record<string, unknown> } | undefined
     if (status?.success && status.data) Object.assign(data, status.data)
   } catch {
     // Credential verification can still be run by the caller later.
@@ -268,6 +274,11 @@ export async function startIamSsoLogin(startUrl: string, region = 'us-east-1'): 
       interval: auth.interval || 5,
       region,
       startUrl,
+      // Nonce gắn với đúng phiên đang chạy. Thiếu nó thì completeIamSsoLogin
+      // không bao giờ khớp state, còn callback ẩn danh lại hủy được phiên của
+      // người khác. Luồng device-code không cần redirectUri/codeVerifier nên
+      // hai giá trị đó vẫn để trống.
+      oauthState: crypto.randomBytes(32).toString('base64url'),
       expiresAt: Date.now() + (auth.expiresIn || 600) * 1000
     }
     const verificationUri = auth.verificationUriComplete || auth.verificationUri
@@ -288,15 +299,21 @@ export async function handleIamSsoCallback(url: URL): Promise<{ title: string; b
   const code = url.searchParams.get('code')
   const state = url.searchParams.get('state')
   const error = url.searchParams.get('error')
+  // Endpoint callback là ẩn danh. Chỉ ghi nhận kết quả khi callback mang đúng
+  // nonce của phiên đang chạy; ngược lại thì bỏ qua chứ không ghi nhận thất bại,
+  // nếu không ai cũng có thể hủy phiên đăng nhập của quản trị viên.
   if (!currentLoginState || currentLoginState.type !== 'iamsso') {
-    iamSsoResult = { completed: true, success: false, error: 'No IAM SSO login is in progress' }
     return { title: 'Xác thực thất bại', body: 'Không có phiên đăng nhập IAM SSO nào đang chạy.' }
+  }
+  // Phiên không có oauthState là luồng device-code kiểu cũ: bỏ qua bước so state.
+  if (currentLoginState.oauthState && state !== currentLoginState.oauthState) {
+    return { title: 'Xác thực thất bại', body: 'Callback xác thực không khớp phiên đăng nhập hiện tại.' }
   }
   if (error) {
     iamSsoResult = { completed: true, success: false, error }
     return { title: 'Xác thực thất bại', body: error }
   }
-  if (!code || state !== currentLoginState.oauthState) {
+  if (!code) {
     iamSsoResult = { completed: true, success: false, error: 'Invalid authorization callback' }
     return { title: 'Xác thực thất bại', body: 'Callback xác thực không hợp lệ.' }
   }
@@ -393,12 +410,15 @@ export function cancelIamSsoLogin(): { success: true } {
 }
 
 export async function completeIamSsoLogin(code: string): Promise<Record<string, unknown>> {
-  const state = currentLoginState?.oauthState || ''
+  if (!currentLoginState || currentLoginState.type !== 'iamsso') {
+    return { success: false, error: 'No IAM SSO login is in progress' }
+  }
+  const state = currentLoginState.oauthState || ''
   await handleIamSsoCallback(new URL(`${publicBaseUrl()}/api/auth/iam-sso/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`))
   return pollIamSsoAuth()
 }
 
-export function startSocialLogin(provider: 'Google' | 'Github'): {
+export function startSocialLogin(provider: 'Google' | 'Github', ownerUserId?: string): {
   success: boolean
   loginUrl?: string
   state?: string
@@ -418,14 +438,30 @@ export function startSocialLogin(provider: 'Google' | 'Github'): {
   loginUrl.searchParams.set('code_challenge', codeChallenge)
   loginUrl.searchParams.set('code_challenge_method', 'S256')
   loginUrl.searchParams.set('state', oauthState)
-  currentLoginState = { type: 'social', codeVerifier, codeChallenge, oauthState, provider, redirectUri, expiresAt: Date.now() + 600000 }
+  pendingSocialCode = null
+  currentLoginState = { type: 'social', codeVerifier, codeChallenge, oauthState, provider, redirectUri, ownerUserId, expiresAt: Date.now() + 600000 }
   return { success: true, loginUrl: loginUrl.toString(), state: oauthState }
 }
 
-export function handleSocialCallback(url: URL, emit: (channel: string, ...args: unknown[]) => void): { title: string; body: string } {
+// emitFor nhận userId của phiên đang chạy và trả về hàm phát sự kiện đã giới hạn phạm vi.
+// Không nhận thẳng một hàm emit toàn cục: vé đối chiếu social là credential mang quyền,
+// nếu broadcast thì bất kỳ user nào đang mở dialog đăng nhập cũng đổi được nó lấy token của nạn nhân.
+export function handleSocialCallback(
+  url: URL,
+  emitFor: (userId: string | undefined) => (channel: string, ...args: unknown[]) => void
+): { title: string; body: string } {
   const error = url.searchParams.get('error')
   const code = url.searchParams.get('code')
   const state = url.searchParams.get('state')
+  // Callback ẩn danh: chỉ xử lý khi khớp nonce của phiên đang chạy, tránh việc
+  // người lạ hủy phiên hoặc nhét code của họ vào phiên của người khác.
+  if (!currentLoginState || currentLoginState.type !== 'social') {
+    return { title: 'Xác thực thất bại', body: 'Không có phiên đăng nhập nào đang chạy.' }
+  }
+  if (currentLoginState.oauthState && state !== currentLoginState.oauthState) {
+    return { title: 'Xác thực thất bại', body: 'Callback xác thực không khớp phiên đăng nhập hiện tại.' }
+  }
+  const emit = emitFor(currentLoginState.ownerUserId)
   if (error) {
     emit('social-auth-callback', { error })
     return { title: 'Xác thực thất bại', body: error }
@@ -434,7 +470,11 @@ export function handleSocialCallback(url: URL, emit: (channel: string, ...args: 
     emit('social-auth-callback', { error: 'Missing code or state' })
     return { title: 'Xác thực thất bại', body: 'Thiếu code hoặc state.' }
   }
-  emit('social-auth-callback', { code, state })
+  // Chỉ phát ra vé đối chiếu dùng một lần: code OAuth thật ở lại máy chủ và
+  // được exchangeSocialToken tra ngược lại.
+  const ticket = crypto.randomBytes(24).toString('base64url')
+  pendingSocialCode = { ticket, code, state }
+  emit('social-auth-callback', { code: ticket, state })
   return { title: 'Xác thực hoàn tất', body: 'Anh có thể đóng tab trình duyệt này và quay lại Krouter.' }
 }
 
@@ -446,8 +486,14 @@ export async function exchangeSocialToken(code: string, state: string): Promise<
   }
   if (state !== currentLoginState.oauthState) {
     currentLoginState = null
+    pendingSocialCode = null
     return { success: false, error: 'State parameter does not match' }
   }
+  // Đổi vé đối chiếu lấy code OAuth thật. Client cũ dán thẳng code vẫn chạy được.
+  const authorizationCode = pendingSocialCode && pendingSocialCode.state === state && pendingSocialCode.ticket === code
+    ? pendingSocialCode.code
+    : code
+  pendingSocialCode = null
   try {
     const token = await postJson<{
       accessToken: string
@@ -455,7 +501,7 @@ export async function exchangeSocialToken(code: string, state: string): Promise<
       profileArn?: string
       expiresIn?: number
     }>(`${KIRO_AUTH_ENDPOINT}/oauth/token`, {
-      code,
+      code: authorizationCode,
       code_verifier: currentLoginState.codeVerifier,
       redirect_uri: currentLoginState.redirectUri
     })
@@ -478,6 +524,7 @@ export async function exchangeSocialToken(code: string, state: string): Promise<
 
 export function cancelSocialLogin(): { success: true } {
   currentLoginState = null
+  pendingSocialCode = null
   return { success: true }
 }
 

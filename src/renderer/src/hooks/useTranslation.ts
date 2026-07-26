@@ -20,15 +20,17 @@ const locales: Record<string, Translations> = { en, zh }
  * 检测系统语言
  */
 function detectSystemLanguage(): 'en' | 'zh' {
-  return 'en'
+  // Đọc ngôn ngữ trình duyệt/hệ thống; chỉ nhận diện zh, còn lại mặc định en
+  const navLang = typeof navigator !== 'undefined' ? navigator.language : ''
+  return navLang.toLowerCase().startsWith('zh') ? 'zh' : 'en'
 }
 
 /**
  * 获取实际使用的语言
  */
 function getActualLanguage(language: Language): 'en' | 'zh' {
-  void language
-  return detectSystemLanguage()
+  // Cùng logic với setLanguage trong store/accounts.ts: 'auto' mới dò hệ thống
+  return language === 'auto' ? detectSystemLanguage() : language
 }
 
 /**

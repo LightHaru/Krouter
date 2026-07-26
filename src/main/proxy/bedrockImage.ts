@@ -65,17 +65,29 @@ const SIZE_MAP: Record<string, { width: number; height: number }> = {
 
 const NOVA_CANVAS_MODEL = 'amazon.nova-canvas-v1:0'
 
+export function buildNovaCanvasInvokePath(modelId = NOVA_CANVAS_MODEL): string {
+  return `/model/${encodeURIComponent(modelId)}/invoke`
+}
+
+export class BedrockImageApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string
+  ) {
+    super(message)
+    this.name = 'BedrockImageApiError'
+  }
+}
+
 // --- Image Storage ---
 
 export class ImageStorageManager {
   private storagePath: string
   private maxAgeMs: number
-  private maxSizeBytes: number
 
   constructor(opts?: { storagePath?: string; maxAgeMs?: number; maxSizeBytes?: number }) {
     this.storagePath = opts?.storagePath || '/tmp/krouter-images'
     this.maxAgeMs = opts?.maxAgeMs || 24 * 60 * 60 * 1000
-    this.maxSizeBytes = opts?.maxSizeBytes || 1024 * 1024 * 1024
     fs.mkdirSync(this.storagePath, { recursive: true })
   }
 
@@ -171,7 +183,7 @@ export async function generateImage(
   const novaReq = buildNovaCanvasRequest(request)
   const body = JSON.stringify(novaReq)
   const host = `bedrock-runtime.${creds.region}.amazonaws.com`
-  const apiPath = `/model/${NOVA_CANVAS_MODEL}/invoke`
+  const apiPath = buildNovaCanvasInvokePath()
 
   const signed = signBedrockRequest({
     creds,
@@ -186,10 +198,14 @@ export async function generateImage(
     }
   })
 
-  proxyLogger.info('BedrockImage', `Generating ${novaReq.imageGenerationConfig.numberOfImages} image(s)`, {
-    size: `${novaReq.imageGenerationConfig.width}x${novaReq.imageGenerationConfig.height}`,
-    quality: novaReq.imageGenerationConfig.quality
-  })
+  proxyLogger.info(
+    'BedrockImage',
+    `Generating ${novaReq.imageGenerationConfig.numberOfImages} image(s)`,
+    {
+      size: `${novaReq.imageGenerationConfig.width}x${novaReq.imageGenerationConfig.height}`,
+      quality: novaReq.imageGenerationConfig.quality
+    }
+  )
 
   const startTime = Date.now()
   const resp = await undiciFetch(signed.url, {
@@ -202,12 +218,18 @@ export async function generateImage(
   if (!resp.ok) {
     const errText = await resp.text()
     proxyLogger.error('BedrockImage', `Generation failed: ${resp.status}`, { error: errText })
-    throw new Error(`Nova Canvas API error (${resp.status}): ${errText}`)
+    throw new BedrockImageApiError(
+      resp.status,
+      `Nova Canvas API error (${resp.status}): ${errText}`
+    )
   }
 
   const result = (await resp.json()) as NovaCanvasResponse
   const elapsed = Date.now() - startTime
-  proxyLogger.info('BedrockImage', `Generated ${result.images?.length || 0} image(s) in ${elapsed}ms`)
+  proxyLogger.info(
+    'BedrockImage',
+    `Generated ${result.images?.length || 0} image(s) in ${elapsed}ms`
+  )
 
   if (!result.images || result.images.length === 0) {
     throw new Error(result.error || 'No images generated')

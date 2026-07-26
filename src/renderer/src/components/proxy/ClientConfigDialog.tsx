@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AlertCircle, Bot, Check, Code2, Copy, Cpu, FileCog, KeyRound, Loader2, Plus, Settings2, Sparkles, Terminal, Workflow, X, type LucideIcon } from 'lucide-react'
+import { AlertCircle, Bot, Brain, Check, Code2, Copy, Cpu, FileCog, KeyRound, Loader2, Plus, Settings2, Sparkles, Terminal, Workflow, X, type LucideIcon } from 'lucide-react'
 import { Badge, Button, Card, CardContent, CardHeader, CardTitle, Select } from '../ui'
 import { useAccountsStore } from '../../store/accounts'
-import { cn } from '@/lib/utils'
+import { cn, copyText } from '@/lib/utils'
 
 type ClientTarget = 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'
 
@@ -13,6 +13,9 @@ interface ModelInfo {
   inputTypes?: string[]
   maxInputTokens?: number | null
   maxOutputTokens?: number | null
+  supportsThinking?: boolean
+  thinkingEfforts?: string[]
+  modelProvider?: string
 }
 
 interface ClientConfigDialogProps {
@@ -134,6 +137,7 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
   const [models, setModels] = useState<ModelInfo[]>([])
   const [selectedModelId, setSelectedModelId] = useState('')
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([])
+  const [reasoningEffort, setReasoningEffort] = useState('auto')
   const [selectedClients, setSelectedClients] = useState<ClientTarget[]>(['openclaw'])
   const [loadingModels, setLoadingModels] = useState(false)
   const [loadingKeys, setLoadingKeys] = useState(false)
@@ -194,6 +198,9 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
   ], [isEn])
 
   const selectedModel = models.find(model => model.id === selectedModelId)
+  const reasoningOptions = selectedModel?.supportsThinking
+    ? Array.from(new Set(['auto', ...(selectedModel.thinkingEfforts || ['minimal', 'low', 'medium', 'high', 'xhigh'])]))
+    : []
   const selectedModelIdSet = useMemo(() => new Set(selectedModelIds.map(normalizeModelId)), [selectedModelIds])
   const importOpenClawOnly = selectedClients.length === 1 && selectedClients[0] === 'openclaw'
 
@@ -388,7 +395,7 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
 
   const copyProxyKey = async () => {
     if (!proxyKey?.key) return
-    await navigator.clipboard.writeText(proxyKey.key)
+    await copyText(proxyKey.key)
     setKeyCopied(true)
     setTimeout(() => setKeyCopied(false), 1600)
   }
@@ -443,12 +450,16 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
         clients: selectedClients,
         modelId: selectedModelId,
         modelName: selectedModel?.name,
+        reasoningEffort: selectedModel?.supportsThinking && reasoningOptions.includes(reasoningEffort) ? reasoningEffort : 'auto',
         models: selectedModels.map(model => ({
           id: model.id,
           name: model.name,
           inputTypes: model.inputTypes,
           maxInputTokens: model.maxInputTokens,
-          maxOutputTokens: model.maxOutputTokens
+          maxOutputTokens: model.maxOutputTokens,
+          supportsThinking: model.supportsThinking,
+          thinkingEfforts: model.thinkingEfforts,
+          modelProvider: model.modelProvider
         }))
       })
       setProxyBase(result.openaiBaseUrl || result.proxyOrigin)
@@ -564,9 +575,29 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
                   {selectedModel && (
                     <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                       <Badge variant="secondary" className="border-0">{selectedModel.name || selectedModel.id}</Badge>
+                      {selectedModel.modelProvider && <Badge variant="outline">{selectedModel.modelProvider}</Badge>}
                       {selectedModel.inputTypes?.map(type => (
                         <Badge key={type} variant="secondary" className="border-0">{type}</Badge>
                       ))}
+                    </div>
+                  )}
+                  {reasoningOptions.length > 0 && (
+                    <div className="grid gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 sm:grid-cols-[1fr_220px] sm:items-center">
+                      <div className="flex items-start gap-2">
+                        <Brain className="mt-0.5 h-4 w-4 text-emerald-500" />
+                        <div>
+                          <div className="text-sm font-medium">{isEn ? 'Thinking / reasoning effort' : 'Muc suy luan / thinking'}</div>
+                          <div className="text-xs text-muted-foreground">{isEn ? 'Applied to Codex CLI and compatible OpenClaw/Hermes requests.' : 'Ap dung cho Codex CLI va request tuong thich cua OpenClaw/Hermes.'}</div>
+                        </div>
+                      </div>
+                      <Select
+                        value={reasoningOptions.includes(reasoningEffort) ? reasoningEffort : 'auto'}
+                        options={reasoningOptions.map(effort => ({
+                          value: effort,
+                          label: effort === 'auto' ? 'Auto' : effort.charAt(0).toUpperCase() + effort.slice(1)
+                        }))}
+                        onChange={setReasoningEffort}
+                      />
                     </div>
                   )}
                   <div className="rounded-lg border bg-muted/20 p-3 space-y-3">
@@ -635,6 +666,11 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
                             <span className="min-w-0 flex-1">
                               <span className="flex items-center gap-1.5">
                                 <span className="truncate font-semibold">{model.id}</span>
+                                {model.modelProvider === 'chatgpt' && (
+                                  <Badge variant="secondary" className="h-4 shrink-0 border-0 bg-emerald-500/15 px-1 text-[9px] text-emerald-600 dark:text-emerald-400">
+                                    ChatGPT
+                                  </Badge>
+                                )}
                                 {isCustom && (
                                   <Badge variant="secondary" className="h-4 shrink-0 border-0 bg-violet-500/15 px-1 text-[9px] text-violet-600 dark:text-violet-400">
                                     {isEn ? 'Custom' : 'Tùy chỉnh'}

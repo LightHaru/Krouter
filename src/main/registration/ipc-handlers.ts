@@ -132,12 +132,12 @@ export function registerIPCHandlers(getMainWindow: () => BrowserWindow | null): 
 
   // 打开 Proton 登录窗口（首次需用户手动登录，之后 session 持久化复用）
   ipcMain.handle('proton-open-login', async (_event, proxy?: string) => {
-    return openProtonLogin(proxy)
+    return await openProtonLogin(proxy)
   })
 
   // 查询 Proton 登录态（不弹窗）
   ipcMain.handle('proton-login-status', async (_event, proxy?: string) => {
-    return getProtonLoginStatus(proxy)
+    return await getProtonLoginStatus(proxy)
   })
 
   // 关闭 Proton 窗口（保留登录态）

@@ -26,7 +26,7 @@ import {
   LogOut,
   RotateCcw
 } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, copyText } from '@/lib/utils'
 
 // 解析 ARGB 颜色转换为 CSS rgba
 function toRgba(argbColor: string): string {
@@ -337,7 +337,7 @@ export const AccountCard = memo(function AccountCard({
       clientId: account.credentials.clientId,
       clientSecret: account.credentials.clientSecret
     }
-    navigator.clipboard.writeText(JSON.stringify(credentials, null, 2))
+    copyText(JSON.stringify(credentials, null, 2))
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }
@@ -447,7 +447,7 @@ export const AccountCard = memo(function AccountCard({
       const result = await window.api.accountGetSubscriptionUrl(account.credentials.accessToken, planName, account.credentials?.region, account.profileArn, account.machineId, account.credentials?.provider || account.idp, account.credentials?.authMethod, account.id)
       if (result.success && result.url) {
         // 自动复制链接到剪贴板
-        await navigator.clipboard.writeText(result.url)
+        await copyText(result.url)
         // 显示复制成功提示
         setSubscriptionSuccess(isEn ? 'Link copied to clipboard!' : '链接已复制到剪贴板！')
         // 短暂显示后关闭弹窗并打开链接
@@ -594,7 +594,7 @@ export const AccountCard = memo(function AccountCard({
                      e.stopPropagation()
                      const text = account.email || account.userId || ''
                      if (text) {
-                       navigator.clipboard.writeText(text)
+                       copyText(text)
                        setEmailCopied(true)
                        setTimeout(() => setEmailCopied(false), 1500)
                      }

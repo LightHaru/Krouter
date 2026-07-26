@@ -593,6 +593,8 @@ function mergeUsageSnapshot(currentUsage: AccountUsage, incomingUsage: Partial<A
 }
 
 let autoSwitchTimer: ReturnType<typeof setInterval> | null = null
+// Chu kỳ (phút) đang được hẹn giờ, dùng để bỏ qua lần startAutoSwitch trùng lặp
+let autoSwitchArmedInterval: number | null = null
 
 // 定时自动保存定时器（防止数据丢失）
 let autoSaveTimer: ReturnType<typeof setInterval> | null = null
@@ -1018,8 +1020,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const limit = typeof proxyAccount.quotaLimit === 'number'
         ? proxyAccount.quotaLimit
         : account.usage.limit
+      // Giữ nguyên ISO đầy đủ: cắt còn YYYY-MM-DD khiến usageResetDue() hiểu là 00:00 UTC,
+      // nên cả ngày reset account bị coi như đã reset và pool định tuyến vào đó để nhận 429.
       const nextResetDate = typeof proxyAccount.quotaResetAt === 'number'
-        ? new Date(proxyAccount.quotaResetAt).toISOString().slice(0, 10)
+        ? new Date(proxyAccount.quotaResetAt).toISOString()
         : account.usage.nextResetDate
       const quotaExhaustedAt = typeof proxyAccount.quotaExhaustedAt === 'number'
         ? proxyAccount.quotaExhaustedAt
@@ -2171,6 +2175,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   loadFromStorage: async (options) => {
     const silent = Boolean(options?.silent)
+    // Đang có thao tác lưu chờ (debounce) hoặc đang ghi thì bỏ qua lần đồng bộ ngầm:
+    // dữ liệu trên đĩa còn cũ hơn state trong bộ nhớ, tải về sẽ ghi đè chỉnh sửa
+    // người dùng vừa thực hiện (và lần lưu debounce sau đó sẽ ghi luôn bản đã bị lùi).
+    if (silent && (saveDebounceTimer || saveMaxWaitTimer || saveInFlight)) return
     if (!silent) set({ isLoading: true })
 
     try {
@@ -2256,7 +2264,6 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           proxyPoolConfig: {
             ...DEFAULT_PROXY_POOL_CONFIG,
             ...(data.proxyPoolConfig as Partial<ProxyPoolConfig> | undefined),
-            sourceRemoveDead: true,
             maxUsableLatencyMs: Math.max(
               100,
               Number((data.proxyPoolConfig as Partial<ProxyPoolConfig> | undefined)?.maxUsableLatencyMs) ||
@@ -2270,18 +2277,23 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         // 应用主题
         get().applyTheme()
 
-        // 如果代理已启用，通过 store 的 setProxy（会自动 normalize URL 并回写 UI）
-        if (data.proxyEnabled && data.proxyUrl) {
-          void get().setProxy(true, data.proxyUrl)
-        }
+        // Các side effect sau khi tải chỉ chạy ở lần tải thật, không chạy ở poll ngầm 10s:
+        // startAutoSwitch/startAutoSave đều clear rồi arm lại timer nên chu kỳ người dùng
+        // cấu hình sẽ không bao giờ tới, còn setProxy thì bắn thêm IPC + saveToStorage mỗi 10s.
+        if (!silent) {
+          // 如果代理已启用，通过 store 的 setProxy（会自动 normalize URL 并回写 UI）
+          if (data.proxyEnabled && data.proxyUrl) {
+            void get().setProxy(true, data.proxyUrl)
+          }
 
-        // 如果自动换号已启用，启动定时器
-        if (data.autoSwitchEnabled) {
-          get().startAutoSwitch()
-        }
+          // 如果自动换号已启用，启动定时器
+          if (data.autoSwitchEnabled) {
+            get().startAutoSwitch()
+          }
 
-        // 启动定时自动保存（防止数据丢失）
-        get().startAutoSave()
+          // 启动定时自动保存（防止数据丢失）
+          get().startAutoSave()
+        }
 
         // 如果生成了新的 machineId，保存到存储
         if (needsSave) {
@@ -2628,20 +2640,25 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const { autoSwitchEnabled, autoSwitchInterval, checkAndAutoSwitch } = get()
     
     if (!autoSwitchEnabled) return
-    
+
+    // Đã hẹn giờ đúng chu kỳ này rồi thì giữ nguyên: gọi lại sẽ reset bộ đếm và bắn
+    // checkAndAutoSwitch ngay lập tức, khiến chu kỳ người dùng đặt không bao giờ tới
+    if (autoSwitchTimer && autoSwitchArmedInterval === autoSwitchInterval) return
+
     // 清除现有定时器
     if (autoSwitchTimer) {
       clearInterval(autoSwitchTimer)
     }
-    
+
     // 立即检查一次
     checkAndAutoSwitch()
-    
+
     // 设置定时检查
     autoSwitchTimer = setInterval(() => {
       checkAndAutoSwitch()
     }, autoSwitchInterval * 60 * 1000)
-    
+    autoSwitchArmedInterval = autoSwitchInterval
+
     console.log(`[AutoSwitch] Started with interval: ${autoSwitchInterval} minutes`)
   },
 
@@ -2649,12 +2666,13 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     if (autoSwitchTimer) {
       clearInterval(autoSwitchTimer)
       autoSwitchTimer = null
+      autoSwitchArmedInterval = null
       console.log('[AutoSwitch] Stopped')
     }
   },
 
   checkAndAutoSwitch: async () => {
-    const { accounts, autoSwitchThreshold, checkAccountStatus, setActiveAccount } = get()
+    const { autoSwitchThreshold, checkAccountStatus, setActiveAccount } = get()
     const activeAccount = get().getActiveAccount()
     
     if (!activeAccount) {
@@ -2668,7 +2686,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     await checkAccountStatus(activeAccount.id)
     
     // 重新获取更新后的账号信息
-    const updatedAccount = get().accounts.get(activeAccount.id)
+    // Đọc lại Map sau await: refresh nền chạy trong lúc chờ có thể đã xoay token của
+    // account khác hoặc đánh dấu hết quota. Dùng snapshot cũ sẽ chọn nhầm account và
+    // gửi accessToken/refreshToken đã bị server thu hồi sang IDE.
+    const { accounts } = get()
+    const updatedAccount = accounts.get(activeAccount.id)
     if (!updatedAccount) return
 
     const remaining = updatedAccount.usage.limit - updatedAccount.usage.current
@@ -2968,7 +2990,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     console.log(`[BackgroundRefresh] Triggering refresh for ${accountsToRefresh.length} accounts (syncInfo: ${autoRefreshSyncInfo})...`)
     
     // 调用主进程后台刷新，不等待结果（通过 IPC 事件接收）
-    window.api.backgroundBatchRefresh(accountsToRefresh, autoRefreshConcurrency, autoRefreshSyncInfo)
+    // Bắt lỗi ở tầng IPC: nếu không, thất bại chỉ hiện ra dưới dạng unhandled rejection
+    // và token âm thầm ngừng được làm mới cho tới khi khởi động lại app
+    void window.api.backgroundBatchRefresh(accountsToRefresh, autoRefreshConcurrency, autoRefreshSyncInfo)
+      .catch(err => console.error('[BackgroundRefresh] trigger failed:', err))
   },
 
   // 处理后台刷新结果（兼容入口；高频场景请走 applyBackgroundRefreshResults 批量）
@@ -3036,7 +3061,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           ...account.credentials,
           accessToken: refreshData?.accessToken || account.credentials.accessToken,
           refreshToken: refreshData?.refreshToken || account.credentials.refreshToken,
-          expiresAt: refreshData?.expiresIn ? now + refreshData.expiresIn * 1000 : account.credentials.expiresAt
+          // Chỉ nhận hạn mới khi payload thật sự mang accessToken mới. Payload đã được
+          // server lọc bỏ token (luồng auto-refresh nền) mà vẫn còn expiresIn sẽ khiến
+          // token CŨ được gia hạn giả -> account chết nhưng bị coi là còn sống.
+          expiresAt: refreshData?.accessToken && refreshData?.expiresIn
+            ? now + refreshData.expiresIn * 1000
+            : account.credentials.expiresAt
         },
         usage: refreshData?.usage ? (() => {
           return mergeUsageSnapshot(account.usage, {
@@ -3179,10 +3209,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   // ==================== 定时自动保存 ====================
   startAutoSave: () => {
-    // 如果已有定时器，先停止
-    if (autoSaveTimer) {
-      clearInterval(autoSaveTimer)
-    }
+    // Đã có bộ đếm thì giữ nguyên: khởi động lại vừa reset chu kỳ AUTO_SAVE_INTERVAL
+    // (khiến vòng lặp tự lưu — đường retry duy nhất khi ghi đĩa lỗi — không bao giờ chạy),
+    // vừa JSON.stringify lại toàn bộ account/group/tag trên UI thread.
+    if (autoSaveTimer) return
 
     // 计算当前数据的哈希值
     const computeHash = () => {
@@ -3586,6 +3616,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         const status: ProxyEntry['status'] = result.success
           ? (fastEnough ? 'alive' : 'slow')
           : 'dead'
+        // Số proxy còn dùng được trong kho (entry đang test đã ở trạng thái 'testing' nên không tính)
+        const nextFailCount = result.success ? 0 : existing.failCount + 1
+        const usableCount = Array.from(state.proxyPool.values())
+          .filter((p) => isProxyUsable(p, state.proxyPoolConfig)).length
         next.set(id, {
           ...existing,
           status,
@@ -3597,9 +3631,15 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               ? `Latency ${latencyMs ?? 'unknown'}ms exceeds ${state.proxyPoolConfig.maxUsableLatencyMs}ms quality limit`
               : result.error,
           // 验活失败也累计到 failCount，但不计入 reportProxyResult 的注册失败
-          failCount: fastEnough ? 0 : existing.failCount + 1,
+          failCount: nextFailCount,
           // 自动停用：累计失败超过阈值；但池中可用代理 <= 1 时保护性保留（轮换代理避免变直连）
-          enabled: fastEnough ? existing.enabled : false
+          enabled: result.success
+            ? existing.enabled
+            : (state.proxyPoolConfig.autoDisableDead &&
+                nextFailCount >= state.proxyPoolConfig.failureThreshold &&
+                usableCount > 1
+              ? false
+              : existing.enabled)
         })
       }
       return { proxyPool: next }
@@ -3637,7 +3677,6 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       proxyPoolConfig: {
         ...state.proxyPoolConfig,
         ...config,
-        sourceRemoveDead: true,
         maxUsableLatencyMs: Math.max(
           100,
           Number(config.maxUsableLatencyMs ?? state.proxyPoolConfig.maxUsableLatencyMs) ||

@@ -1,108 +1,127 @@
 ---
 name: krouter-image
-description: Free image generation via ChatGPT OAuth + Amazon Nova Canvas fallback (OpenAI-compatible)
-version: 2.1.0
-tags: [image, generation, chatgpt, gpt-image-2, nova-canvas, free]
-metadata:
-  openclaw:
-    requires: [krouter-proxy]
-    category: media
+description: Generate and verify images through Krouter using ChatGPT OAuth or an explicitly configured Amazon Bedrock image model
+version: 3.1.0
+tags: [image, generation, chatgpt, oauth, nova-canvas, openai-compatible]
+metadata: {"openclaw":{"requires":{"bins":["node"]},"category":"media"}}
 ---
 
-# Krouter Image Generation
+# Krouter Image
 
-Generate high-quality images for FREE using ChatGPT OAuth (GPT-Image-2) or Amazon Nova Canvas.
+Use Krouter's authenticated image helper. It automatically reads the Krouter provider already used by OpenClaw, calls the OpenAI-compatible image endpoint, downloads the result, verifies real image bytes, and prints a safe JSON result without exposing the API key.
 
-## Quick Start
+## OpenClaw
+
+When the user asks to generate an image, run:
 
 ```bash
-curl http://localhost:5580/v1/images/generations \
-  -H "Authorization: Bearer YOUR_KEY" \
+node "{baseDir}/scripts/generate-image.cjs" --prompt "IMAGE DESCRIPTION" --output "./generated-images/result.png"
+```
+
+Optional flags are `--model`, `--size`, `--quality`, `--prompt-file`, and `--output`. Use `--prompt-file` when the prompt contains complex quoting. After success, return the absolute `path` from the JSON result as media or an attachment. Do not manually read, print, or pass the Krouter API key.
+
+If the current agent already uses a `krouter/*` model, do not ask the user for an endpoint or API key. The helper discovers them from `OPENCLAW_CONFIG_PATH`, `~/.openclaw/openclaw.json`, and every `~/.openclaw/agents/*/agent/models.json` profile. `KROUTER_BASE_URL` and `KROUTER_API_KEY` are optional diagnostic overrides, not normal requirements.
+
+## Preconditions
+
+1. Keep Krouter Proxy API running. The fallback base URL is `http://127.0.0.1:5580`.
+2. Keep the existing OpenClaw `krouter` provider enabled. The helper reuses its base URL and API key automatically.
+3. Configure one image backend:
+   - ChatGPT OAuth: open **Routing Control Room > ChatGPT OAuth** and select **Connect ChatGPT**. The HTTP endpoint below is available for headless use.
+   - Amazon Bedrock: enable Bedrock credentials and request an explicit Bedrock image model. Nova Canvas currently requires a supported Bedrock region such as `ap-northeast-1`, `eu-west-1`, or `us-east-1`; verify AWS's current model-region table before use.
+4. Check `GET /health` before generating.
+
+ChatGPT product limits and availability are controlled by the upstream account and may change. Do not promise that a request is free or that a fixed daily quota is available.
+
+## ChatGPT OAuth Setup
+
+```bash
+curl -sS -X POST http://127.0.0.1:5580/auth/chatgpt/login \
+  -H "Authorization: Bearer YOUR_KROUTER_KEY"
+```
+
+Open the returned `authUrl`, finish sign-in, then check:
+
+```bash
+curl -sS http://127.0.0.1:5580/auth/chatgpt/status \
+  -H "Authorization: Bearer YOUR_KROUTER_KEY"
+```
+
+This route uses the ChatGPT/Codex sign-in flow and an upstream ChatGPT backend; it is not the public OpenAI Images API. Availability and usage limits depend on the connected plan and can change. Never print OAuth access or refresh tokens into agent output, logs, or prompts.
+
+## Generate
+
+```bash
+curl -sS http://127.0.0.1:5580/v1/images/generations \
+  -H "Authorization: Bearer YOUR_KROUTER_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "A beautiful sunset over Vietnamese mountains, watercolor style",
+    "model": "gpt-image",
+    "prompt": "A quiet Vietnamese mountain pass at sunrise, editorial ink and watercolor",
     "size": "1024x1024",
-    "quality": "high"
+    "quality": "high",
+    "response_format": "url"
   }'
 ```
 
-## Model Routing
+If `model` is omitted, Krouter prefers an available ChatGPT OAuth account and may fall back to configured Bedrock. Use `nova-canvas` or an `amazon.*` model only when Bedrock is enabled. Krouter does not silently change the configured AWS region because that could violate data-residency expectations.
 
-| Model | Backend | Cost | Quality |
-|-------|---------|------|---------|
-| *(default)* | ChatGPT OAuth | FREE | GPT-Image-2 quality |
-| `gpt-image` / `gpt-image-2` | ChatGPT OAuth | FREE | High |
-| `dall-e-3` / `dall-e` | ChatGPT OAuth | FREE | High |
-| `chatgpt` | ChatGPT OAuth | FREE | High |
-| `nova-canvas` | AWS Bedrock | Paid | Amazon Nova |
-| `amazon.*` / `stability.*` | AWS Bedrock | Paid | Various |
+## Required Verification
 
-## Setup (ChatGPT Free — No API Key Needed)
+A successful HTTP status is not enough.
 
-1. Start Krouter proxy
-2. Call login endpoint:
-```bash
-curl -X POST http://localhost:5580/auth/chatgpt/login
-```
-3. Open the returned `authUrl` in your browser
-4. Login with your ChatGPT account (free account works!)
-5. Done — Krouter handles token refresh automatically
+1. Confirm `data` contains at least one item.
+2. For `response_format: "url"`, download `data[0].url`.
+3. Require an `image/*` Content-Type and a non-empty body.
+4. Decode the image and confirm width and height are greater than zero.
+5. Report the backend/model requested and the saved artifact path.
 
-## Check Status
+Example URL verification:
 
 ```bash
-curl http://localhost:5580/auth/chatgpt/status
+curl -fSL -D image.headers -o generated.png "URL_FROM_RESPONSE"
+file generated.png
 ```
+
+For `response_format: "b64_json"`, base64-decode `data[0].b64_json` and perform the same image decode check.
 
 ## Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `prompt` | string | required | Image description |
-| `model` | string | *(auto)* | Model to use (see routing table) |
-| `n` | number | 1 | Number of images |
-| `size` | string | "1024x1024" | Image dimensions |
-| `quality` | string | "standard" | "standard", "high", or "hd" |
-| `response_format` | string | "url" | "url" or "b64_json" |
-| `negative_prompt` | string | — | What to avoid (Bedrock only) |
-| `cfg_scale` | number | 7.0 | Creativity scale (Bedrock only) |
-| `seed` | number | — | For reproducibility |
+| Parameter | Type | Default | Notes |
+|---|---:|---|---|
+| `prompt` | string | required | Non-empty image instruction |
+| `model` | string | auto | `gpt-image`, `gpt-image-2`, `chatgpt`, `nova-canvas`, or configured `amazon.*` / `stability.*` |
+| `n` | number | 1 | Upstream may return fewer images |
+| `size` | string | `1024x1024` | Also supports 256/512 square, portrait and landscape mappings |
+| `quality` | string | standard | `high` and `hd` add a quality instruction on ChatGPT |
+| `response_format` | string | url | `url` or `b64_json` |
+| `negative_prompt` | string | none | Bedrock path only |
+| `cfg_scale` | number | backend default | Bedrock path only |
+| `seed` | number | random | Bedrock path only |
 
-## Supported Sizes
-
-- `1024x1024` — Square (default)
-- `1024x1536` — Portrait
-- `1536x1024` — Landscape
-- `1024x1792` — Tall portrait
-- `1792x1024` — Wide landscape
-
-## Response
+## Response Shape
 
 ```json
 {
   "created": 1719000000,
   "data": [
     {
-      "url": "http://localhost:5580/v1/images/abc123.png",
-      "revised_prompt": "A beautiful sunset over Vietnamese mountains..."
+      "url": "http://127.0.0.1:5580/v1/images/generated-id.png",
+      "revised_prompt": "..."
     }
   ]
 }
 ```
 
-## Free Tier Limits
+## Failure Handling
 
-- Free ChatGPT accounts: ~2-3 images/day/account
-- Plus/Pro accounts: ~50+ images/day/account
-- Krouter pool rotation: multiple accounts = higher throughput
-- Auto-rotates when an account hits its limit
+| Status or message | Action |
+|---|---|
+| `401` / `403` from Krouter | Check the Krouter API key |
+| `No ChatGPT accounts available` | Complete ChatGPT OAuth login or enable Bedrock |
+| `Authentication failed` | Re-login to ChatGPT; do not retry with the same stale token |
+| `429` / quota exhausted | Stop retrying that account and wait for its upstream limit to reset |
+| Bedrock credential/model error | Verify region, credentials, model access and explicit model ID; `ap-southeast-1` does not currently host Nova Canvas |
+| URL returns non-image bytes | Treat the run as failed and keep the response/log for diagnosis |
 
-## For OpenClaw Agents
-
-Agents can use this endpoint directly — it's OpenAI-compatible:
-```yaml
-# In agent config
-image_provider:
-  base_url: http://localhost:5580
-  endpoint: /v1/images/generations
-```
+Retries must be bounded. Never rotate identities or attempt to bypass upstream access controls.

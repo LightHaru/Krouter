@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { UserPlus, Mail, Key, Loader2, CheckCircle2, XCircle, Trash2, Play, Square, Clock, RotateCcw, RefreshCw, Download, Upload, Settings2, Link2, AtSign, Shuffle, Info, Pause, AlertTriangle, ShieldAlert, Gauge, Activity, CalendarClock, Timer, Network, Lock } from 'lucide-react'
+import { UserPlus, Mail, Key, Loader2, CheckCircle2, XCircle, Trash2, Play, Square, Clock, RotateCcw, RefreshCw, Download, Upload, Settings2, Link2, AtSign, Shuffle, Info, Pause, AlertTriangle, ShieldAlert, Gauge, Activity, CalendarClock, Timer, Network, Lock, ChevronDown } from 'lucide-react'
 import { useTranslation } from '@/hooks/useTranslation'
 import { isPlaceholderProfileArn, useAccountsStore } from '@/store/accounts'
 import { useTaskStore } from '@/store/tasks'
@@ -9,7 +9,7 @@ import type { ProxyEntry, ProxyPoolConfig, ProxyValidationResult } from '@/types
 import type { Account } from '@/types/account'
 import { Card, CardContent, CardHeader, CardTitle, Button, Input, Label, Progress, Badge, Switch } from '../ui'
 import { cn, randomUuid } from '@/lib/utils'
-import { appendSubscriptionLink, updateSubscriptionLink } from './SubscriptionPage'
+import { appendSubscriptionLink, updateSubscriptionLink } from './subscriptionLinkStore'
 import { generateNextDotVariant, countSameRootVariants, totalVariantCount, splitEmail } from '@/lib/dotVariants'
 import { RegistrationCircuitBreaker } from '@/lib/registrationCircuitBreaker'
 
@@ -47,16 +47,24 @@ function isSubmitEmailRouteFailure(raw: string): boolean {
     || e.includes('unauthorized')
 }
 
-function isHtmlProxyGatewayFailure(raw: string | undefined): boolean {
+function isProxyGatewayRouteFailure(raw: string | undefined): boolean {
   const e = (raw || '').toLowerCase()
-  return e.includes('status=403')
+  const htmlForbidden = e.includes('status=403')
     && (e.includes('<html') || e.includes('html forbidden page'))
     && e.includes('forbidden')
+  const oidcIntercepted = e.includes('proxy gateway intercepted aws oidc request')
+    && e.includes('route/proxy is not usable for aws sign-in')
+  const diagnosticResponse = e.includes('proxy gateway returned server diagnostics')
+    && e.includes('aws sign-in route failed')
+  return htmlForbidden || oidcIntercepted || diagnosticResponse
 }
 
 function normalizeRegistrationRouteFailure(raw: string | undefined): string | null {
   if (!raw) return null
-  if (isHtmlProxyGatewayFailure(raw)) {
+  if (isProxyGatewayRouteFailure(raw)) {
+    if (raw.toLowerCase().includes('oidc') || raw.toLowerCase().includes('server diagnostics')) {
+      return 'Proxy route failed: the gateway intercepted AWS OIDC and returned diagnostics instead of JSON'
+    }
     return 'Proxy route failed: the gateway returned an HTML 403 page before Kiro produced an API response'
   }
   if (!isSubmitEmailRouteFailure(raw)) return null
@@ -104,7 +112,7 @@ function diagnoseRegError(err: string | undefined): ErrorDiagnosis {
   if (!e) {
     return { category: 'unknown', title: 'Lỗi không xác định', reasons: ['Không nhận được thông tin lỗi cụ thể'], suggestions: ['Xem nhật ký đầy đủ'] }
   }
-  if (isHtmlProxyGatewayFailure(err)) {
+  if (isProxyGatewayRouteFailure(err)) {
     return {
       category: 'network',
       title: 'Proxy gateway trả về HTML 403',
@@ -1249,15 +1257,40 @@ export function RegisterPage(): React.JSX.Element {
     }
   }, [])
 
-  const getProxyPoolReadiness = useCallback((): { enabled: boolean; total: number; usable: number } => {
+  const getProxyPoolReadiness = useCallback((): {
+    enabled: boolean
+    total: number
+    usable: number
+    disabled: number
+    untested: number
+    slow: number
+    dead: number
+  } => {
     const { proxyPool, proxyPoolConfig } = useAccountsStore.getState()
     const entries = Array.from(proxyPool.values())
+    const usable = entries.filter((proxy) =>
+      proxy.enabled &&
+      proxy.status === 'alive' &&
+      typeof proxy.latencyMs === 'number' &&
+      Number.isFinite(proxy.latencyMs) &&
+      proxy.latencyMs >= 0 &&
+      proxy.latencyMs <= proxyPoolConfig.maxUsableLatencyMs
+    ).length
     return {
       enabled: proxyPoolConfig.enabled,
       total: entries.length,
-      usable: entries.filter((proxy) => proxy.enabled && proxy.status !== 'dead').length
+      usable,
+      disabled: entries.filter(proxy => !proxy.enabled).length,
+      untested: entries.filter(proxy => proxy.status === 'untested' || proxy.status === 'testing').length,
+      slow: entries.filter(proxy => proxy.status === 'slow').length,
+      dead: entries.filter(proxy => proxy.status === 'dead').length
     }
   }, [])
+
+  const proxyReadinessDetail = useCallback((readiness: ReturnType<typeof getProxyPoolReadiness>): string => (
+    `${readiness.total} saved, ${readiness.usable} registration-ready, ${readiness.disabled} disabled, ` +
+    `${readiness.untested} untested, ${readiness.slow} slow, ${readiness.dead} dead`
+  ), [getProxyPoolReadiness])
 
   const proxyFallbackLog = useCallback((scope: string): string => {
     const readiness = getProxyPoolReadiness()
@@ -1265,10 +1298,10 @@ export function RegisterPage(): React.JSX.Element {
       return `[Proxy] Proxy pool has ${readiness.total} saved proxy route(s) but is OFF; ${scope} will use direct/system network. Turn on Proxy Pool or choose Client route if you want this run to use a proxy.`
     }
     if (readiness.enabled && readiness.usable === 0) {
-      return `[Proxy] Proxy pool is ON but has no usable proxy; ${scope} will use direct/system network unless a client route is selected.`
+      return `[Proxy] Proxy pool is ON but has no registration-ready proxy (${proxyReadinessDetail(readiness)}); ${scope} will not use the server IP.`
     }
     return `[Proxy] Proxy pool is disabled or has no usable proxy; ${scope} will use direct/system network, so the exit IP can remain unchanged.`
-  }, [getProxyPoolReadiness])
+  }, [getProxyPoolReadiness, proxyReadinessDetail])
 
   const resolveImportProxyUrl = useCallback((binding?: ImportProxyBinding | null): string | undefined => {
     if (!binding) return undefined
@@ -1316,13 +1349,14 @@ export function RegisterPage(): React.JSX.Element {
     if (!binding?.proxyId) return
     const normalizedError = error ? compactLogError(error, 360) : undefined
     useAccountsStore.getState().reportProxyResult(binding.proxyId, success, email, normalizedError)
-    if (!success && normalizedError && isHtmlProxyGatewayFailure(String(error || normalizedError))) {
+    if (!success && normalizedError && isProxyGatewayRouteFailure(String(error || normalizedError))) {
       addLog(`[Proxy] Route nay bi gateway tu choi AWS sign-in; da ghi nhan vao proxy pool: ${normalizedError}`)
     }
   }, [addLog])
 
   const prepareRegistrationProxyRoute = async (
-    scope: string
+    scope: string,
+    initialExclusions?: { excludeIds?: ReadonlySet<string>; excludeHosts?: ReadonlySet<string> }
   ): Promise<{ success: boolean; patch: Record<string, unknown>; binding: ImportProxyBinding | null; error?: string }> => {
     if (networkSource === 'client-proxy') {
       const route = resolveRegistrationNetworkRoute()
@@ -1365,13 +1399,13 @@ export function RegisterPage(): React.JSX.Element {
     if (readiness.total === 0 || readiness.usable === 0) {
       const error = readiness.total === 0
         ? 'Proxy pool is ON but empty; registration was stopped before using direct/server IP.'
-        : 'Proxy pool is ON but has no usable proxy; registration was stopped before using direct/server IP.'
+        : `Proxy pool has no registration-ready route (${proxyReadinessDetail(readiness)}); registration was stopped before using direct/server IP.`
       addLog(`[Proxy] ${error}`)
       return { success: false, patch: {}, binding: null, error }
     }
 
-    const excludedIds = new Set<string>()
-    const excludedHosts = new Set<string>()
+    const excludedIds = new Set<string>(initialExclusions?.excludeIds)
+    const excludedHosts = new Set<string>(initialExclusions?.excludeHosts)
     const maxAttempts = Math.max(1, readiness.total)
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const live = useAccountsStore.getState()
@@ -1865,36 +1899,70 @@ export function RegisterPage(): React.JSX.Element {
       addLog(`[Proton] Sử dụng bí danh dấu chấm: ${variant}`)
     }
 
-    const preparedRoute = await prepareRegistrationProxyRoute('auto registration')
-    if (!preparedRoute.success) {
-      setResult(makeFailedRegResult(preparedRoute.error))
-      setPhase('idle')
-      return
-    }
-    Object.assign(config, preparedRoute.patch)
-    currentRegistrationProxyBinding.current = preparedRoute.binding
+    const routeExclusions = { excludeIds: new Set<string>(), excludeHosts: new Set<string>() }
+    const maxRouteAttempts = networkSource === 'client-proxy' ? 1 : 3
+    let lastRouteError: unknown
 
-    try {
-      const res = await window.api.registrationStartAuto(config as Parameters<typeof window.api.registrationStartAuto>[0])
-      const autoResult = res.result as RegResult | undefined
-      reportRegistrationProxyOutcome(
-        currentRegistrationProxyBinding.current,
-        Boolean(res.success && autoResult?.status === 'success'),
-        autoResult?.email,
-        res.error || autoResult?.error
-      )
-      if (res.success && res.result) {
-        await onRegComplete(res.result as RegResult)
-      } else if (!res.success) {
-        addLog(`${t('register.logStartFailed')} ${res.error}`)
-        setResult(makeFailedRegResult(res.error))
-        setPhase('idle')
+    for (let routeAttempt = 0; routeAttempt < maxRouteAttempts; routeAttempt++) {
+      const preparedRoute = await prepareRegistrationProxyRoute('auto registration', routeExclusions)
+      if (!preparedRoute.success) {
+        lastRouteError = preparedRoute.error
+        break
       }
-    } catch (error) {
-      addLog(`${t('register.logStartFailed')} ${error instanceof Error ? error.message : String(error)}`)
-      setResult(makeFailedRegResult(error))
-      setPhase('idle')
+      currentRegistrationProxyBinding.current = preparedRoute.binding
+      const attemptConfig = { ...config, ...preparedRoute.patch }
+
+      try {
+        const res = await window.api.registrationStartAuto(attemptConfig as Parameters<typeof window.api.registrationStartAuto>[0])
+        const autoResult = res.result as RegResult | undefined
+        const attemptError = res.error || autoResult?.error
+        reportRegistrationProxyOutcome(
+          currentRegistrationProxyBinding.current,
+          Boolean(res.success && autoResult?.status === 'success'),
+          autoResult?.email,
+          attemptError
+        )
+        if (res.success && res.result) {
+          await onRegComplete(res.result as RegResult)
+          return
+        }
+
+        lastRouteError = attemptError
+        const binding = currentRegistrationProxyBinding.current
+        const canRotate = routeAttempt + 1 < maxRouteAttempts
+          && Boolean(binding?.proxyId)
+          && isProxyGatewayRouteFailure(String(attemptError || ''))
+        if (canRotate && binding?.proxyId) {
+          routeExclusions.excludeIds.add(binding.proxyId)
+          try {
+            if (binding.proxyUrl) routeExclusions.excludeHosts.add(new URL(binding.proxyUrl).hostname)
+          } catch { /* malformed URL was already reported by route validation */ }
+          addLog(`[NetworkGuard] OIDC route rejected; switching to another proxy (${routeAttempt + 2}/${maxRouteAttempts})...`)
+          continue
+        }
+        break
+      } catch (error) {
+        lastRouteError = error
+        reportRegistrationProxyOutcome(currentRegistrationProxyBinding.current, false, undefined, error)
+        const binding = currentRegistrationProxyBinding.current
+        const canRotate = routeAttempt + 1 < maxRouteAttempts
+          && Boolean(binding?.proxyId)
+          && isProxyGatewayRouteFailure(error instanceof Error ? error.message : String(error))
+        if (canRotate && binding?.proxyId) {
+          routeExclusions.excludeIds.add(binding.proxyId)
+          try {
+            if (binding.proxyUrl) routeExclusions.excludeHosts.add(new URL(binding.proxyUrl).hostname)
+          } catch { /* malformed URL was already reported by route validation */ }
+          addLog(`[NetworkGuard] OIDC route failed; switching to another proxy (${routeAttempt + 2}/${maxRouteAttempts})...`)
+          continue
+        }
+        break
+      }
     }
+
+    addLog(`${t('register.logStartFailed')} ${lastRouteError instanceof Error ? lastRouteError.message : String(lastRouteError || 'No usable registration route')}`)
+    setResult(makeFailedRegResult(lastRouteError || 'No usable registration route'))
+    setPhase('idle')
   }
 
   // ============ 取消 ============
@@ -2141,7 +2209,7 @@ export function RegisterPage(): React.JSX.Element {
         logLines: [],
         error: readiness.total === 0
           ? 'Proxy pool is ON but empty; registration was stopped before using direct/server IP.'
-          : 'Proxy pool is ON but has no usable proxy; registration was stopped before using direct/server IP.'
+          : `Proxy pool has no registration-ready route (${proxyReadinessDetail(readiness)}); registration was stopped before using direct/server IP.`
       }
     }
 
@@ -2150,7 +2218,7 @@ export function RegisterPage(): React.JSX.Element {
       patch: {},
       logLines: [proxyFallbackLog('registration')]
     }
-  }, [networkSource, clientProxyUrl, clientProxyUpstream, getRegistrationProxy, getProxyPoolReadiness, isEn, proxyFallbackLog])
+  }, [networkSource, clientProxyUrl, clientProxyUpstream, getRegistrationProxy, getProxyPoolReadiness, isEn, proxyFallbackLog, proxyReadinessDetail])
 
   const requestBatchStopForTerminalError = useCallback((err: string | undefined, context: string): boolean => {
     const terminal = getTerminalBatchError(err)
@@ -2197,16 +2265,6 @@ export function RegisterPage(): React.JSX.Element {
   }, [addLog, batchContinueOnError])
 
   const requestBatchStopForSafetyCircuit = useCallback((reason: string, context: string): void => {
-    if (batchContinueOnError) {
-      addLog(`[BatchGuard] Safety circuit warning in ${context}; continuing batch because Continue on task error is enabled: ${reason}`)
-      void useWebhookStore.getState().triggerEvent('risk-warning', {
-        title: 'Registration safety circuit warning',
-        message: reason,
-        level: 'warn',
-        fields: { Context: context, Reason: reason }
-      })
-      return
-    }
     if (batchAbort.current) return
     batchAbort.current = true
     batchPause.current = false
@@ -2226,7 +2284,7 @@ export function RegisterPage(): React.JSX.Element {
       fields: { Context: context, Reason: reason }
     })
     void window.api.registrationCancel()
-  }, [addLog, batchContinueOnError])
+  }, [addLog])
 
   const requestBatchStopForProxyConfigError = useCallback((err: string): void => {
     if (!batchAbort.current) {
@@ -2414,7 +2472,9 @@ export function RegisterPage(): React.JSX.Element {
       if (now.getHours() === hh && now.getMinutes() === mm) {
         scheduleTriggered.current = todayKey
         addLog(`[Lịch] Đã đến giờ ${scheduleTime}, tự động bắt đầu đăng ký hàng loạt`)
-        void startBatch()
+        // Gọi qua ref để luôn chạy startBatch mới nhất; gọi trực tiếp sẽ dùng closure cũ
+        // (mode / batchCount / thông tin đăng nhập của lần effect chạy gần nhất).
+        void startBatchRef.current()
       }
     }
     const timer = setInterval(tick, 60_000)
@@ -2879,6 +2939,24 @@ export function RegisterPage(): React.JSX.Element {
     return best
   }, [mixedEnabledSources, mixedWeights, outlookData, tempMailDomain, tempMailEmail, tempMailEpin, tingamefiMailApiUrl, tingamefiMailAdminPassword, tingamefiMailDomain, protonBaseEmail])
 
+  /**
+   * Vị từ thuần: có ít nhất một sub-source dùng được hay không.
+   * Dùng cho render (nút disabled) — pickNextSource làm thay đổi mixedCredits nên gọi trong
+   * render sẽ tiêu mất một suất lập lịch ở mỗi dòng log / phím gõ / tick đồng hồ,
+   * làm hỏng tỷ lệ trọng số trước khi buildAutoConfig kịp chạy.
+   * Điều kiện phải khớp đúng phần lọc candidates của pickNextSource.
+   */
+  const hasUsableSource = useCallback((): boolean => {
+    return mixedEnabledSources.some((src) => {
+      // 子源必须填了对应的配置
+      if (src === 'outlook') return !!outlookData.trim()
+      if (src === 'tempmail') return !!(tempMailDomain.trim() && tempMailEmail.trim() && tempMailEpin.trim())
+      if (src === 'tingamefi') return !!(tingamefiMailApiUrl.trim() && tingamefiMailAdminPassword.trim() && tingamefiMailDomain.trim())
+      if (src === 'proton') return !!protonBaseEmail.trim()
+      return false
+    })
+  }, [mixedEnabledSources, outlookData, tempMailDomain, tempMailEmail, tempMailEpin, tingamefiMailApiUrl, tingamefiMailAdminPassword, tingamefiMailDomain, protonBaseEmail])
+
   // 构建自动模式配置
   const buildAutoConfig = useCallback((): Parameters<typeof window.api.registrationStartAuto>[0] => {
     const config: Record<string, unknown> = {}
@@ -3017,7 +3095,14 @@ export function RegisterPage(): React.JSX.Element {
         : importProxy
       currentRegistrationProxyBinding.current = attemptImportProxy || null
 
-      const res = await window.api.registrationStartAuto(enrichedConfig as typeof config)
+      // IPC bị reject (main process chết, kênh bị đóng...) phải trở thành một lần thất bại,
+      // không được để promise reject thoát ra ngoài startBatch và bỏ qua phần dọn dẹp.
+      let res: { success: boolean; result?: unknown; error?: string }
+      try {
+        res = await window.api.registrationStartAuto(enrichedConfig as typeof config)
+      } catch (err) {
+        res = { success: false, error: err instanceof Error ? err.message : String(err) }
+      }
 
       // 上报代理使用结果
       if (pickedProxy) {
@@ -3040,7 +3125,7 @@ export function RegisterPage(): React.JSX.Element {
           addLog(`[BatchGuard] ${terminalFailure}`)
           if (pickedProxy) markBatchProxyCooldown(pickedProxy, terminalFailure)
           const decision = registrationCircuit.current.record(
-            isHtmlProxyGatewayFailure(rawError) ? 'proxy_gateway_rejected' : 'service_rejected'
+            isProxyGatewayRouteFailure(rawError) ? 'proxy_gateway_rejected' : 'service_rejected'
           )
           if (decision.stop) {
             requestBatchStopForSafetyCircuit(
@@ -3065,7 +3150,7 @@ export function RegisterPage(): React.JSX.Element {
           addLog(`[BatchGuard] ${terminalFailure}`)
           if (pickedProxy) markBatchProxyCooldown(pickedProxy, terminalFailure)
           const decision = registrationCircuit.current.record(
-            isHtmlProxyGatewayFailure(rawError) ? 'proxy_gateway_rejected' : 'service_rejected'
+            isProxyGatewayRouteFailure(rawError) ? 'proxy_gateway_rejected' : 'service_rejected'
           )
           if (decision.stop) {
             requestBatchStopForSafetyCircuit(
@@ -3174,6 +3259,10 @@ export function RegisterPage(): React.JSX.Element {
   const startBatch = async (retryItems?: BatchItem[]): Promise<void> => {
     if (mode === 'manual') return
 
+    // Số lượng thực sự sẽ chạy trong lần này. setBatchCount là state React bất đồng bộ,
+    // closure bên dưới vẫn thấy batchCount cũ nên phải kẹp vào biến cục bộ này.
+    let effectiveCount = batchCount
+
     // 每日配额检查
     if (dailyQuotaLimit > 0) {
       const remainingQuota = Math.max(0, dailyQuotaLimit - dailyQuotaUsed)
@@ -3186,6 +3275,7 @@ export function RegisterPage(): React.JSX.Element {
       if (want > remainingQuota) {
         addLog(`[Hạn mức] Yêu cầu ${want} tài khoản nhưng hôm nay chỉ còn ${remainingQuota}, tự động giảm xuống ${remainingQuota}`)
         if (!retryItems) {
+          effectiveCount = Math.min(batchCount, remainingQuota)
           setBatchCount(remainingQuota)
         }
       }
@@ -3329,7 +3419,7 @@ export function RegisterPage(): React.JSX.Element {
       setBatchDone(0)
       setBatchSuccess(0)
       setBatchFail(0)
-      items = Array.from({ length: batchCount }, (_, i) => ({
+      items = Array.from({ length: effectiveCount }, (_, i) => ({
         id: randomUuid(),
         index: i + 1,
         status: 'pending' as BatchItemStatus,
@@ -3415,28 +3505,78 @@ export function RegisterPage(): React.JSX.Element {
     const executing = new Set<Promise<void>>()
     let launched = 0
 
-    for (let i = 0; i < items.length; i++) {
-      if (batchAbort.current) {
-        addLog(t('register.batchStopped').replace('{done}', String(launched)).replace('{total}', String(totalCount)))
-        break
-      }
+    // Bọc toàn bộ phần chạy trong try/finally: chỉ cần một reject thoát ra là phần dọn dẹp
+    // bị bỏ qua, _batchRunning kẹt ở true và mục trong Task Center kẹt ở "đang chạy" cho tới
+    // khi khởi động lại app.
+    try {
+      for (let i = 0; i < items.length; i++) {
+        if (batchAbort.current) {
+          addLog(t('register.batchStopped').replace('{done}', String(launched)).replace('{total}', String(totalCount)))
+          break
+        }
 
-      // 暂停：等待恢复
-      while (batchPause.current && !batchAbort.current) {
-        await new Promise((r) => setTimeout(r, 500))
-      }
-      if (batchAbort.current) break
+        // 暂停：等待恢复
+        while (batchPause.current && !batchAbort.current) {
+          await new Promise((r) => setTimeout(r, 500))
+        }
+        if (batchAbort.current) break
 
-      const itemId = items[i].id
-      const taskId = `batch-${itemId.slice(0, 8)}`
-      const rotateProxyPerTask = networkSource !== 'client-proxy' && liveProxyPoolConfig.enabled
-      let taskProxyRoute: BatchProxyRoute | null = null
-      if (rotateProxyPerTask) {
-        const taskProxy = useAccountsStore.getState().pickNextProxy(getBatchProxyExclusions())
-        if (!taskProxy) {
-          if (batchContinueOnError) {
-            const routeError = `No usable proxy route before task ${i + 1}/${totalCount}`
-            addLog(`[NetworkGuard] ${routeError}; marking task failed and continuing because Continue on task error is enabled.`)
+        const itemId = items[i].id
+        const taskId = `batch-${itemId.slice(0, 8)}`
+        const rotateProxyPerTask = networkSource !== 'client-proxy' && liveProxyPoolConfig.enabled
+        let taskProxyRoute: BatchProxyRoute | null = null
+        if (rotateProxyPerTask) {
+          const taskProxy = useAccountsStore.getState().pickNextProxy(getBatchProxyExclusions())
+          if (!taskProxy) {
+            if (batchContinueOnError) {
+              const routeError = `No usable proxy route before task ${i + 1}/${totalCount}`
+              addLog(`[NetworkGuard] ${routeError}; marking task failed and continuing because Continue on task error is enabled.`)
+              await handleBatchOutcome(itemId, {
+                success: false,
+                result: { status: 'failed', email: '', error: routeError } as RegResult
+              })
+              const doneForRun = clampRunCount(_batchDone, totalCount)
+              useTaskStore.getState().updateTask(taskCenterId, {
+                done: doneForRun,
+                successCount: _batchSuccess,
+                failedCount: _batchFail,
+                progress: totalCount > 0 ? Math.round((doneForRun / totalCount) * 100) : 0
+              })
+              if (i < items.length - 1 && !batchAbort.current && batchInterval > 0) {
+                await new Promise((r) => setTimeout(r, batchInterval * 1000))
+              }
+              continue
+            }
+            requestBatchStopForProxyConfigError(`No usable proxy route before task ${i + 1}/${totalCount}`)
+            break
+          }
+          taskProxyRoute = {
+            entry: taskProxy,
+            url: injectProxySession(taskProxy.url),
+            upstreamProxy: liveProxyPoolConfig.upstreamProxy?.trim() || ''
+          }
+          addLog(`[NetworkGuard] Tác vụ ${i + 1}/${totalCount}: chọn proxy ${taskProxy.protocol}://${taskProxy.host}:${taskProxy.port}`)
+        }
+
+        // 限速：等待令牌（含退避）
+        if (rateLimiterRef.current) {
+          await rateLimiterRef.current.waitForSlot({ get aborted() { return batchAbort.current } })
+          if (batchAbort.current) break
+        }
+
+        let taskRouteCheck: { success: boolean; latencyMs?: number; externalIp?: string; error?: string }
+        try {
+          taskRouteCheck = await validateBatchNetworkRoute(liveProxyPoolConfig.testTimeoutMs || 8000, taskProxyRoute)
+        } catch (error) {
+          taskRouteCheck = { success: false, error: error instanceof Error ? error.message : String(error) }
+        }
+        if (!taskRouteCheck.success || !taskRouteCheck.externalIp) {
+          const routeError = `Network route check failed before task ${i + 1}/${totalCount}: ${taskRouteCheck.error || 'missing exit IP'}`
+          const circuitDecision = registrationCircuit.current.record('network_route_failed')
+          if (batchContinueOnError && rotateProxyPerTask && taskProxyRoute) {
+            addLog(`[NetworkGuard] ${routeError}; marking task failed and continuing with the next proxy.`)
+            markBatchProxyCooldown(taskProxyRoute.entry, routeError)
+            useAccountsStore.getState().reportProxyResult(taskProxyRoute.entry.id, false, undefined, routeError)
             await handleBatchOutcome(itemId, {
               success: false,
               result: { status: 'failed', email: '', error: routeError } as RegResult
@@ -3451,42 +3591,42 @@ export function RegisterPage(): React.JSX.Element {
             if (i < items.length - 1 && !batchAbort.current && batchInterval > 0) {
               await new Promise((r) => setTimeout(r, batchInterval * 1000))
             }
+            if (circuitDecision.stop) {
+              requestBatchStopForSafetyCircuit(
+                circuitDecision.reason || routeError,
+                `proxy preflight ${i + 1}/${totalCount}`
+              )
+            }
             continue
           }
-          requestBatchStopForProxyConfigError(`No usable proxy route before task ${i + 1}/${totalCount}`)
+          requestBatchStopForProxyConfigError(
+            routeError
+          )
           break
         }
-        taskProxyRoute = {
-          entry: taskProxy,
-          url: injectProxySession(taskProxy.url),
-          upstreamProxy: liveProxyPoolConfig.upstreamProxy?.trim() || ''
+        registrationCircuit.current.record('network_route_ok')
+        if (!rotateProxyPerTask && _batchExpectedExitIp && taskRouteCheck.externalIp !== _batchExpectedExitIp) {
+          requestBatchStopForProxyConfigError(
+            `Network route changed before task ${i + 1}/${totalCount} (${_batchExpectedExitIp} -> ${taskRouteCheck.externalIp}); batch stopped`
+          )
+          break
         }
-        addLog(`[NetworkGuard] Tác vụ ${i + 1}/${totalCount}: chọn proxy ${taskProxy.protocol}://${taskProxy.host}:${taskProxy.port}`)
-      }
+        if (!rotateProxyPerTask) _batchExpectedExitIp = taskRouteCheck.externalIp
+        addLog(`[NetworkGuard] Tác vụ ${i + 1}/${totalCount}: route OK, exit IP ${taskRouteCheck.externalIp}, latency ${fmtLatencyMs(taskRouteCheck.latencyMs)}`)
 
-      // 限速：等待令牌（含退避）
-      if (rateLimiterRef.current) {
-        await rateLimiterRef.current.waitForSlot({ get aborted() { return batchAbort.current } })
-        if (batchAbort.current) break
-      }
+        taskIdToItemId.current.set(taskId, itemId)
+        addLog(`--- Batch ${i + 1}/${totalCount} ---`)
+        launched++
 
-      let taskRouteCheck: { success: boolean; latencyMs?: number; externalIp?: string; error?: string }
-      try {
-        taskRouteCheck = await validateBatchNetworkRoute(liveProxyPoolConfig.testTimeoutMs || 8000, taskProxyRoute)
-      } catch (error) {
-        taskRouteCheck = { success: false, error: error instanceof Error ? error.message : String(error) }
-      }
-      if (!taskRouteCheck.success || !taskRouteCheck.externalIp) {
-        const routeError = `Network route check failed before task ${i + 1}/${totalCount}: ${taskRouteCheck.error || 'missing exit IP'}`
-        const circuitDecision = registrationCircuit.current.record('network_route_failed')
-        if (batchContinueOnError && rotateProxyPerTask && taskProxyRoute) {
-          addLog(`[NetworkGuard] ${routeError}; marking task failed and continuing with the next proxy.`)
-          markBatchProxyCooldown(taskProxyRoute.entry, routeError)
-          useAccountsStore.getState().reportProxyResult(taskProxyRoute.entry.id, false, undefined, routeError)
-          await handleBatchOutcome(itemId, {
-            success: false,
-            result: { status: 'failed', email: '', error: routeError } as RegResult
-          })
+        const task = (async () => {
+          const outcome = await runSingleWithRetry(itemId, taskId, batchRetries, taskProxyRoute)
+          taskIdToItemId.current.delete(taskId)
+          await handleBatchOutcome(itemId, outcome)
+          // 上报限速器结果（用于动态退避 + 风控判定）
+          if (rateLimiterRef.current) {
+            rateLimiterRef.current.reportResult(outcome.success)
+          }
+          // 上报任务中心进度
           const doneForRun = clampRunCount(_batchDone, totalCount)
           useTaskStore.getState().updateTask(taskCenterId, {
             done: doneForRun,
@@ -3494,118 +3634,83 @@ export function RegisterPage(): React.JSX.Element {
             failedCount: _batchFail,
             progress: totalCount > 0 ? Math.round((doneForRun / totalCount) * 100) : 0
           })
-          if (i < items.length - 1 && !batchAbort.current && batchInterval > 0) {
-            await new Promise((r) => setTimeout(r, batchInterval * 1000))
-          }
-          if (circuitDecision.stop) {
-            requestBatchStopForSafetyCircuit(
-              circuitDecision.reason || routeError,
-              `proxy preflight ${i + 1}/${totalCount}`
-            )
-          }
-          continue
+        })()
+
+        // Nuốt reject trước khi đưa vào pool: Promise.race/allSettled bên dưới không được
+        // ném ra ngoài, nếu không phần dọn dẹp cuối batch sẽ bị bỏ qua và nút kẹt ở "Dừng".
+        const tracked = task.catch((err) => { console.error('[Batch] task failed:', err) }).finally(() => executing.delete(tracked))
+        executing.add(tracked)
+
+        // 控制并发数：池满时等待空位
+        if (executing.size >= concurrency) {
+          await Promise.race(executing)
         }
-        requestBatchStopForProxyConfigError(
-          routeError
-        )
-        break
-      }
-      registrationCircuit.current.record('network_route_ok')
-      if (!rotateProxyPerTask && _batchExpectedExitIp && taskRouteCheck.externalIp !== _batchExpectedExitIp) {
-        requestBatchStopForProxyConfigError(
-          `Network route changed before task ${i + 1}/${totalCount} (${_batchExpectedExitIp} -> ${taskRouteCheck.externalIp}); batch stopped`
-        )
-        break
-      }
-      if (!rotateProxyPerTask) _batchExpectedExitIp = taskRouteCheck.externalIp
-      addLog(`[NetworkGuard] Tác vụ ${i + 1}/${totalCount}: route OK, exit IP ${taskRouteCheck.externalIp}, latency ${fmtLatencyMs(taskRouteCheck.latencyMs)}`)
 
-      taskIdToItemId.current.set(taskId, itemId)
-      addLog(`--- Batch ${i + 1}/${totalCount} ---`)
-      launched++
-
-      const task = (async () => {
-        const outcome = await runSingleWithRetry(itemId, taskId, batchRetries, taskProxyRoute)
-        taskIdToItemId.current.delete(taskId)
-        await handleBatchOutcome(itemId, outcome)
-        // 上报限速器结果（用于动态退避 + 风控判定）
-        if (rateLimiterRef.current) {
-          rateLimiterRef.current.reportResult(outcome.success)
+        // 每次启动任务后等待间隔（0 则不等待）
+        if (i < items.length - 1 && !batchAbort.current && batchInterval > 0) {
+          await new Promise((r) => setTimeout(r, batchInterval * 1000))
         }
-        // 上报任务中心进度
-        const doneForRun = clampRunCount(_batchDone, totalCount)
-        useTaskStore.getState().updateTask(taskCenterId, {
-          done: doneForRun,
-          successCount: _batchSuccess,
-          failedCount: _batchFail,
-          progress: totalCount > 0 ? Math.round((doneForRun / totalCount) * 100) : 0
-        })
-      })()
-
-      const tracked = task.finally(() => executing.delete(tracked))
-      executing.add(tracked)
-
-      // 控制并发数：池满时等待空位
-      if (executing.size >= concurrency) {
-        await Promise.race(executing)
       }
 
-      // 每次启动任务后等待间隔（0 则不等待）
-      if (i < items.length - 1 && !batchAbort.current && batchInterval > 0) {
-        await new Promise((r) => setTimeout(r, batchInterval * 1000))
-      }
-    }
+      // 等待所有正在执行的任务完成
+      await Promise.allSettled(executing)
+    } finally {
+      const stoppedEarly = batchAbort.current
+      const doneForRun = clampRunCount(_batchDone, totalCount)
 
-    // 等待所有正在执行的任务完成
-    await Promise.all(executing)
-    const stoppedEarly = batchAbort.current
-    const doneForRun = clampRunCount(_batchDone, totalCount)
+      setBatchRunning(false)
+      setIsPaused(false)
+      setPhase('idle')
+      addLog(stoppedEarly
+        ? t('register.batchStopped').replace('{done}', String(doneForRun)).replace('{total}', String(totalCount))
+        : t('register.batchCompleted')
+      )
 
-    setBatchRunning(false)
-    setIsPaused(false)
-    setPhase('idle')
-    addLog(stoppedEarly
-      ? t('register.batchStopped').replace('{done}', String(doneForRun)).replace('{total}', String(totalCount))
-      : t('register.batchCompleted')
-    )
-
-    // 完成任务中心条目
-    const taskState = useTaskStore.getState().tasks.get(taskCenterId)
-    if (stoppedEarly) {
-      if (taskState?.status !== 'cancelled') {
+      // 完成任务中心条目
+      const taskState = useTaskStore.getState().tasks.get(taskCenterId)
+      if (stoppedEarly) {
+        if (taskState?.status !== 'cancelled') {
+          useTaskStore.getState().completeTask(taskCenterId, {
+            successCount: _batchSuccess,
+            failedCount: _batchFail,
+            error: 'Batch stopped before all tasks finished'
+          })
+        }
+      } else {
         useTaskStore.getState().completeTask(taskCenterId, {
           successCount: _batchSuccess,
-          failedCount: _batchFail,
-          error: 'Batch stopped before all tasks finished'
+          failedCount: _batchFail
         })
       }
-    } else {
-      useTaskStore.getState().completeTask(taskCenterId, {
-        successCount: _batchSuccess,
-        failedCount: _batchFail
-      })
-    }
-    currentTaskCenterId.current = null
+      currentTaskCenterId.current = null
 
-    // 触发 Webhook 通知
-    void useWebhookStore.getState().triggerEvent(stoppedEarly ? 'batch-error' : 'batch-completed', {
-      title: stoppedEarly ? `Đăng ký hàng loạt${retryItems ? ' thử lại' : ''} đã dừng` : `Đăng ký hàng loạt${retryItems ? ' thử lại' : ''} đã hoàn tất`,
-      message: stoppedEarly
-        ? `Tổng ${totalCount} tác vụ, đã hoàn thành ${doneForRun}, thành công ${_batchSuccess}, thất bại ${_batchFail}`
-        : `Tổng ${totalCount} tác vụ, thành công ${_batchSuccess}, thất bại ${_batchFail}`,
-      level: stoppedEarly ? 'error' : (_batchFail === 0 ? 'success' : (_batchSuccess === 0 ? 'error' : 'warn')),
-      fields: {
-        'Chế độ': mode === 'outlook' ? 'Outlook' : mode === 'tempmail' ? 'TempMail.Plus' : mode === 'tingamefi' ? 'Tingamefi' : mode === 'mixed' ? 'Hỗn hợp' : 'Thủ công',
-        'Đồng thời': concurrency,
-        'Thành công': _batchSuccess,
-        'Thất bại': _batchFail,
-        Tổng: totalCount
-      }
-    })
-    batchPinnedProxy.current = null
-    batchClientProxyRoute.current = null
-    _batchExpectedExitIp = null
+      // 触发 Webhook 通知
+      void useWebhookStore.getState().triggerEvent(stoppedEarly ? 'batch-error' : 'batch-completed', {
+        title: stoppedEarly ? `Đăng ký hàng loạt${retryItems ? ' thử lại' : ''} đã dừng` : `Đăng ký hàng loạt${retryItems ? ' thử lại' : ''} đã hoàn tất`,
+        message: stoppedEarly
+          ? `Tổng ${totalCount} tác vụ, đã hoàn thành ${doneForRun}, thành công ${_batchSuccess}, thất bại ${_batchFail}`
+          : `Tổng ${totalCount} tác vụ, thành công ${_batchSuccess}, thất bại ${_batchFail}`,
+        level: stoppedEarly ? 'error' : (_batchFail === 0 ? 'success' : (_batchSuccess === 0 ? 'error' : 'warn')),
+        fields: {
+          'Chế độ': mode === 'outlook' ? 'Outlook' : mode === 'tempmail' ? 'TempMail.Plus' : mode === 'tingamefi' ? 'Tingamefi' : mode === 'mixed' ? 'Hỗn hợp' : 'Thủ công',
+          'Đồng thời': concurrency,
+          'Thành công': _batchSuccess,
+          'Thất bại': _batchFail,
+          Tổng: totalCount
+        }
+      })
+      batchPinnedProxy.current = null
+      batchClientProxyRoute.current = null
+      _batchExpectedExitIp = null
+    }
   }
+
+  // Ref luôn trỏ tới startBatch của lần render mới nhất, phục vụ effect hẹn giờ ở trên
+  // (effect đó cố tình không khai báo startBatch trong deps vì tham chiếu đổi mỗi render).
+  const startBatchRef = useRef(startBatch)
+  useEffect(() => {
+    startBatchRef.current = startBatch
+  })
 
   /** 暂停 / 恢复批量注册 */
   const togglePauseBatch = (): void => {
@@ -4530,7 +4635,7 @@ export function RegisterPage(): React.JSX.Element {
                   (mode === 'outlook' && !outlookData.trim()) ||
                   (mode === 'tempmail' && (!tempMailDomain.trim() || !tempMailEmail.trim() || !tempMailEpin.trim())) ||
                   (mode === 'tingamefi' && (!tingamefiMailApiUrl.trim() || !tingamefiMailAdminPassword.trim() || !tingamefiMailDomain.trim())) ||
-                  (mode === 'mixed' && pickNextSource() == null)
+                  (mode === 'mixed' && !hasUsableSource())
                 }
               >
                 {batchRunning ? <><Square className="h-4 w-4 mr-2" />{t('register.batchStop')}</> : <><Play className="h-4 w-4 mr-2" />{t('register.batchStart')}</>}
@@ -5052,6 +5157,7 @@ interface RegisterAnalyticsProps {
 function RegisterAnalyticsReport({ history }: RegisterAnalyticsProps): React.ReactNode {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
+  const [expanded, setExpanded] = useState(false)
   const analytics = useMemo(() => {
     const total = history.length
     let success = 0, failed = 0
@@ -5155,9 +5261,12 @@ function RegisterAnalyticsReport({ history }: RegisterAnalyticsProps): React.Rea
             <Activity className="h-4 w-4 text-primary" />
           </div>
           <span>{isEn ? 'Registration Analytics' : 'Phân tích kết quả đăng ký'}</span>
-          <Badge variant="outline" className="text-[10px] ml-auto">
-            {isEn ? 'Samples' : 'Mẫu'} {analytics.total}
-          </Badge>
+          <div className="ml-auto hidden sm:flex items-center gap-1.5">
+            <Badge variant="outline" className="text-[10px]">{Math.round(analytics.successRate * 100)}%</Badge>
+            <Badge variant="outline" className="text-[10px] text-green-600">{analytics.success} {isEn ? 'success' : 'thành công'}</Badge>
+            <Badge variant="outline" className="text-[10px] text-red-600">{analytics.failed} {isEn ? 'failed' : 'thất bại'}</Badge>
+            <Badge variant="outline" className="text-[10px]">{analytics.total} {isEn ? 'samples' : 'mẫu'}</Badge>
+          </div>
           <Button
             size="sm"
             variant="ghost"
@@ -5167,9 +5276,27 @@ function RegisterAnalyticsReport({ history }: RegisterAnalyticsProps): React.Rea
             <Download className="h-3 w-3 mr-1" />
             CSV
           </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 text-[10px]"
+            onClick={() => setExpanded((value) => !value)}
+          >
+            {expanded ? (isEn ? 'Collapse' : 'Thu gọn') : (isEn ? 'Details' : 'Chi tiết')}
+            <ChevronDown className={cn('h-3 w-3 ml-1 transition-transform', expanded && 'rotate-180')} />
+          </Button>
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4 pt-4">
+        {!expanded && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <div><span className="text-[9px] uppercase tracking-wide text-muted-foreground">{isEn ? 'Success rate' : 'Tỷ lệ thành công'}</span><strong className="block text-lg tabular-nums" style={{ color: successColor }}>{Math.round(analytics.successRate * 100)}%</strong></div>
+            <div><span className="text-[9px] uppercase tracking-wide text-muted-foreground">{isEn ? 'Success' : 'Thành công'}</span><strong className="block text-lg tabular-nums text-green-600">{analytics.success}</strong></div>
+            <div><span className="text-[9px] uppercase tracking-wide text-muted-foreground">{isEn ? 'Failed' : 'Thất bại'}</span><strong className="block text-lg tabular-nums text-red-600">{analytics.failed}</strong></div>
+            <div><span className="text-[9px] uppercase tracking-wide text-muted-foreground">{isEn ? 'Samples' : 'Mẫu'}</span><strong className="block text-lg tabular-nums">{analytics.total}</strong></div>
+          </div>
+        )}
+        {expanded && <>
         {/* 顶部：圆环图 + 关键指标 */}
         <div className="grid grid-cols-1 md:grid-cols-[140px_1fr] gap-4 items-center">
           {/* 圆环图 */}
@@ -5328,6 +5455,7 @@ function RegisterAnalyticsReport({ history }: RegisterAnalyticsProps): React.Rea
             </div>
           </div>
         )}
+        </>}
       </CardContent>
     </Card>
   )
@@ -5651,7 +5779,7 @@ function EmailBlacklistManager(): React.ReactNode {
           )}
 
           <p className="text-[10px] text-muted-foreground italic">
-            Danh sách đen được tự động thêm khi đăng ký lỗi kiểu "email_used". Email trong danh sách này sẽ bị bỏ qua ở các lần đăng ký hàng loạt sau.
+            Danh sách đen được tự động thêm khi đăng ký lỗi kiểu &quot;email_used&quot;. Email trong danh sách này sẽ bị bỏ qua ở các lần đăng ký hàng loạt sau.
             Nếu Kiro đã giải phóng email cũ, anh có thể xóa thủ công tại đây để cho email đó tham gia đăng ký lại.
           </p>
         </CardContent>

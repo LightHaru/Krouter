@@ -1,30 +1,8 @@
 import { useEffect, useState } from 'react'
-import {
-  AlertCircle,
-  ArrowRight,
-  Bot,
-  CheckCircle,
-  Code,
-  Download,
-  ExternalLink,
-  Github,
-  KeyRound,
-  MonitorUp,
-  Network,
-  RefreshCw,
-  Route,
-  ServerCog,
-  Shield,
-  Sparkles,
-  TerminalSquare,
-  Zap,
-  type LucideIcon
-} from 'lucide-react'
-import { Card, CardContent, CardHeader, CardTitle, Button } from '../ui'
-import krouterLogo from '@/assets/krouter-logo.svg'
+import { AlertCircle, CheckCircle2, Cloud, Download, ExternalLink, Github, KeyRound, Loader2, RefreshCw, Route, Server, ShieldCheck, TerminalSquare, Users } from 'lucide-react'
+import { Badge, Button } from '../ui'
 import krouterMark from '@/assets/krouter-mark.svg'
 import { APP_GITHUB_URL, APP_NAME, APP_OWNER, APP_TAGLINE, APP_TAGLINE_VI } from '@/brand'
-import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
 
 interface UpdateInfo {
@@ -35,399 +13,71 @@ interface UpdateInfo {
   releaseName?: string
   releaseUrl?: string
   publishedAt?: string
-  assets?: Array<{
-    name: string
-    downloadUrl: string
-    size: number
-  }>
   error?: string
 }
 
-interface FeatureItem {
-  icon: LucideIcon
-  title: string
-  body: string
-}
-
-interface FlowItem {
-  icon: LucideIcon
-  label: string
-  detail: string
-}
-
-export function AboutPage() {
-  const [version, setVersion] = useState('...')
-  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
-  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
-  const [showUpdateModal, setShowUpdateModal] = useState(false)
+export function AboutPage(): React.ReactNode {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
+  const [version, setVersion] = useState('...')
+  const [checking, setChecking] = useState(false)
+  const [update, setUpdate] = useState<UpdateInfo | null>(null)
 
-  useEffect(() => {
-    window.api.getAppVersion().then(setVersion).catch(() => setVersion('unknown'))
-  }, [])
+  useEffect(() => { window.api.getAppVersion().then(setVersion).catch(() => setVersion('unknown')) }, [])
 
-  const checkForUpdates = async () => {
-    setIsCheckingUpdate(true)
-    try {
-      const result = await window.api.checkForUpdatesManual()
-      setUpdateInfo(result)
-      setShowUpdateModal(true)
-    } catch (error) {
-      setUpdateInfo({
-        hasUpdate: false,
-        error: error instanceof Error ? error.message : 'Check update failed'
-      })
-      setShowUpdateModal(true)
-    } finally {
-      setIsCheckingUpdate(false)
-    }
+  const checkUpdates = async (): Promise<void> => {
+    setChecking(true)
+    try { setUpdate(await window.api.checkForUpdatesManual()) }
+    catch (cause) { setUpdate({ hasUpdate: false, error: cause instanceof Error ? cause.message : 'Update check failed' }) }
+    finally { setChecking(false) }
   }
 
-  const openExternal = (url: string | undefined) => {
-    if (!url) return
-    window.api.openExternal(url)
-  }
-
-  const formatFileSize = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} B`
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-  }
-
-  const features: FeatureItem[] = [
-    {
-      icon: Route,
-      title: isEn ? 'Account router' : 'Router tài khoản',
-      body: isEn
-        ? 'Rotates requests across healthy Kiro accounts by model, quota, and runtime state.'
-        : 'Xoay request qua các tài khoản Kiro còn khỏe theo model, quota và trạng thái runtime.'
-    },
-    {
-      icon: KeyRound,
-      title: isEn ? 'Client API keys' : 'Key cho client',
-      body: isEn
-        ? 'Creates OpenAI-compatible keys for OpenClaw, Aira, Codex, and other dev tools.'
-        : 'Tạo key tương thích OpenAI cho OpenClaw, Aira, Codex và các công cụ dev.'
-    },
-    {
-      icon: ServerCog,
-      title: isEn ? 'Backend runtime' : 'Backend runtime',
-      body: isEn
-        ? 'Keeps the proxy service alive from the backend/CLI instead of relying on a browser tab.'
-        : 'Giữ API proxy chạy bằng backend/CLI thay vì phụ thuộc vào tab trình duyệt.'
-    },
-    {
-      icon: Network,
-      title: isEn ? 'Localhost or tunnel' : 'Localhost hoặc tunnel',
-      body: isEn
-        ? 'Runs local-first and exposes the dashboard publicly only when a tunnel is enabled.'
-        : 'Ưu tiên localhost và chỉ public dashboard khi bật tunnel.'
-    }
-  ]
-
-  const flows: FlowItem[] = [
-    {
-      icon: Bot,
-      label: isEn ? 'OpenClaw / Aira' : 'OpenClaw / Aira',
-      detail: isEn ? 'One client endpoint' : 'Một endpoint client'
-    },
-    {
-      icon: Zap,
-      label: APP_NAME,
-      detail: isEn ? 'Key, model, quota router' : 'Key, model, quota router'
-    },
-    {
-      icon: Shield,
-      label: isEn ? 'Kiro accounts' : 'Tài khoản Kiro',
-      detail: isEn ? 'Health, quota, profile ARN' : 'Health, quota, profile ARN'
-    }
-  ]
+  const open = (url?: string): void => { if (url) void window.api.openExternal(url) }
 
   return (
-    <div className="flex-1 overflow-auto p-4 space-y-4 md:p-6 md:space-y-6">
-      <div className="page-hero overflow-hidden p-5 md:p-8">
-        <div className="relative grid gap-6 lg:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)] lg:items-center">
-          <div className="min-w-0 space-y-5">
-            <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
-              <img src={krouterLogo} alt={APP_NAME} className="h-16 w-auto max-w-full shrink-0 md:h-20" />
-              <div className="min-w-0">
-                <h1 className="text-2xl font-bold text-primary md:text-3xl">{APP_NAME}</h1>
-                <p className="mt-1 max-w-2xl text-sm text-muted-foreground md:text-base">
-                  {isEn ? APP_TAGLINE : APP_TAGLINE_VI}
-                </p>
-                <p className="mt-2 text-xs text-muted-foreground">
-                  {isEn ? 'Version' : 'Phiên bản'} {version} · {APP_OWNER}
-                </p>
-              </div>
-            </div>
+    <div className="about-manifest flex-1 overflow-auto p-4 md:p-6">
+      <header className="about-head">
+        <div className="about-brand-block"><img src={krouterMark} alt={APP_NAME} /><div><span>AI ROUTING CONTROL PLANE</span><h1>{APP_NAME}</h1><p>{isEn ? APP_TAGLINE : APP_TAGLINE_VI}</p></div></div>
+        <div className="about-release"><img src={krouterMark} alt="" /><div><small>{isEn ? 'INSTALLED BUILD' : 'BAN DANG CAI'}</small><strong>v{version}</strong><span>{APP_OWNER}</span></div><Badge variant="success">STABLE</Badge></div>
+      </header>
 
-            <div className="grid gap-2 text-sm text-muted-foreground sm:grid-cols-3">
-              <div className="rounded-xl border border-primary/10 bg-white/45 p-3 dark:bg-white/5">
-                <p className="font-semibold text-foreground">{isEn ? 'Web dashboard' : 'Dashboard web'}</p>
-                <p className="mt-1 text-xs">{isEn ? 'Account control surface' : 'Nơi quản lý tài khoản'}</p>
-              </div>
-              <div className="rounded-xl border border-primary/10 bg-white/45 p-3 dark:bg-white/5">
-                <p className="font-semibold text-foreground">{isEn ? 'CLI runtime' : 'CLI runtime'}</p>
-                <p className="mt-1 text-xs">{isEn ? 'Setup and tunnel control' : 'Setup và tunnel'}</p>
-              </div>
-              <div className="rounded-xl border border-primary/10 bg-white/45 p-3 dark:bg-white/5">
-                <p className="font-semibold text-foreground">OpenClaw</p>
-                <p className="mt-1 text-xs">provider: krouter</p>
-              </div>
-            </div>
+      <section className="about-actions"><div><ShieldCheck /><span>{isEn ? 'Local-first runtime' : 'Runtime local-first'}</span></div><div><Route /><span>{isEn ? 'One endpoint, three sources' : 'Mot endpoint, ba nguon'}</span></div><div><KeyRound /><span>{isEn ? 'Client key isolation' : 'Tach biet client key'}</span></div><Button variant="outline" onClick={() => void checkUpdates()} disabled={checking}>{checking ? <Loader2 className="animate-spin" /> : <RefreshCw />}{isEn ? 'Check updates' : 'Kiem tra update'}</Button><Button onClick={() => open(APP_GITHUB_URL)}><Github />GitHub<ExternalLink /></Button></section>
 
-            <div className="flex flex-wrap gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-2"
-                onClick={checkForUpdates}
-                disabled={isCheckingUpdate}
-              >
-                <RefreshCw className={cn('h-4 w-4', isCheckingUpdate && 'animate-spin')} />
-                {isCheckingUpdate ? (isEn ? 'Checking...' : 'Đang kiểm tra...') : (isEn ? 'Check updates' : 'Kiểm tra cập nhật')}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-2"
-                onClick={() => openExternal(APP_GITHUB_URL)}
-              >
-                <Github className="h-4 w-4" />
-                GitHub
-                <ExternalLink className="h-3 w-3" />
-              </Button>
-            </div>
+      <div className="about-grid">
+        <section className="about-routing-map">
+          <div className="about-section-title"><span>SYSTEM ARCHITECTURE</span><h2>{isEn ? 'How a request moves' : 'Duong di cua request'}</h2></div>
+          <div className="about-route-line">
+            <RouteNode icon={TerminalSquare} label={isEn ? 'AI clients' : 'AI client'} detail="OpenAI / Anthropic" />
+            <i />
+            <RouteNode icon={Server} label="Krouter API" detail="localhost:5580" active />
+            <i />
+            <div className="about-provider-stack"><RouteNode icon={Users} label="Kiro" detail={isEn ? 'account pool' : 'pool tai khoan'} /><RouteNode icon={Cloud} label="Bedrock" detail="AWS identity" /><RouteNode icon={KeyRound} label="Custom API" detail="provider prefix" /></div>
           </div>
+          <div className="about-contract"><div><small>BASE URL</small><code>http://localhost:5580/v1</code></div><div><small>AUTH</small><code>Authorization: Bearer sk-...</code></div><div><small>HEALTH</small><code>GET /health</code></div></div>
+        </section>
 
-          <div className="relative min-h-[260px] rounded-2xl border border-primary/10 bg-white/55 p-5 shadow-inner dark:bg-white/5">
-            <div className="absolute right-5 top-5 rounded-full bg-primary/10 p-3">
-              <img src={krouterMark} alt={APP_NAME} className="h-12 w-12" />
-            </div>
-            <div className="flex h-full flex-col justify-end gap-4 pt-20">
-              {flows.map((flow, index) => {
-                const Icon = flow.icon
-                return (
-                  <div key={flow.label} className="flex items-center gap-3">
-                    <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-sm">
-                      <Icon className="h-5 w-5" />
-                    </div>
-                    <div className="min-w-0 flex-1 rounded-xl border border-primary/10 bg-background/70 px-3 py-2">
-                      <p className="truncate text-sm font-semibold">{flow.label}</p>
-                      <p className="truncate text-xs text-muted-foreground">{flow.detail}</p>
-                    </div>
-                    {index < flows.length - 1 && <ArrowRight className="hidden h-4 w-4 text-primary md:block" />}
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        </div>
+        <aside className="about-runtime-card">
+          <div className="about-section-title"><span>OPERATOR NOTES</span><h2>{isEn ? 'Runtime contract' : 'Hop dong runtime'}</h2></div>
+          <p>{isEn ? 'The dashboard is the control surface. The backend owns proxy lifecycle, token refresh, account rotation, tunnel state and durable configuration.' : 'Dashboard la be mat dieu khien. Backend quan ly proxy, refresh token, xoay tai khoan, tunnel va cau hinh ben vung.'}</p>
+          <div className="about-command-list">{['krouter setup', 'krouter status', 'krouter tunnel start', 'krouter openclaw import'].map((command) => <code key={command}><span>$</span>{command}</code>)}</div>
+        </aside>
       </div>
 
-      {showUpdateModal && updateInfo && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/50" onClick={() => setShowUpdateModal(false)} />
-          <div className="relative z-10 max-h-[80vh] w-full max-w-md overflow-y-auto rounded-xl bg-card p-6 shadow-xl">
-            {updateInfo.hasUpdate ? (
-              <div className="space-y-4">
-                <div className="flex items-center gap-3">
-                  <div className="rounded-full bg-success/10 p-2">
-                    <Download className="h-6 w-6 text-success" />
-                  </div>
-                  <div>
-                    <h3 className="text-lg font-semibold">{isEn ? 'New version available' : 'Có bản mới'}</h3>
-                    <p className="text-sm text-muted-foreground">
-                      {updateInfo.currentVersion} -&gt; {updateInfo.latestVersion}
-                    </p>
-                  </div>
-                </div>
+      <section className="about-principles">
+        <ManifestItem number="01" title={isEn ? 'Observable by default' : 'Quan sat mac dinh'} body={isEn ? 'Health, quota, latency and route errors remain visible at the operating surface.' : 'Health, quota, latency va route error luon hien tren man hinh van hanh.'} />
+        <ManifestItem number="02" title={isEn ? 'Provider neutral' : 'Khong le thuoc provider'} body={isEn ? 'Kiro, Bedrock and compatible APIs participate in one model catalog.' : 'Kiro, Bedrock va compatible API cung tham gia mot model catalog.'} />
+        <ManifestItem number="03" title={isEn ? 'Local before public' : 'Local truoc public'} body={isEn ? 'The service stays on loopback unless an operator explicitly enables LAN or tunnel access.' : 'Service giu tren loopback den khi operator chu dong bat LAN hoac tunnel.'} />
+      </section>
 
-                {updateInfo.releaseName && (
-                  <div className="rounded-lg bg-muted/50 p-3">
-                    <p className="text-sm font-medium">{updateInfo.releaseName}</p>
-                    {updateInfo.publishedAt && (
-                      <p className="text-xs text-muted-foreground">
-                        {new Date(updateInfo.publishedAt).toLocaleDateString(isEn ? 'en-US' : 'vi-VN')}
-                      </p>
-                    )}
-                  </div>
-                )}
-
-                {updateInfo.releaseNotes && (
-                  <div className="max-h-32 overflow-y-auto whitespace-pre-wrap rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground">
-                    {updateInfo.releaseNotes}
-                  </div>
-                )}
-
-                {updateInfo.assets && updateInfo.assets.length > 0 && (
-                  <div className="space-y-1">
-                    {updateInfo.assets.slice(0, 6).map((asset) => (
-                      <div key={asset.downloadUrl} className="flex items-center justify-between rounded bg-muted/30 px-2 py-1 text-xs">
-                        <span className="truncate">{asset.name}</span>
-                        <span className="ml-2 text-muted-foreground">{formatFileSize(asset.size)}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                <Button className="w-full gap-2" onClick={() => openExternal(updateInfo.releaseUrl)}>
-                  <ExternalLink className="h-4 w-4" />
-                  {isEn ? 'Open release page' : 'Mở trang phát hành'}
-                </Button>
-              </div>
-            ) : updateInfo.error ? (
-              <div className="space-y-4">
-                <div className="flex items-center gap-3">
-                  <div className="rounded-full bg-red-500/10 p-2">
-                    <AlertCircle className="h-6 w-6 text-red-500" />
-                  </div>
-                  <div>
-                    <h3 className="text-lg font-semibold">{isEn ? 'Check failed' : 'Kiểm tra lỗi'}</h3>
-                    <p className="text-sm text-muted-foreground">{updateInfo.error}</p>
-                  </div>
-                </div>
-                <Button variant="outline" className="w-full" onClick={checkForUpdates}>
-                  {isEn ? 'Retry' : 'Thử lại'}
-                </Button>
-              </div>
-            ) : (
-              <div className="space-y-4">
-                <div className="flex items-center gap-3">
-                  <div className="rounded-full bg-success/10 p-2">
-                    <CheckCircle className="h-6 w-6 text-success" />
-                  </div>
-                  <div>
-                    <h3 className="text-lg font-semibold">{isEn ? 'Up to date' : 'Đang là bản mới nhất'}</h3>
-                    <p className="text-sm text-muted-foreground">
-                      {isEn ? `Version ${updateInfo.currentVersion}` : `Phiên bản ${updateInfo.currentVersion}`}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-        {features.map((feature) => {
-          const Icon = feature.icon
-          return (
-            <Card key={feature.title} className="hover-lift">
-              <CardContent className="p-4">
-                <div className="flex items-start gap-3">
-                  <div className="rounded-lg bg-primary/10 p-2">
-                    <Icon className="h-5 w-5 text-primary" />
-                  </div>
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold">{feature.title}</p>
-                    <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{feature.body}</p>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          )
-        })}
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[1.05fr_0.95fr]">
-        <Card className="hover-lift">
-          <CardHeader className="pb-2">
-            <CardTitle className="flex items-center gap-3 text-base">
-              <div className="rounded-lg bg-primary/10 p-2">
-                <Sparkles className="h-4 w-4 text-primary" />
-              </div>
-              {isEn ? 'What Krouter is for' : 'Krouter dùng để làm gì'}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3 text-sm leading-relaxed text-muted-foreground">
-            <p>
-              {isEn
-                ? 'Krouter is the control plane for a Kiro-based AI coding setup: it keeps account state visible, exposes one compatible API endpoint, and routes each request to a usable account.'
-                : 'Krouter là control plane cho workflow AI coding dùng Kiro: hiển thị trạng thái tài khoản, mở một API endpoint tương thích và điều hướng mỗi request đến tài khoản đang dùng được.'}
-            </p>
-            <p>
-              {isEn
-                ? 'The web dashboard handles operations. The backend service and CLI keep proxy, tunnel, API keys, and client imports running outside the browser.'
-                : 'Dashboard web xử lý thao tác quản lý. Backend service và CLI giữ API proxy, tunnel, API key và import client chạy độc lập với trình duyệt.'}
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card className="hover-lift">
-          <CardHeader className="pb-2">
-            <CardTitle className="flex items-center gap-3 text-base">
-              <div className="rounded-lg bg-primary/10 p-2">
-                <TerminalSquare className="h-4 w-4 text-primary" />
-              </div>
-              {isEn ? 'Runtime commands' : 'Lệnh runtime'}
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="grid gap-2 text-xs">
-              {['krouter setup', 'krouter status', 'krouter tunnel start', 'krouter openclaw import'].map((command) => (
-                <div key={command} className="flex items-center gap-2 rounded-lg bg-muted/40 px-3 py-2 font-mono">
-                  <Code className="h-3.5 w-3.5 text-primary" />
-                  <span>{command}</span>
-                </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card className="hover-lift">
-        <CardHeader className="pb-2">
-          <CardTitle className="flex items-center gap-3 text-base">
-            <div className="rounded-lg bg-primary/10 p-2">
-              <MonitorUp className="h-4 w-4 text-primary" />
-            </div>
-            {isEn ? 'Client integration' : 'Ket noi client'}
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="grid gap-3 text-sm md:grid-cols-3">
-            <div className="rounded-xl bg-muted/30 p-3">
-              <p className="font-semibold">Endpoint</p>
-              <p className="mt-1 break-all font-mono text-xs text-muted-foreground">http://localhost:5580/v1</p>
-            </div>
-            <div className="rounded-xl bg-muted/30 p-3">
-              <p className="font-semibold">API key</p>
-              <p className="mt-1 font-mono text-xs text-muted-foreground">sk-...</p>
-            </div>
-            <div className="rounded-xl bg-muted/30 p-3">
-              <p className="font-semibold">OpenClaw</p>
-              <p className="mt-1 font-mono text-xs text-muted-foreground">provider: krouter</p>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card className="hover-lift">
-        <CardHeader className="pb-2">
-          <CardTitle className="flex items-center gap-3 text-base">
-            <div className="rounded-lg bg-primary/10 p-2">
-              <Github className="h-4 w-4 text-primary" />
-            </div>
-            {isEn ? 'Project' : 'Du an'}
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="min-w-0">
-              <p className="font-medium">{APP_OWNER}</p>
-              <p className="break-all text-sm text-muted-foreground">{APP_GITHUB_URL}</p>
-            </div>
-            <Button variant="outline" size="sm" className="gap-2" onClick={() => openExternal(APP_GITHUB_URL)}>
-              <Github className="h-4 w-4" />
-              GitHub
-              <ExternalLink className="h-3 w-3" />
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
+      {update && <div className="about-update-overlay" onClick={() => setUpdate(null)}><div className="about-update-dialog" onClick={(event) => event.stopPropagation()}>{update.error ? <><AlertCircle className="error" /><h2>{isEn ? 'Update check failed' : 'Kiem tra update that bai'}</h2><p>{update.error}</p><Button variant="outline" onClick={() => void checkUpdates()}>Retry</Button></> : update.hasUpdate ? <><Download /><h2>{update.releaseName || (isEn ? 'New version available' : 'Co phien ban moi')}</h2><p>{update.currentVersion} -&gt; {update.latestVersion}</p>{update.releaseNotes && <pre>{update.releaseNotes}</pre>}<Button onClick={() => open(update.releaseUrl)}><ExternalLink />{isEn ? 'Open release' : 'Mo release'}</Button></> : <><CheckCircle2 className="ok" /><h2>{isEn ? 'Krouter is up to date' : 'Krouter da la ban moi nhat'}</h2><p>v{update.currentVersion || version}</p><Button variant="outline" onClick={() => setUpdate(null)}>Close</Button></>}</div></div>}
     </div>
   )
+}
+
+function RouteNode({ icon: Icon, label, detail, active = false }: { icon: React.ElementType; label: string; detail: string; active?: boolean }): React.ReactNode {
+  return <div className={active ? 'about-route-node active' : 'about-route-node'}><Icon /><div><strong>{label}</strong><span>{detail}</span></div></div>
+}
+
+function ManifestItem({ number, title, body }: { number: string; title: string; body: string }): React.ReactNode {
+  return <article><span>{number}</span><h2>{title}</h2><p>{body}</p></article>
 }

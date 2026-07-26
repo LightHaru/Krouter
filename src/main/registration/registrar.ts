@@ -1,26 +1,58 @@
 import { SessionClient, type ModuleClient } from 'tlsclientwrapper'
+import * as os from 'os'
+import * as path from 'path'
+import * as fs from 'fs'
 import { acquireModuleClient } from './tlsClientPool'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
 import { RegistrationConfig } from './config'
 import { BrowserIdentity, randomIdentity } from './browser-identity'
 import { ChainProxyRelay } from './chainProxy'
-import { FingerprintContext, newFPContext, resetPerfTiming, generateFingerprint } from './fingerprint'
+import {
+  FingerprintContext,
+  newFPContext,
+  resetPerfTiming,
+  generateFingerprint
+} from './fingerprint'
 import { encryptPassword } from './jwe'
 import { refreshAppJSConfig } from './xxtea'
 import {
-  visitorId, awsccc, ubidGen, newUUID, gmtDate,
-  extractParam, splitAfter, saveCookies,
-  getNestedMap, getNestedStringMap
+  visitorId,
+  awsccc,
+  ubidGen,
+  newUUID,
+  gmtDate,
+  extractParam,
+  splitAfter,
+  saveCookies,
+  getNestedMap,
+  getNestedStringMap
 } from './http-utils'
 import {
-  TempEmailService, MoEmailService, TempMailPlusService, TingamefiMailService, ProtonWebviewService,
-  parseOutlookLines, getInboxCount, waitForOTP
+  TempEmailService,
+  MoEmailService,
+  TempMailPlusService,
+  TingamefiMailService,
+  ProtonWebviewService,
+  parseOutlookLines,
+  getInboxCount,
+  waitForOTP,
+  type EmailProxyOptions
 } from './email-service'
 import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
 import { redactString } from '../utils/redact'
 import { getRuntimeUserDataPath } from '../runtimePaths'
 
 export type LogFn = (message: string) => void
+
+/** Tuỳ chọn khởi tạo SessionClient của tlsclientwrapper mà Registrar dựng ra. */
+interface TlsSessionOpts {
+  tlsClientIdentifier: 'chrome_146'
+  timeoutSeconds: number
+  followRedirects: boolean
+  insecureSkipVerify: boolean
+  sessionId: string
+  proxyUrl?: string
+}
 
 export interface FingerprintSnapshot {
   chromeVer: string
@@ -55,12 +87,26 @@ type StepFn = () => Promise<void>
 
 /** 注册流程的可观察「阶段」标识，供前端按 taskId 实时显示进度 */
 export type RegStepName =
-  | 'init' | 'proxy-chain-ready' | 'tls-ready' | 'exit-ip'
-  | 'oidc' | 'device' | 'email-created'
-  | 'portal' | 'workflow-init' | 'submit-email'
-  | 'signup' | 'send-otp' | 'waiting-otp' | 'otp-received'
-  | 'create-identity' | 'set-password' | 'sso-workflow' | 'sso-token'
-  | 'verify-alive' | 'done'
+  | 'init'
+  | 'proxy-chain-ready'
+  | 'tls-ready'
+  | 'exit-ip'
+  | 'oidc'
+  | 'device'
+  | 'email-created'
+  | 'portal'
+  | 'workflow-init'
+  | 'submit-email'
+  | 'signup'
+  | 'send-otp'
+  | 'waiting-otp'
+  | 'otp-received'
+  | 'create-identity'
+  | 'set-password'
+  | 'sso-workflow'
+  | 'sso-token'
+  | 'verify-alive'
+  | 'done'
   | 'risk-control'
 
 export interface RegStepEvent {
@@ -104,6 +150,12 @@ export class Registrar {
   private log: LogFn
   private onStep: StepFn2
   private abortController = new AbortController()
+  /**
+   * Tăng mỗi khi một bước bị withTimeout bỏ rơi hoặc retryStep chuyển sang lượt mới.
+   * Code đang bay của lượt cũ so generation đã chốt lúc bắt đầu với giá trị hiện tại để
+   * biết mình đã lạc hậu và dừng lại trước khi mutate state dùng chung.
+   */
+  private stepGeneration = 0
   private chainRelay: ChainProxyRelay | null = null
   private chainTargetProxy = ''
   private exitIP = ''
@@ -128,8 +180,16 @@ export class Registrar {
   /** 触发 step 事件：上层（前端 UI）可据此实时展示注册到了哪一步。失败时静默以不影响主流程。 */
   private emitStep(name: RegStepName, info?: Partial<RegStepEvent>): void {
     try {
-      this.onStep({ name, ts: Date.now(), email: this.email || undefined, exitIp: this.exitIP || undefined, ...info })
-    } catch { /* ignore */ }
+      this.onStep({
+        name,
+        ts: Date.now(),
+        email: this.email || undefined,
+        exitIp: this.exitIP || undefined,
+        ...info
+      })
+    } catch {
+      /* ignore */
+    }
   }
 
   /** 基于当前 identity 的 sec-ch-ua 头（动态生成，跟 chromeVer 对齐） */
@@ -157,7 +217,9 @@ export class Registrar {
       const relayUrl = await this.chainRelay.start()
       this.chainTargetProxy = target
       this.cfg.proxy = relayUrl
-      this.log('[ProxyChain] Đã bật chuỗi proxy: máy cục bộ → proxy trung chuyển → proxy đích → trang đích')
+      this.log(
+        '[ProxyChain] Đã bật chuỗi proxy: máy cục bộ → proxy trung chuyển → proxy đích → trang đích'
+      )
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       this.chainRelay = null
@@ -190,19 +252,23 @@ export class Registrar {
           headers: { 'User-Agent': this.identity.ua }
         } as UndiciRequestInit)
         if (resp.ok) {
-          const body = await resp.json() as Record<string, unknown>
+          const body = (await resp.json()) as Record<string, unknown>
           const ip = String(body.ip || body.query || body.origin || '').trim()
           if (ip) {
             this.exitIP = ip
             this.emitStep('exit-ip', { exitIp: ip })
           }
           const via = proxyUrl ? proxyUrl.replace(/:([^:@/]+)@/, ':***@') : undefined
-          this.log(`[✓ IP] IP đầu ra: ${ip || 'không xác định'}${via ? ` (qua ${via})` : ' (kết nối trực tiếp)'}`)
+          this.log(
+            `[✓ IP] IP đầu ra: ${ip || 'không xác định'}${via ? ` (qua ${via})` : ' (kết nối trực tiếp)'}`
+          )
           return // 成功，退出
         }
         this.log(`[IP] Kiểm tra IP đầu ra thất bại: HTTP ${resp.status}`)
       } catch (err) {
-        this.log(`[IP] Kiểm tra IP đầu ra thất bại: ${err instanceof Error ? err.message : String(err)}`)
+        this.log(
+          `[IP] Kiểm tra IP đầu ra thất bại: ${err instanceof Error ? err.message : String(err)}`
+        )
       }
 
       // 失败后尝试换 session 重建代理链
@@ -212,7 +278,9 @@ export class Registrar {
       }
     }
     if (this.cfg.strictProxy) {
-      throw new Error('[NetworkGuard] Không thể xác minh IP đầu ra của route đã khóa; đã dừng đăng ký')
+      throw new Error(
+        '[NetworkGuard] Không thể xác minh IP đầu ra của route đã khóa; đã dừng đăng ký'
+      )
     }
     this.log('[IP] Tất cả lần kiểm tra IP đầu ra đều thất bại, tiếp tục bằng kết nối hệ thống')
   }
@@ -240,8 +308,12 @@ export class Registrar {
     if (!original) return
 
     // 替换或追加 _session-随机值
-    const session = Array.from({ length: 8 }, () =>
-      'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random() * 62)]
+    const session = Array.from(
+      { length: 8 },
+      () =>
+        'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[
+          Math.floor(Math.random() * 62)
+        ]
     ).join('')
 
     let newTarget: string
@@ -249,8 +321,18 @@ export class Registrar {
       // 已有 _session-xxx → 替换
       newTarget = original.replace(/(_session-)[^_:@/]*/i, `$1${session}`)
     } else {
-      // 没有 _session- → 在 : 或 @ 之前插入
+      // 没有 _session- → 在 : 或 @ 之前插入（仅当 URL 真的有 userinfo）
       const atIdx = original.indexOf('@')
+      if (atIdx < 0) {
+        // Không có userinfo thì không có chỗ nào để nhét session token. Trước đây
+        // insertPos = -1 nên token bị chèn TRƯỚC ký tự cuối cùng:
+        //   http://gate.rotating.example.com:9000 -> ...:900_session-XXXXXXXX0
+        // Vì canRefreshProxySession chỉ cần khớp /rotating|rotate/i nên nhánh này chạy
+        // thường xuyên với URL không có '@', và chainTargetProxy bị xoá ngay sau đó nên
+        // URL gốc không khôi phục lại được.
+        this.log('[IP] Proxy không có userinfo nên không nhúng được session token, giữ nguyên URL')
+        return
+      }
       const colonIdx = original.indexOf(':', original.indexOf('://') + 3)
       const insertPos = colonIdx > 0 && colonIdx < atIdx ? colonIdx : atIdx
       newTarget = original.slice(0, insertPos) + `_session-${session}` + original.slice(insertPos)
@@ -271,32 +353,59 @@ export class Registrar {
   }
 
   /** TLS SessionClient 选项 */
-  private get sessionOpts() {
+  private get sessionOpts(): TlsSessionOpts {
     const explicit = (this.cfg.proxy && this.cfg.proxy.trim()) || undefined
     // 严格模式：必须有显式代理，禁止回退到环境变量/系统代理，避免网络路径静默改变。
     if (this.cfg.strictProxy) {
       if (!explicit) {
-        throw new Error('Chế độ proxy nghiêm ngặt: cfg.proxy đang trống, đã dừng để tránh tự động đổi cấu hình mạng')
+        throw new Error(
+          'Chế độ proxy nghiêm ngặt: cfg.proxy đang trống, đã dừng để tránh tự động đổi cấu hình mạng'
+        )
       }
     }
     const proxyUrl = this.cfg.strictProxy
       ? explicit
-      : (explicit
-        || process.env.HTTPS_PROXY || process.env.https_proxy
-        || process.env.HTTP_PROXY || process.env.http_proxy
-        || getSystemProxy() || undefined)
+      : explicit ||
+        process.env.HTTPS_PROXY ||
+        process.env.https_proxy ||
+        process.env.HTTP_PROXY ||
+        process.env.http_proxy ||
+        getSystemProxy() ||
+        undefined
     return {
       tlsClientIdentifier: 'chrome_146' as const,
       // 25s：AWS 注册 API 正常响应 1-5s，慢住宅代理 10-15s；超过基本是挂起。
       // 配合 sendRequest 的 3 次重试，单步最坏 ~75s（旧值 60s 会到 ~180s，是批量卡 1-5 分钟主因）
       timeoutSeconds: 25,
       followRedirects: true,
-      insecureSkipVerify: true,
+      // TUYỆT ĐỐI không tắt xác thực chứng chỉ TLS: toàn bộ lưu lượng đăng ký đi qua proxy dân cư
+      // của bên thứ ba, nên chủ proxy có thể kết thúc TLS bằng chứng chỉ tự ký và đọc được request
+      // mật khẩu bọc JWE, mã OTP, loginCsrfToken, authCode SSO và cuối cùng là
+      // refreshToken/accessToken của tài khoản mới.
+      // Nếu một proxy thật sự cần root CA riêng thì phải GHIM (pin) đúng CA đó một cách tường minh,
+      // không bao giờ được tắt xác thực trên toàn cục.
+      insecureSkipVerify: false,
       // 多线程隔离：固定 sessionId 隔离 DLL 层面共享的 TLS session cache
       // 整个 Registrar 生命周期内用同一个 ID，避免 rebuildTlsClient 产生僵尸 session
       sessionId: this.tlsSessionId,
       proxyUrl
     }
+  }
+
+  /**
+   * Proxy hiệu lực cho tầng email (nhà cung cấp mail, làm mới token OAuth Outlook).
+   * Dùng đúng giá trị mà TLS session đang dùng — kể cả địa chỉ ChainProxyRelay cục bộ — để nhà
+   * cung cấp mail không nhìn thấy IP thật trong khi AWS chỉ thấy IP proxy. Trước đây tầng email chỉ
+   * đọc biến môi trường / proxy hệ thống nên mọi hộp thư đều bị lộ IP nhà của người dùng.
+   */
+  private emailProxyOptions(): EmailProxyOptions {
+    const proxyUrl = this.sessionOpts.proxyUrl
+    if (this.cfg.strictProxy && !proxyUrl) {
+      throw new Error(
+        'Chế độ proxy nghiêm ngặt: không xác định được proxy cho dịch vụ email, đã dừng đăng ký'
+      )
+    }
+    return { proxyUrl, strictProxy: this.cfg.strictProxy }
   }
 
   /**
@@ -315,7 +424,10 @@ export class Registrar {
       : { customLibraryDownloadPath: downloadDir }
     // 共享池：首次注册才真正 open(DLL+worker pool)，之后所有注册秒级复用
     this.moduleClient = await acquireModuleClient(opts)
-    this.log('[TLS] using shared ModuleClient, pool stats: ' + JSON.stringify(this.moduleClient.getPoolStats()))
+    this.log(
+      '[TLS] using shared ModuleClient, pool stats: ' +
+        JSON.stringify(this.moduleClient.getPoolStats())
+    )
     this.session = new SessionClient(this.moduleClient, this.sessionOpts)
   }
 
@@ -327,10 +439,6 @@ export class Registrar {
    * 优先放到 userData，避免被系统临时目录清理工具误删（之前用 tmpdir 会被清理）
    */
   private ensureTlsLib(): { existingPath?: string; downloadDir: string } {
-    const os = require('os')
-    const path = require('path')
-    const fs = require('fs')
-
     const platform = os.platform()
     const arch = os.arch()
     let filename = 'tls-client-xgo-1.14.0-'
@@ -348,7 +456,11 @@ export class Registrar {
     const finalPath = path.join(tlsClientDir, filename)
 
     // 确保目录存在
-    try { fs.mkdirSync(tlsClientDir, { recursive: true }) } catch { /* ignore */ }
+    try {
+      fs.mkdirSync(tlsClientDir, { recursive: true })
+    } catch {
+      /* ignore */
+    }
 
     // 已存在 → 直接复用
     if (fs.existsSync(finalPath)) {
@@ -363,7 +475,12 @@ export class Registrar {
     ]
     const resourcePath = resourceCandidates.find((candidate) => fs.existsSync(candidate))
     if (resourcePath) {
-      this.log('[TLS] Copying library from resources to userData (one-time): ' + resourcePath + ' -> ' + finalPath)
+      this.log(
+        '[TLS] Copying library from resources to userData (one-time): ' +
+          resourcePath +
+          ' -> ' +
+          finalPath
+      )
       try {
         fs.copyFileSync(resourcePath, finalPath)
         return { existingPath: finalPath, downloadDir: tlsClientDir }
@@ -386,14 +503,20 @@ export class Registrar {
     }
 
     // 4. 都没有 → 返回 downloadDir，让 tlsclientwrapper open() 自动下载到此目录（永久保存）
-    this.log('[TLS] Library not found, will download from GitHub to userData (one-time): ' + tlsClientDir)
+    this.log(
+      '[TLS] Library not found, will download from GitHub to userData (one-time): ' + tlsClientDir
+    )
     return { downloadDir: tlsClientDir }
   }
 
   private async rebuildTlsClient(): Promise<void> {
     // 只重建轻量级的 SessionClient（新 TLS 连接），复用重量级的 ModuleClient（worker pool + DLL）
     // 之前的实现会 terminate + 重新 open ModuleClient，导致每次注册创建 2 个 worker pool
-    try { await this.session?.destroySession() } catch { /* ignore */ }
+    try {
+      await this.session?.destroySession()
+    } catch {
+      /* ignore */
+    }
     if (!this.moduleClient) {
       await this.initTlsClient()
       return
@@ -408,10 +531,14 @@ export class Registrar {
    * 静态资源不需要 TLS 指纹伪装，直接用 Node/undici fetch 即可。
    */
   private async fetchAppJS(url: string, init?: RequestInit): Promise<Response> {
-    const proxyUrl = (this.cfg.proxy && this.cfg.proxy.trim())
-      || process.env.HTTPS_PROXY || process.env.https_proxy
-      || process.env.HTTP_PROXY || process.env.http_proxy
-      || getSystemProxy() || undefined
+    const proxyUrl =
+      (this.cfg.proxy && this.cfg.proxy.trim()) ||
+      process.env.HTTPS_PROXY ||
+      process.env.https_proxy ||
+      process.env.HTTP_PROXY ||
+      process.env.http_proxy ||
+      getSystemProxy() ||
+      undefined
     const agent = safeCreateProxyAgent(proxyUrl)
     if (agent) {
       const resp = await undiciFetch(url, { ...(init as UndiciRequestInit), dispatcher: agent })
@@ -422,15 +549,36 @@ export class Registrar {
 
   private isRecoverableTlsClientError(err: unknown): boolean {
     if (!(err instanceof Error)) return false
-    return err.message.includes('EOF')
-      || err.message.includes('no tls client for modification check')
-      || err.message.includes('failed to modify existing client')
+    return (
+      err.message.includes('EOF') ||
+      err.message.includes('no tls client for modification check') ||
+      err.message.includes('failed to modify existing client')
+    )
   }
 
   /** 清理 TLS 客户端资源：仅销毁 SessionClient；ModuleClient 是进程级共享池，不再每次 terminate */
   private async cleanup(): Promise<void> {
+    // Cửa sổ Proton ẩn (show:false, backgroundThrottling:false) không bao giờ tự đóng: trước đây
+    // chỉ IPC 'proton-close' mới đóng nó, nên sau khi đăng ký xong 'window-all-closed' không bao
+    // giờ kích hoạt, app.quit() không được gọi và Krouter thành tiến trình ma còn nguyên một
+    // renderer Chromium. releaseProtonWindow chỉ đóng khi không còn lượt lấy OTP nào đang chạy,
+    // nên registrar chạy song song không phá cửa sổ của nhau.
+    if (this.cfg.useProton && process.versions.electron) {
+      try {
+        const { releaseProtonWindow } = await import('./proton-mail-window')
+        releaseProtonWindow()
+      } catch (err) {
+        this.log(
+          `[Proton] Không đóng được cửa sổ Proton: ${err instanceof Error ? err.message : String(err)}`
+        )
+      }
+    }
     if (this.chainRelay) {
-      try { await this.chainRelay.stop() } catch { /* ignore */ }
+      try {
+        await this.chainRelay.stop()
+      } catch {
+        /* ignore */
+      }
       this.chainRelay = null
     }
     if (this.session) {
@@ -440,9 +588,11 @@ export class Registrar {
       try {
         await Promise.race([
           s.destroySession(),
-          new Promise(resolve => setTimeout(resolve, 3000))
+          new Promise((resolve) => setTimeout(resolve, 3000))
         ])
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
     // moduleClient 是共享引用，不能 terminate（会影响其它正在跑的注册）
     this.moduleClient = null
@@ -457,12 +607,14 @@ export class Registrar {
   // ============ HTTP 工具方法 ============
 
   private cookieString(): string {
-    return Array.from(this.cookies.entries()).map(([k, v]) => `${k}=${v}`).join('; ')
+    return Array.from(this.cookies.entries())
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ')
   }
 
   private buildHeaders(referer: string, origin: string): Record<string, string> {
     const h: Record<string, string> = {
-      'Accept': 'application/json, text/plain, */*',
+      Accept: 'application/json, text/plain, */*',
       'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
       'Accept-Encoding': 'gzip, deflate, br',
       'Content-Type': 'application/json',
@@ -482,19 +634,19 @@ export class Registrar {
 
   private buildProfileHeaders(referer: string): Record<string, string> {
     const h: Record<string, string> = {
-      'Accept': '*/*',
+      Accept: '*/*',
       'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
       'Content-Type': 'application/json;charset=UTF-8',
       'User-Agent': this.identity.ua,
-      'Origin': this.cfg.profileBase,
-      'Referer': referer,
+      Origin: this.cfg.profileBase,
+      Referer: referer,
       'sec-ch-ua': this.secUA,
       'sec-ch-ua-mobile': '?0',
       'sec-ch-ua-platform': '"Windows"',
       'sec-fetch-dest': 'empty',
       'sec-fetch-mode': 'cors',
       'sec-fetch-site': 'same-origin',
-      'priority': 'u=1, i'
+      priority: 'u=1, i'
     }
     const keys = ['awsccc', 'aws-user-profile-ubid', 'i18next']
     if (this.cookies.has('awsd2c-token')) keys.push('awsd2c-token', 'awsd2c-token-c')
@@ -503,12 +655,19 @@ export class Registrar {
     return h
   }
 
-  private async doGet(url: string, headers: Record<string, string>): Promise<{ body: string; status: number; headers: Record<string, string | string[]> }> {
-    return this.sendRequest('GET', url, headers)
+  private async doGet(
+    url: string,
+    headers: Record<string, string>
+  ): Promise<{ body: string; status: number; headers: Record<string, string | string[]> }> {
+    return await this.sendRequest('GET', url, headers)
   }
 
-  private async doPost(url: string, payload: unknown, headers: Record<string, string>): Promise<{ body: string; status: number; headers: Record<string, string | string[]> }> {
-    return this.sendRequest('POST', url, headers, JSON.stringify(payload))
+  private async doPost(
+    url: string,
+    payload: unknown,
+    headers: Record<string, string>
+  ): Promise<{ body: string; status: number; headers: Record<string, string | string[]> }> {
+    return await this.sendRequest('POST', url, headers, JSON.stringify(payload))
   }
 
   /** 网络层退避时长：指数 + 抖动（约 0.8s / 1.6s / 3.2s，封顶 8s） */
@@ -523,10 +682,15 @@ export class Registrar {
    * 并不抛异常；若不在响应层识别，会被上层当成业务失败直接判死号（如 #9 的「未获取到加密公钥」）。
    */
   private isTransientResponse(status: number, body: string): boolean {
-    if (status === 0 || status === 429 || status === 502 || status === 503 || status === 504) return true
+    if (status === 0 || status === 429 || status === 502 || status === 503 || status === 504)
+      return true
     const lower = body.toLowerCase()
-    return lower.includes('failed to do request') || lower.includes('eof')
-      || lower.includes('connection reset') || lower.includes('timeout')
+    return (
+      lower.includes('failed to do request') ||
+      lower.includes('eof') ||
+      lower.includes('connection reset') ||
+      lower.includes('timeout')
+    )
   }
 
   /**
@@ -537,8 +701,12 @@ export class Registrar {
     if (status === 504) return true
     if (status !== 0) return false
     const lower = body.toLowerCase()
-    return lower.includes('timeout') || lower.includes('deadline')
-      || lower.includes('client.timeout') || lower.includes('failed to do request')
+    return (
+      lower.includes('timeout') ||
+      lower.includes('deadline') ||
+      lower.includes('client.timeout') ||
+      lower.includes('failed to do request')
+    )
   }
 
   /**
@@ -555,38 +723,62 @@ export class Registrar {
     const maxAttempts = 3
     let lastErr: unknown = null
     let sessionRefreshed = false // 整个请求最多换 1 次 proxy session，避免频繁停建代理链
+    // sendRequest có thể chạy tới ~75s trong khi watchdog của bước chỉ 30-35s, nên phần thân
+    // hàm này thường xuyên còn sống sau khi withTimeout đã bỏ rơi nó. Chốt generation lúc vào
+    // và kiểm tra trước mỗi lần đụng state dùng chung.
+    const gen = this.stepGeneration
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      this.assertCurrentGeneration(gen)
       try {
-        const resp = method === 'GET'
-          ? await this.session!.get(url, { headers })
-          : await this.session!.post(url, body ?? '', { headers })
+        const resp =
+          method === 'GET'
+            ? await this.session!.get(url, { headers })
+            : await this.session!.post(url, body ?? '', { headers })
         const decoded = this.decodeBody(resp.body)
         const status = resp.status
         if (attempt < maxAttempts && this.isTransientResponse(status, decoded)) {
+          this.assertCurrentGeneration(gen)
           const broken = status === 0 || /eof|reset|failed to do request/i.test(decoded)
           // 超时类（出口链路慢/网络抖动/隧道挂起）：refresh proxy session 后重建链路。
-          if (this.isTimeoutResponse(status, decoded) && !sessionRefreshed && this.canRefreshProxySession()) {
-            this.log(`[Mạng] ${method} hết thời gian chờ (status=${status}), làm mới phiên proxy rồi thử lại ${attempt}/${maxAttempts - 1}`)
+          if (
+            this.isTimeoutResponse(status, decoded) &&
+            !sessionRefreshed &&
+            this.canRefreshProxySession()
+          ) {
+            this.log(
+              `[Mạng] ${method} hết thời gian chờ (status=${status}), làm mới phiên proxy rồi thử lại ${attempt}/${maxAttempts - 1}`
+            )
             try {
               await this.refreshProxySession()
               await this.rebuildTlsClient()
               sessionRefreshed = true
             } catch (e) {
-              this.log(`[Mạng] Đổi phiên thất bại, chuyển sang tạo lại kết nối thông thường: ${e instanceof Error ? e.message : String(e)}`)
+              this.log(
+                `[Mạng] Đổi phiên thất bại, chuyển sang tạo lại kết nối thông thường: ${e instanceof Error ? e.message : String(e)}`
+              )
               await this.rebuildTlsClient()
             }
           } else {
-            this.log(`[Mạng] ${method} tạm thời thất bại status=${status}, ${broken ? 'tạo lại TLS + ' : ''}chờ rồi thử lại ${attempt}/${maxAttempts - 1}`)
+            this.log(
+              `[Mạng] ${method} tạm thời thất bại status=${status}, ${broken ? 'tạo lại TLS + ' : ''}chờ rồi thử lại ${attempt}/${maxAttempts - 1}`
+            )
             if (broken) await this.rebuildTlsClient()
           }
           await this.abortableSleep(this.netBackoffMs(attempt))
           continue
         }
-        return { body: decoded, status, headers: (resp.headers || {}) as Record<string, string | string[]> }
+        return {
+          body: decoded,
+          status,
+          headers: (resp.headers || {}) as Record<string, string | string[]>
+        }
       } catch (err: unknown) {
         lastErr = err
         if (attempt < maxAttempts && this.isRecoverableTlsClientError(err)) {
-          this.log(`[TLS] ${method} gặp lỗi có thể khôi phục: ${err instanceof Error ? err.message : String(err)}, tạo lại TLS rồi thử lại ${attempt}/${maxAttempts - 1}`)
+          this.assertCurrentGeneration(gen)
+          this.log(
+            `[TLS] ${method} gặp lỗi có thể khôi phục: ${err instanceof Error ? err.message : String(err)}, tạo lại TLS rồi thử lại ${attempt}/${maxAttempts - 1}`
+          )
           await this.rebuildTlsClient()
           await this.abortableSleep(this.netBackoffMs(attempt))
           continue
@@ -602,10 +794,20 @@ export class Registrar {
   private abortableSleep(ms: number): Promise<void> {
     const signal = this.abortController.signal
     return new Promise((resolve, reject) => {
-      if (signal.aborted) { reject(new Error('Đăng ký đã bị hủy')); return }
-      let timer: ReturnType<typeof setTimeout>
-      const onAbort = (): void => { clearTimeout(timer); reject(new Error('Đăng ký đã bị hủy')) }
-      timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve() }, ms)
+      if (signal.aborted) {
+        reject(new Error('Đăng ký đã bị hủy'))
+        return
+      }
+      // onAbort tham chiếu `timer` nhưng chỉ chạy sau khi timer đã được gán, nên khai báo
+      // const ở sau là an toàn.
+      const onAbort = (): void => {
+        clearTimeout(timer)
+        reject(new Error('Đăng ký đã bị hủy'))
+      }
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort)
+        resolve()
+      }, ms)
       signal.addEventListener('abort', onAbort, { once: true })
     })
   }
@@ -617,7 +819,9 @@ export class Registrar {
     // Phase 14: Add adaptive delay when risk-control has been detected
     const totalMin = min + this.adaptiveDelayMs
     const totalMax = max + this.adaptiveDelayMs
-    await this.abortableSleep(totalMin + Math.floor(Math.random() * Math.max(1, totalMax - totalMin)))
+    await this.abortableSleep(
+      totalMin + Math.floor(Math.random() * Math.max(1, totalMax - totalMin))
+    )
   }
 
   /**
@@ -630,8 +834,12 @@ export class Registrar {
     this.lastRiskControlAt = Date.now()
     // Exponential backoff: 5s, 15s, 30s, 60s, 120s max
     this.adaptiveDelayMs = Math.min(120_000, 5000 * Math.pow(2, this.riskControlHits - 1))
-    this.log(`[RiskControl] AWS chặn lần ${this.riskControlHits}, tăng delay lên ${Math.round(this.adaptiveDelayMs / 1000)}s giữa các bước`)
-    this.emitStep('risk-control', { extra: { riskHits: this.riskControlHits, adaptiveDelayMs: this.adaptiveDelayMs } })
+    this.log(
+      `[RiskControl] AWS chặn lần ${this.riskControlHits}, tăng delay lên ${Math.round(this.adaptiveDelayMs / 1000)}s giữa các bước`
+    )
+    this.emitStep('risk-control', {
+      extra: { riskHits: this.riskControlHits, adaptiveDelayMs: this.adaptiveDelayMs }
+    })
   }
 
   /** Phase 14: Decay adaptive delay after time without risk triggers */
@@ -655,7 +863,10 @@ export class Registrar {
   private withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
     const signal = this.abortController.signal
     return new Promise<T>((resolve, reject) => {
-      if (signal.aborted) { reject(new Error('Đăng ký đã bị hủy')); return }
+      if (signal.aborted) {
+        reject(new Error('Đăng ký đã bị hủy'))
+        return
+      }
       let done = false
       const settle = (fn: () => void): void => {
         if (done) return
@@ -664,14 +875,39 @@ export class Registrar {
         signal.removeEventListener('abort', onAbort)
         fn()
       }
-      const timer = setTimeout(() => settle(() => reject(new Error(`${label} hết thời gian chờ tổng thể ${Math.round(ms / 1000)} giây`))), ms)
-      const onAbort = (): void => settle(() => reject(new Error('Đăng ký đã bị hủy')))
+      const timer = setTimeout(
+        () =>
+          settle(() => {
+            // Promise gốc KHÔNG bị hủy — nó vẫn chạy tiếp trên state dùng chung (session,
+            // cookies, workflowHandle, chainRelay). Tăng generation để bản mồ côi tự nhận ra
+            // mình đã bị bỏ rơi và dừng lại, thay vì rebuildTlsClient() phá session của lượt
+            // thử tiếp theo (chính là chuỗi lỗi "no tls client for modification check").
+            this.stepGeneration++
+            reject(new Error(`${label} hết thời gian chờ tổng thể ${Math.round(ms / 1000)} giây`))
+          }),
+        ms
+      )
+      const onAbort = (): void =>
+        settle(() => {
+          this.stepGeneration++
+          reject(new Error('Đăng ký đã bị hủy'))
+        })
       signal.addEventListener('abort', onAbort, { once: true })
       p.then(
         (v) => settle(() => resolve(v)),
         (e) => settle(() => reject(e))
       )
     })
+  }
+
+  /**
+   * Ném lỗi nếu lượt thử đã bị withTimeout bỏ rơi. Dùng trước mọi thao tác đụng vào state
+   * dùng chung để một promise mồ côi không phá hỏng lượt thử đang sống.
+   */
+  private assertCurrentGeneration(gen: number): void {
+    if (gen !== this.stepGeneration) {
+      throw new Error('Lượt thử đã bị bỏ qua do hết thời gian chờ')
+    }
   }
 
   /**
@@ -694,16 +930,23 @@ export class Registrar {
       } catch (err) {
         lastErr = err
         if (i < attempts) {
+          // Lượt vừa rồi coi như bỏ: mọi thứ nó còn để lại đang bay phải ngừng đụng vào
+          // session/cookies trước khi ta dựng lại chúng cho lượt kế tiếp.
+          this.stepGeneration++
           // 幂等步骤失败：若支持 session refresh，先重建代理会话再退避。
           if (opts?.refreshSession && this.canRefreshProxySession()) {
             try {
               await this.refreshProxySession()
               await this.rebuildTlsClient()
               this.log(`[${name}] Đã làm mới phiên proxy`)
-            } catch { /* 换 session 失败则继续普通重试 */ }
+            } catch {
+              /* 换 session 失败则继续普通重试 */
+            }
           }
           const wait = 1500 * i + Math.floor(Math.random() * 800)
-          this.log(`[${name}] Lần ${i}/${attempts} thất bại: ${(err as Error).message}, thử lại sau ${wait}ms`)
+          this.log(
+            `[${name}] Lần ${i}/${attempts} thất bại: ${(err as Error).message}, thử lại sau ${wait}ms`
+          )
           await this.abortableSleep(wait)
         }
       }
@@ -737,13 +980,20 @@ export class Registrar {
   }
 
   private parseBody(body: string): Record<string, unknown> {
-    try { return JSON.parse(body) } catch { return {} }
+    try {
+      return JSON.parse(body)
+    } catch {
+      return {}
+    }
   }
 
-  private parseRequiredJsonBody(body: string | undefined, context: string): Record<string, unknown> {
+  private parseRequiredJsonBody(
+    body: string | undefined,
+    context: string
+  ): Record<string, unknown> {
     const decoded = this.decodeBody(body || '')
     try {
-      return decoded ? JSON.parse(decoded) as Record<string, unknown> : {}
+      return decoded ? (JSON.parse(decoded) as Record<string, unknown>) : {}
     } catch {
       const compact = decoded.replace(/\s+/g, ' ').trim().slice(0, 220)
       throw new Error(`${context} trả về non-JSON: ${compact || '(empty body)'}`)
@@ -763,7 +1013,8 @@ export class Registrar {
     if (lower.includes('"errorcode":"blocked"')) return 'AWS-RISK-CONTROL'
     if (lower.includes('request was blocked by tes')) return 'AWS-RISK-CONTROL'
     if (lower.includes('blocked') && lower.includes('tes')) return 'AWS-RISK-CONTROL'
-    if (lower.includes('try again later') && lower.includes('administrator')) return 'AWS-RISK-CONTROL'
+    if (lower.includes('try again later') && lower.includes('administrator'))
+      return 'AWS-RISK-CONTROL'
     if (lower.includes('unexpected error') && lower.includes('contact')) return 'AWS-RISK-CONTROL'
     if (status !== 400) return null
     return null
@@ -771,32 +1022,46 @@ export class Registrar {
 
   /** 把响应错误格式化为更友好的消息（含风控识别） */
   private formatErrorBody(body: string, status: number): string {
+    if (this.isProxyGatewayDiagnosticBody(body)) {
+      return `status=${status} proxy gateway intercepted AWS OIDC request and returned server diagnostics instead of JSON; route/proxy is not usable for AWS sign-in`
+    }
     const risk = this.detectRiskControl(body, status)
     if (risk) {
       this.onRiskControlDetected()
       return `${risk} (AWS đã chặn yêu cầu; đề xuất: 1) dừng tác vụ hàng loạt hiện tại; 2) bật giới hạn tốc độ và tự động tạm dừng; 3) tránh đăng ký hàng loạt cùng một tên miền email; 4) nếu tài khoản bị hạn chế, liên hệ Support theo hướng dẫn của AWS/Kiro)`
     }
     const compactBody = body.replace(/\s+/g, ' ').trim()
-    if (
-      status === 403
-      && /<html[\s>]/i.test(compactBody)
-      && /403 forbidden/i.test(compactBody)
-    ) {
+    if (status === 403 && /<html[\s>]/i.test(compactBody) && /403 forbidden/i.test(compactBody)) {
       return `status=403 proxy gateway returned an HTML Forbidden page before Kiro produced an API response; route/proxy is not usable for AWS sign-in`
     }
-    if ((status === 401 || status === 403) && /forbidden|unauthorized|access denied/i.test(compactBody)) {
+    if (
+      (status === 401 || status === 403) &&
+      /forbidden|unauthorized|access denied/i.test(compactBody)
+    ) {
       return `status=${status} route đăng ký bị Kiro/AWS từ chối; nguồn mail có thể vẫn bình thường; body=${compactBody.substring(0, 160)}`
     }
     return `status=${status} body=${compactBody.substring(0, 200)}`
   }
 
+  private isProxyGatewayDiagnosticBody(body: string): boolean {
+    const signatures = ['REMOTE_ADDR', 'REMOTE_PORT', 'REQUEST_METHOD', 'REQUEST_URI', 'HTTP_HOST']
+    return signatures.filter((signature) => body.includes(signature)).length >= 3
+  }
+
   private async fetchD2CToken(origin: string, referer: string): Promise<void> {
     const headers: Record<string, string> = {
-      'Accept': '*/*', 'Content-Type': 'application/json',
-      'User-Agent': this.identity.ua, 'Origin': origin, 'Referer': referer,
-      'sec-ch-ua': this.secUA, 'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"', 'sec-fetch-dest': 'empty',
-      'sec-fetch-mode': 'cors', 'sec-fetch-site': 'cross-site', 'priority': 'u=1, i'
+      Accept: '*/*',
+      'Content-Type': 'application/json',
+      'User-Agent': this.identity.ua,
+      Origin: origin,
+      Referer: referer,
+      'sec-ch-ua': this.secUA,
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'cross-site',
+      priority: 'u=1, i'
     }
     const parts: string[] = []
     if (this.cookies.has('awsccc')) parts.push('awsccc=' + this.cookies.get('awsccc'))
@@ -822,7 +1087,9 @@ export class Registrar {
         try {
           const decoded = JSON.parse(Buffer.from(jwtParts[1], 'base64url').toString())
           if (decoded.vid) this.vid = decoded.vid
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
     }
   }
@@ -833,9 +1100,16 @@ export class Registrar {
     return this.genFPWithTime(pageType, eventType, 0, emailLen, emailAddr)
   }
 
-  private genFPWithTime(pageType: string, eventType: string, timeOnPage: number, emailLen: number, emailAddr: string): string {
+  private genFPWithTime(
+    pageType: string,
+    eventType: string,
+    timeOnPage: number,
+    emailLen: number,
+    emailAddr: string
+  ): string {
     const did = this.cfg.directoryId
-    let loc = '', ref = ''
+    let loc = '',
+      ref = ''
 
     switch (pageType) {
       case 'signin':
@@ -859,7 +1133,17 @@ export class Registrar {
       ref = this.cfg.viewBase + '/'
     }
 
-    return generateFingerprint(this.identity, loc, ref, this.fpCtx, pageType, eventType, timeOnPage, emailLen, emailAddr)
+    return generateFingerprint(
+      this.identity,
+      loc,
+      ref,
+      this.fpCtx,
+      pageType,
+      eventType,
+      timeOnPage,
+      emailLen,
+      emailAddr
+    )
   }
 
   // ============ 注册步骤 ============
@@ -870,18 +1154,45 @@ export class Registrar {
     const payload = {
       clientName: 'Amazon Q Developer for command line',
       clientType: 'public',
-      scopes: ['codewhisperer:completions', 'codewhisperer:analysis', 'codewhisperer:conversations', 'codewhisperer:transformations', 'codewhisperer:taskassist']
+      scopes: [
+        'codewhisperer:completions',
+        'codewhisperer:analysis',
+        'codewhisperer:conversations',
+        'codewhisperer:transformations',
+        'codewhisperer:taskassist'
+      ]
     }
     const headers = { 'Content-Type': 'application/json' }
 
-    let resp: { body: string; status: number; headers: Record<string, string | string[]> } | null = null
+    let lastError = 'unknown response'
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        resp = await this.doPost(this.cfg.oidcBase + '/client/register', payload, headers)
-        if (resp.status === 200) break
-      } catch (err: unknown) {
+        const resp = await this.doPost(this.cfg.oidcBase + '/client/register', payload, headers)
+        const data = this.parseBody(resp.body)
+        const clientId = (data.clientId as string) || ''
+        if (resp.status === 200 && clientId) {
+          this.clientId = clientId
+          this.clientSecret = (data.clientSecret as string) || ''
+          return
+        }
+
+        lastError = this.formatErrorBody(resp.body, resp.status)
+        if (lastError.includes('route/proxy is not usable for AWS sign-in')) {
+          throw new Error(`Đăng ký OIDC thất bại: ${lastError}`)
+        }
         if (attempt < 2) {
-          this.log(`[1] Thử lại OIDC (${attempt + 1}/3)...`)
+          this.log(`[1] Thử lại OIDC (${attempt + 2}/3): ${lastError}`)
+          await this.abortableSleep(2000 * (attempt + 1))
+          await this.rebuildTlsClient()
+        }
+      } catch (err: unknown) {
+        if (
+          err instanceof Error &&
+          err.message.includes('route/proxy is not usable for AWS sign-in')
+        )
+          throw err
+        if (attempt < 2) {
+          this.log(`[1] Thử lại OIDC (${attempt + 2}/3)...`)
           await this.abortableSleep(2000 * (attempt + 1))
           await this.rebuildTlsClient()
           continue
@@ -889,20 +1200,21 @@ export class Registrar {
         throw err
       }
     }
-    if (!resp) throw new Error('Đăng ký OIDC thất bại: tất cả lần thử đều thất bại')
-    const data = this.parseBody(resp.body)
-    this.clientId = (data.clientId as string) || ''
-    this.clientSecret = (data.clientSecret as string) || ''
-    if (!this.clientId) throw new Error(`Đăng ký OIDC thất bại: ${resp.body.slice(0, 200)}`)
+    throw new Error(`Đăng ký OIDC thất bại: ${lastError}`)
   }
 
   private async step2Device(): Promise<void> {
     this.emitStep('device')
     this.log('[2] Cấp quyền thiết bị')
-    const resp = await this.doPost(this.cfg.oidcBase + '/device_authorization', {
-      clientId: this.clientId, clientSecret: this.clientSecret,
-      startUrl: this.cfg.startURL
-    }, { 'Content-Type': 'application/json' })
+    const resp = await this.doPost(
+      this.cfg.oidcBase + '/device_authorization',
+      {
+        clientId: this.clientId,
+        clientSecret: this.clientSecret,
+        startUrl: this.cfg.startURL
+      },
+      { 'Content-Type': 'application/json' }
+    )
     const data = this.parseBody(resp.body)
     this.deviceCode = (data.deviceCode as string) || ''
     this.userCode = (data.userCode as string) || ''
@@ -912,15 +1224,17 @@ export class Registrar {
   private async step3Email(): Promise<void> {
     if (this.cfg.manualMode) return // 手动模式在外部设置
 
+    // Cùng một proxy với các request tới AWS: bắt buộc, nếu không nhà cung cấp mail sẽ thấy IP thật.
+    const emailProxy = this.emailProxyOptions()
+
     if (this.cfg.useOutlook && this.cfg.outlookData) {
       this.log('[3] Sử dụng email Outlook')
       const accounts = parseOutlookLines(this.cfg.outlookData)
       if (accounts.length === 0) throw new Error('Không có tài khoản Outlook khả dụng')
       // 单行 → 直接用（批量并发时前端已为每个 task 切一行，避免并发抢占）
       // 多行（单次注册）→ 随机挑一行
-      const acc = accounts.length === 1
-        ? accounts[0]
-        : accounts[Math.floor(Math.random() * accounts.length)]
+      const acc =
+        accounts.length === 1 ? accounts[0] : accounts[Math.floor(Math.random() * accounts.length)]
       this.email = acc.email
       this.emitStep('email-created')
       this.log(`email=${this.email}`)
@@ -929,11 +1243,18 @@ export class Registrar {
 
     if (this.cfg.useTempMailPlus) {
       this.log('[3] Sử dụng email tên miền riêng (TempMail.Plus)')
-      if (!this.cfg.tempMailPlusEmail || !this.cfg.tempMailPlusEpin || !this.cfg.tempMailPlusDomain) {
+      if (
+        !this.cfg.tempMailPlusEmail ||
+        !this.cfg.tempMailPlusEpin ||
+        !this.cfg.tempMailPlusDomain
+      ) {
         throw new Error('Cấu hình TempMail.Plus chưa đầy đủ')
       }
       this.emailSvc = new TempMailPlusService(
-        this.cfg.tempMailPlusEmail, this.cfg.tempMailPlusEpin, this.cfg.tempMailPlusDomain
+        this.cfg.tempMailPlusEmail,
+        this.cfg.tempMailPlusEpin,
+        this.cfg.tempMailPlusDomain,
+        emailProxy
       )
       this.email = await this.emailSvc.create()
       if (!this.email) throw new Error('Tạo địa chỉ email thất bại')
@@ -944,13 +1265,18 @@ export class Registrar {
 
     if (this.cfg.useTingamefiMail) {
       this.log('[3] Sử dụng email tạm Tingamefi')
-      if (!this.cfg.tingamefiMailApiUrl || !this.cfg.tingamefiMailAdminPassword || !this.cfg.tingamefiMailDomain) {
+      if (
+        !this.cfg.tingamefiMailApiUrl ||
+        !this.cfg.tingamefiMailAdminPassword ||
+        !this.cfg.tingamefiMailDomain
+      ) {
         throw new Error('Cấu hình email Tingamefi chưa đầy đủ')
       }
       this.emailSvc = new TingamefiMailService(
         this.cfg.tingamefiMailApiUrl,
         this.cfg.tingamefiMailAdminPassword,
-        this.cfg.tingamefiMailDomain
+        this.cfg.tingamefiMailDomain,
+        emailProxy
       )
       this.email = await this.emailSvc.create()
       if (!this.email) throw new Error('Tạo địa chỉ email Tingamefi thất bại')
@@ -974,7 +1300,7 @@ export class Registrar {
 
     this.log('[3] Tạo email tạm')
     if (!this.cfg.moEmailBaseURL) throw new Error('Chưa cấu hình MoEmail')
-    this.emailSvc = new MoEmailService(this.cfg.moEmailBaseURL, this.cfg.moEmailAPIKey)
+    this.emailSvc = new MoEmailService(this.cfg.moEmailBaseURL, this.cfg.moEmailAPIKey, emailProxy)
     this.email = await this.emailSvc.create()
     if (!this.email) throw new Error('Tạo email tạm thất bại')
     this.emitStep('email-created')
@@ -989,10 +1315,10 @@ export class Registrar {
     const url = `${this.cfg.portalBase}/login?directory_id=view&redirect_url=${redirect}`
 
     const h: Record<string, string> = {
-      'Accept': 'application/json, text/plain, */*',
+      Accept: 'application/json, text/plain, */*',
       'Content-Type': 'application/json',
-      'Origin': this.cfg.viewBase,
-      'Referer': this.cfg.viewBase + '/',
+      Origin: this.cfg.viewBase,
+      Referer: this.cfg.viewBase + '/',
       'User-Agent': this.identity.ua
     }
     const resp = await this.doGet(url, h)
@@ -1019,13 +1345,20 @@ export class Registrar {
     let fp = this.genFP('signin', 'first_load', 0, '')
     let rid = newUUID()
     let h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
-    let resp = await this.doPost(api, {
-      stepId: '', workflowStateHandle: this.workflowHandle,
-      inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
-      requestId: rid
-    }, h)
+    let resp = await this.doPost(
+      api,
+      {
+        stepId: '',
+        workflowStateHandle: this.workflowHandle,
+        inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
+        requestId: rid
+      },
+      h
+    )
     if (resp.status !== 200) {
       throw new Error(`WorkflowInit Kiro failed: ${this.formatErrorBody(resp.body, resp.status)}`)
     }
@@ -1037,15 +1370,24 @@ export class Registrar {
       fp = this.genFP('signin', 'PageLoad', 0, '')
       rid = newUUID()
       h = this.buildHeaders(ref, this.cfg.signinBase)
-      h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+      h['x-amzn-requestid'] = rid
+      h['x-amz-date'] = gmtDate()
+      h['priority'] = 'u=1, i'
 
-      resp = await this.doPost(api, {
-        stepId: 'start', workflowStateHandle: this.workflowHandle,
-        inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
-        requestId: rid
-      }, h)
+      resp = await this.doPost(
+        api,
+        {
+          stepId: 'start',
+          workflowStateHandle: this.workflowHandle,
+          inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
+          requestId: rid
+        },
+        h
+      )
       if (resp.status !== 200) {
-        throw new Error(`WorkflowStart Kiro failed: ${this.formatErrorBody(resp.body, resp.status)}`)
+        throw new Error(
+          `WorkflowStart Kiro failed: ${this.formatErrorBody(resp.body, resp.status)}`
+        )
       }
       saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
       data = this.parseBody(resp.body)
@@ -1061,23 +1403,39 @@ export class Registrar {
     const fp = this.genFP('signin', 'PageSubmit', this.email.length, this.email)
     const rid = newUUID()
     const h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
-    const resp = await this.doPost(api, {
-      stepId: 'get-identity-user', workflowStateHandle: this.workflowHandle,
-      actionId: 'SUBMIT',
-      inputs: [
-        { input_type: 'UserRequestInput', username: this.email },
-        { input_type: 'ApplicationTypeRequestInput', applicationType: 'SSO_INDIVIDUAL_ID' },
-        {
-          input_type: 'UserEventRequestInput', directoryId: this.cfg.directoryId,
-          userName: this.email,
-          userEvents: [{ input_type: 'UserEvent', eventType: 'PAGE_SUBMIT', pageName: 'IDENTIFICATION', timeSpentOnPage: 5000 }]
-        },
-        { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
-      ],
-      visitorId: this.vid, requestId: rid
-    }, h)
+    const resp = await this.doPost(
+      api,
+      {
+        stepId: 'get-identity-user',
+        workflowStateHandle: this.workflowHandle,
+        actionId: 'SUBMIT',
+        inputs: [
+          { input_type: 'UserRequestInput', username: this.email },
+          { input_type: 'ApplicationTypeRequestInput', applicationType: 'SSO_INDIVIDUAL_ID' },
+          {
+            input_type: 'UserEventRequestInput',
+            directoryId: this.cfg.directoryId,
+            userName: this.email,
+            userEvents: [
+              {
+                input_type: 'UserEvent',
+                eventType: 'PAGE_SUBMIT',
+                pageName: 'IDENTIFICATION',
+                timeSpentOnPage: 5000
+              }
+            ]
+          },
+          { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
+        ],
+        visitorId: this.vid,
+        requestId: rid
+      },
+      h
+    )
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     const data = this.parseBody(resp.body)
     if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
@@ -1095,17 +1453,25 @@ export class Registrar {
     const fp = this.genFP('signup', 'PageSubmit', 0, '')
     const rid = newUUID()
     const h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
-    const resp = await this.doPost(api, {
-      stepId: 'get-identity-user', workflowStateHandle: this.workflowHandle,
-      actionId: 'SIGNUP',
-      inputs: [
-        { input_type: 'UserRequestInput', username: this.email },
-        { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
-      ],
-      visitorId: this.vid, requestId: rid
-    }, h)
+    const resp = await this.doPost(
+      api,
+      {
+        stepId: 'get-identity-user',
+        workflowStateHandle: this.workflowHandle,
+        actionId: 'SIGNUP',
+        inputs: [
+          { input_type: 'UserRequestInput', username: this.email },
+          { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
+        ],
+        visitorId: this.vid,
+        requestId: rid
+      },
+      h
+    )
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     const data = this.parseBody(resp.body)
     const redir = data.redirect as Record<string, unknown> | undefined
@@ -1123,34 +1489,51 @@ export class Registrar {
     let fp = this.genFP('signup', 'first_load', 0, '')
     let rid = newUUID()
     let h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
-    let resp = await this.doPost(api, {
-      stepId: '', workflowStateHandle: this.workflowHandle,
-      inputs: [
-        { input_type: 'UserRequestInput', username: this.email },
-        { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
-      ],
-      visitorId: this.vid, requestId: rid
-    }, h)
+    let resp = await this.doPost(
+      api,
+      {
+        stepId: '',
+        workflowStateHandle: this.workflowHandle,
+        inputs: [
+          { input_type: 'UserRequestInput', username: this.email },
+          { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
+        ],
+        visitorId: this.vid,
+        requestId: rid
+      },
+      h
+    )
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     let data = this.parseBody(resp.body)
     if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
-    if (data.stepId !== 'start') throw new Error(`Khởi tạo đăng ký thất bại: ${this.formatErrorBody(resp.body, resp.status)}`)
+    if (data.stepId !== 'start')
+      throw new Error(`Khởi tạo đăng ký thất bại: ${this.formatErrorBody(resp.body, resp.status)}`)
 
     fp = this.genFP('signup', 'PageLoad', 0, '')
     rid = newUUID()
     h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
-    resp = await this.doPost(api, {
-      stepId: 'start', workflowStateHandle: this.workflowHandle,
-      inputs: [
-        { input_type: 'UserRequestInput', username: this.email },
-        { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
-      ],
-      visitorId: this.vid, requestId: rid
-    }, h)
+    resp = await this.doPost(
+      api,
+      {
+        stepId: 'start',
+        workflowStateHandle: this.workflowHandle,
+        inputs: [
+          { input_type: 'UserRequestInput', username: this.email },
+          { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
+        ],
+        visitorId: this.vid,
+        requestId: rid
+      },
+      h
+    )
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     data = this.parseBody(resp.body)
     if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
@@ -1174,9 +1557,10 @@ export class Registrar {
 
     const url = `${this.cfg.profileBase}/?workflowID=${this.workflowId}`
     const resp = await this.doGet(url, {
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'User-Agent': this.identity.ua,
-      'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate'
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate'
     })
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     resetPerfTiming(this.fpCtx)
@@ -1188,21 +1572,28 @@ export class Registrar {
     const ref = `${this.cfg.profileBase}/?workflowID=${this.workflowId}`
     const fp = this.genFP('profile', 'PageLoad', 0, '')
 
-    const resp = await this.doPost(this.cfg.profileBase + '/api/start', {
-      workflowID: this.workflowId,
-      browserData: {
-        attributes: {
-          fingerprint: fp,
-          eventTimestamp: new Date().toISOString().replace(/\.\d{3}Z$/, '.000Z'),
-          timeSpentOnPage: '38', eventType: 'PageLoad',
-          ubid: this.ubid, visitorId: this.vid
-        },
-        cookies: {}
-      }
-    }, this.buildProfileHeaders(ref))
+    const resp = await this.doPost(
+      this.cfg.profileBase + '/api/start',
+      {
+        workflowID: this.workflowId,
+        browserData: {
+          attributes: {
+            fingerprint: fp,
+            eventTimestamp: new Date().toISOString().replace(/\.\d{3}Z$/, '.000Z'),
+            timeSpentOnPage: '38',
+            eventType: 'PageLoad',
+            ubid: this.ubid,
+            visitorId: this.vid
+          },
+          cookies: {}
+        }
+      },
+      this.buildProfileHeaders(ref)
+    )
     const data = this.parseBody(resp.body)
     this.workflowState = (data.workflowState as string) || ''
-    if (!this.workflowState) throw new Error(`Khởi động hồ sơ không trả về workflowState: ${resp.body.slice(0, 200)}`)
+    if (!this.workflowState)
+      throw new Error(`Khởi động hồ sơ không trả về workflowState: ${resp.body.slice(0, 200)}`)
   }
 
   private async step9SendOTP(): Promise<void> {
@@ -1214,7 +1605,7 @@ export class Registrar {
       const acc = accounts.find((a) => a.email === this.email)
       if (acc) {
         try {
-          this.outlookMailCount = await getInboxCount(acc)
+          this.outlookMailCount = await getInboxCount(acc, this.emailProxyOptions())
           this.log(`Số email trước khi gửi: ${this.outlookMailCount}`)
         } catch (err) {
           this.log(`Lấy số lượng email thất bại: ${err}, dùng giá trị mặc định 0`)
@@ -1224,7 +1615,13 @@ export class Registrar {
 
     const ref = `${this.cfg.profileBase}/?workflowID=${this.workflowId}`
     const timeOnPage = 5000 + Math.floor(Math.random() * 3001)
-    const fp = this.genFPWithTime('profile', 'PageSubmit', timeOnPage, this.email.length, this.email)
+    const fp = this.genFPWithTime(
+      'profile',
+      'PageSubmit',
+      timeOnPage,
+      this.email.length,
+      this.email
+    )
     const tsp = String(timeOnPage)
 
     const payload = {
@@ -1234,20 +1631,29 @@ export class Registrar {
         attributes: {
           fingerprint: fp,
           eventTimestamp: new Date().toISOString().replace(/\.\d{3}Z$/, '.000Z'),
-          timeSpentOnPage: tsp, pageName: 'EMAIL_COLLECTION',
-          eventType: 'PageSubmit', ubid: this.ubid, visitorId: this.vid
+          timeSpentOnPage: tsp,
+          pageName: 'EMAIL_COLLECTION',
+          eventType: 'PageSubmit',
+          ubid: this.ubid,
+          visitorId: this.vid
         },
         cookies: {}
       }
     }
 
-    const resp = await this.doPost(this.cfg.profileBase + '/api/send-otp', payload, this.buildProfileHeaders(ref))
-    if (resp.status !== 200) throw new Error(`Gửi mã xác minh thất bại: ${this.formatErrorBody(resp.body, resp.status)}`)
+    const resp = await this.doPost(
+      this.cfg.profileBase + '/api/send-otp',
+      payload,
+      this.buildProfileHeaders(ref)
+    )
+    if (resp.status !== 200)
+      throw new Error(`Gửi mã xác minh thất bại: ${this.formatErrorBody(resp.body, resp.status)}`)
     this.log('Đã gửi mã xác minh')
   }
 
   private async step10GetOTP(): Promise<string> {
-    if (this.cfg.manualMode) throw new Error('Chế độ thủ công yêu cầu cung cấp mã xác minh từ bên ngoài')
+    if (this.cfg.manualMode)
+      throw new Error('Chế độ thủ công yêu cầu cung cấp mã xác minh từ bên ngoài')
 
     this.emitStep('waiting-otp')
     this.log('[10] Chờ mã xác minh')
@@ -1256,7 +1662,7 @@ export class Registrar {
       const accounts = parseOutlookLines(this.cfg.outlookData)
       const acc = accounts.find((a) => a.email === this.email)
       if (!acc) throw new Error('Không tìm thấy tài khoản Outlook tương ứng')
-      return await waitForOTP(acc, this.outlookMailCount, 120, 5, signal)
+      return await waitForOTP(acc, this.outlookMailCount, 120, 5, signal, this.emailProxyOptions())
     }
     if (!this.emailSvc) throw new Error('Dịch vụ email chưa được khởi tạo')
     return await this.emailSvc.waitForCode(120, 3, signal)
@@ -1269,24 +1675,32 @@ export class Registrar {
     const ref = `${this.cfg.profileBase}/?workflowID=${this.workflowId}`
     const fp = this.genFP('profile', 'EmailVerification', 0, '')
 
-    const resp = await this.doPost(this.cfg.profileBase + '/api/create-identity', {
-      workflowState: this.workflowState,
-      userData: { email: this.email, fullName: this.cfg.fullName },
-      otpCode: otp,
-      browserData: {
-        attributes: {
-          fingerprint: fp,
-          eventTimestamp: new Date().toISOString().replace(/\.\d{3}Z$/, '.000Z'),
-          timeSpentOnPage: '45000', pageName: 'EMAIL_VERIFICATION',
-          eventType: 'EmailVerification', ubid: this.ubid, visitorId: this.vid
-        },
-        cookies: {}
-      }
-    }, this.buildProfileHeaders(ref))
+    const resp = await this.doPost(
+      this.cfg.profileBase + '/api/create-identity',
+      {
+        workflowState: this.workflowState,
+        userData: { email: this.email, fullName: this.cfg.fullName },
+        otpCode: otp,
+        browserData: {
+          attributes: {
+            fingerprint: fp,
+            eventTimestamp: new Date().toISOString().replace(/\.\d{3}Z$/, '.000Z'),
+            timeSpentOnPage: '45000',
+            pageName: 'EMAIL_VERIFICATION',
+            eventType: 'EmailVerification',
+            ubid: this.ubid,
+            visitorId: this.vid
+          },
+          cookies: {}
+        }
+      },
+      this.buildProfileHeaders(ref)
+    )
     const data = this.parseBody(resp.body)
     this.regCode = (data.registrationCode as string) || ''
     this.signState = (data.signInState as string) || ''
-    if (!this.regCode) throw new Error(`create-identity không trả về registrationCode: ${resp.body.slice(0, 200)}`)
+    if (!this.regCode)
+      throw new Error(`create-identity không trả về registrationCode: ${resp.body.slice(0, 200)}`)
   }
 
   private async step12SetPassword(): Promise<void> {
@@ -1299,23 +1713,41 @@ export class Registrar {
     // 12a: 获取加密公钥
     let rid = newUUID()
     let h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
-    let resp = await this.doPost(api, {
-      stepId: '', state: this.signState,
-      inputs: [
-        { input_type: 'UserRegistrationRequestInput', registrationCode: this.regCode, state: this.signState },
-        { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
-      ],
-      requestId: rid
-    }, h)
+    let resp = await this.doPost(
+      api,
+      {
+        stepId: '',
+        state: this.signState,
+        inputs: [
+          {
+            input_type: 'UserRegistrationRequestInput',
+            registrationCode: this.regCode,
+            state: this.signState
+          },
+          { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
+        ],
+        requestId: rid
+      },
+      h
+    )
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     let data = this.parseBody(resp.body)
     this.workflowHandle = (data.workflowStateHandle as string) || ''
 
-    const encCtx = getNestedMap(data as Record<string, unknown>, 'workflowResponseData', 'encryptionContextResponse')
+    const encCtx = getNestedMap(
+      data as Record<string, unknown>,
+      'workflowResponseData',
+      'encryptionContextResponse'
+    )
     const pubKeyMap = encCtx ? getNestedStringMap(encCtx, 'publicKey') : null
-    if (!pubKeyMap?.n) throw new Error(`Không lấy được khóa công khai mã hóa: ${this.formatErrorBody(resp.body, resp.status)}`)
+    if (!pubKeyMap?.n)
+      throw new Error(
+        `Không lấy được khóa công khai mã hóa: ${this.formatErrorBody(resp.body, resp.status)}`
+      )
 
     const issuer = (encCtx?.issuer as string) || 'signin'
     const audience = (encCtx?.audience as string) || 'AWSPasswordService'
@@ -1327,24 +1759,37 @@ export class Registrar {
     fp = this.genFP('signup', 'PageSubmit', 0, '')
     rid = newUUID()
     h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
-    resp = await this.doPost(api, {
-      stepId: 'get-new-password-for-password-creation',
-      workflowStateHandle: this.workflowHandle, actionId: 'SUBMIT',
-      inputs: [
-        { input_type: 'PasswordRequestInput', password: encrypted, successfullyEncrypted: 'SUCCESSFUL' },
-        { input_type: 'UserRequestInput', username: this.email },
-        { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
-      ],
-      visitorId: this.vid, requestId: rid
-    }, h)
+    resp = await this.doPost(
+      api,
+      {
+        stepId: 'get-new-password-for-password-creation',
+        workflowStateHandle: this.workflowHandle,
+        actionId: 'SUBMIT',
+        inputs: [
+          {
+            input_type: 'PasswordRequestInput',
+            password: encrypted,
+            successfullyEncrypted: 'SUCCESSFUL'
+          },
+          { input_type: 'UserRequestInput', username: this.email },
+          { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
+        ],
+        visitorId: this.vid,
+        requestId: rid
+      },
+      h
+    )
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     data = this.parseBody(resp.body)
 
     const redir = data.redirect as Record<string, unknown> | undefined
     const rurl = redir?.url as string
-    if (!rurl) throw new Error(`SetPassword Kiro failed: ${this.formatErrorBody(resp.body, resp.status)}`)
+    if (!rurl)
+      throw new Error(`SetPassword Kiro failed: ${this.formatErrorBody(resp.body, resp.status)}`)
 
     const wh = extractParam(rurl, 'workflowStateHandle')
     const st = extractParam(rurl, 'state')
@@ -1359,20 +1804,32 @@ export class Registrar {
     const fp = this.genFP('signin', 'PageLoad', 0, '')
     const rid = newUUID()
     const h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
-    const resp = await this.doPost(api, {
-      stepId: '', workflowStateHandle: wh,
-      workflowResultHandle: rh, state,
-      inputs: [
-        { input_type: 'UserRequestInput', username: this.email },
-        { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
-      ],
-      visitorId: this.vid, requestId: rid
-    }, h)
+    const resp = await this.doPost(
+      api,
+      {
+        stepId: '',
+        workflowStateHandle: wh,
+        workflowResultHandle: rh,
+        state,
+        inputs: [
+          { input_type: 'UserRequestInput', username: this.email },
+          { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
+        ],
+        visitorId: this.vid,
+        requestId: rid
+      },
+      h
+    )
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     const data = this.parseBody(resp.body)
-    if (data.stepId !== 'end-of-workflow-success') throw new Error(`Hoàn tất quy trình thất bại: ${data.stepId || 'undefined'} ${this.formatErrorBody(resp.body, resp.status)}`)
+    if (data.stepId !== 'end-of-workflow-success')
+      throw new Error(
+        `Hoàn tất quy trình thất bại: ${data.stepId || 'undefined'} ${this.formatErrorBody(resp.body, resp.status)}`
+      )
 
     const redir = data.redirect as Record<string, unknown> | undefined
     const rurl = redir?.url as string
@@ -1392,11 +1849,17 @@ export class Registrar {
     const loginURL = `${this.cfg.portalBase}/login?directory_id=view&redirect_url=${redirectURL}`
 
     const h: Record<string, string> = {
-      'Accept': '*/*', 'User-Agent': this.identity.ua,
-      'Origin': this.cfg.viewBase, 'Referer': this.cfg.viewBase + '/',
-      'sec-ch-ua': this.secUA, 'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"', 'sec-fetch-dest': 'empty',
-      'sec-fetch-mode': 'cors', 'sec-fetch-site': 'cross-site', 'priority': 'u=1, i'
+      Accept: '*/*',
+      'User-Agent': this.identity.ua,
+      Origin: this.cfg.viewBase,
+      Referer: this.cfg.viewBase + '/',
+      'sec-ch-ua': this.secUA,
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'cross-site',
+      priority: 'u=1, i'
     }
     if (this.cookies.has('awsccc')) h['Cookie'] = 'awsccc=' + this.cookies.get('awsccc')
 
@@ -1421,28 +1884,42 @@ export class Registrar {
     let fp = this.genFP('signin', 'PageLoad', 0, '')
     let rid = newUUID()
     let h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
-    let resp = await this.doPost(api, {
-      stepId: '', workflowStateHandle: wh,
-      inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
-      requestId: rid
-    }, h)
+    let resp = await this.doPost(
+      api,
+      {
+        stepId: '',
+        workflowStateHandle: wh,
+        inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
+        requestId: rid
+      },
+      h
+    )
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     let data = this.parseBody(resp.body)
-    let newWH = (data.workflowStateHandle as string) || wh
+    const newWH = (data.workflowStateHandle as string) || wh
 
     if (data.stepId === 'start') {
       fp = this.genFP('signin', 'PageLoad', 0, '')
       rid = newUUID()
       h = this.buildHeaders(ref, this.cfg.signinBase)
-      h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+      h['x-amzn-requestid'] = rid
+      h['x-amz-date'] = gmtDate()
+      h['priority'] = 'u=1, i'
 
-      resp = await this.doPost(api, {
-        stepId: 'start', workflowStateHandle: newWH,
-        inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
-        requestId: rid
-      }, h)
+      resp = await this.doPost(
+        api,
+        {
+          stepId: 'start',
+          workflowStateHandle: newWH,
+          inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
+          requestId: rid
+        },
+        h
+      )
       saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
       data = this.parseBody(resp.body)
     }
@@ -1465,14 +1942,16 @@ export class Registrar {
     const startURL = this.cfg.viewBase + '/start/?' + params.toString()
 
     const cookieParts: string[] = []
-    if (this.cookies.has('loginCsrfToken')) cookieParts.push('loginCsrfToken=' + this.cookies.get('loginCsrfToken'))
+    if (this.cookies.has('loginCsrfToken'))
+      cookieParts.push('loginCsrfToken=' + this.cookies.get('loginCsrfToken'))
     if (this.cookies.has('awsccc')) cookieParts.push('awsccc=' + this.cookies.get('awsccc'))
 
     await this.doGet(startURL, {
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'User-Agent': this.identity.ua,
-      'Referer': this.cfg.signinBase + '/',
-      'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate',
+      Referer: this.cfg.signinBase + '/',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
       ...(cookieParts.length ? { Cookie: cookieParts.join('; ') } : {})
     })
   }
@@ -1484,23 +1963,38 @@ export class Registrar {
     if (!csrf) throw new Error('Thiếu loginCsrfToken')
 
     const h: Record<string, string> = {
-      'Accept': 'application/json, text/plain, */*',
+      Accept: 'application/json, text/plain, */*',
       'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': this.identity.ua, 'Origin': this.cfg.viewBase,
-      'Referer': this.cfg.viewBase + '/',
+      'User-Agent': this.identity.ua,
+      Origin: this.cfg.viewBase,
+      Referer: this.cfg.viewBase + '/',
       'x-amz-sso-csrf-token': csrf,
-      'sec-ch-ua': this.secUA, 'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"', 'sec-fetch-dest': 'empty',
-      'sec-fetch-mode': 'cors', 'sec-fetch-site': 'cross-site', 'priority': 'u=1, i'
+      'sec-ch-ua': this.secUA,
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'cross-site',
+      priority: 'u=1, i'
     }
     const formData = `authCode=${encodeURIComponent(this.authCode)}&state=${encodeURIComponent(this.ssoState)}&orgId=view`
 
     // 使用新客户端轮询 SSO Token
-    const ssoSession = new SessionClient(this.moduleClient!, this.sessionOpts)
+    // sessionId RIÊNG: this.sessionOpts mang sessionId cố định (this.tlsSessionId), nên nếu dùng
+    // nguyên nó thì client này sẽ dùng chung session phía DLL với this.session và khối finally bên
+    // dưới sẽ phá luôn session đó. Bốn lời gọi kế tiếp (accept_user_code, associate_token, tối đa
+    // 30 lượt poll /token) khi ấy đều trả "no tls client for modification check", mỗi lần lại kéo
+    // theo một rebuildTlsClient + backoff — biến 2 giây poll thành nhiều phút.
+    // Gán qua biến trung gian: viết thẳng object literal vào tham số sẽ kích hoạt excess-property
+    // check của TS, mà TlsClientDefaultOptions không khai báo sessionId (chỉ nhận qua spread).
+    const ssoSessionOpts = { ...this.sessionOpts, sessionId: newUUID() }
+    const ssoSession = new SessionClient(this.moduleClient!, ssoSessionOpts)
 
     try {
       for (let retry = 0; retry < 5; retry++) {
-        const resp = await ssoSession.post(this.cfg.portalBase + '/auth/sso-token', formData, { headers: h })
+        const resp = await ssoSession.post(this.cfg.portalBase + '/auth/sso-token', formData, {
+          headers: h
+        })
         const data = this.parseRequiredJsonBody(resp.body, `SSO Token status=${resp.status}`)
 
         if (typeof data.token === 'string' && data.token) {
@@ -1515,29 +2009,48 @@ export class Registrar {
         throw new Error(`Lấy SSO Token thất bại: ${resp.body?.slice(0, 200)}`)
       }
     } finally {
-      try { await ssoSession.destroySession() } catch { /* ignore */ }
+      try {
+        await ssoSession.destroySession()
+      } catch {
+        /* ignore */
+      }
     }
 
     if (!this.ssoToken) throw new Error('Lấy SSO Token vẫn thất bại sau 5 lần thử')
 
     // Accept device + Associate token
-    let resp = await this.doPost(this.cfg.oidcBase + '/device_authorization/accept_user_code', {
-      userCode: this.userCode, userSessionId: this.ssoToken
-    }, { 'Content-Type': 'application/json' })
+    let resp = await this.doPost(
+      this.cfg.oidcBase + '/device_authorization/accept_user_code',
+      {
+        userCode: this.userCode,
+        userSessionId: this.ssoToken
+      },
+      { 'Content-Type': 'application/json' }
+    )
     const dcData = this.parseBody(resp.body)
     const dc = dcData.deviceContext
 
-    await this.doPost(this.cfg.oidcBase + '/device_authorization/associate_token', {
-      deviceContext: dc, userSessionId: this.ssoToken
-    }, { 'Content-Type': 'application/json' })
+    await this.doPost(
+      this.cfg.oidcBase + '/device_authorization/associate_token',
+      {
+        deviceContext: dc,
+        userSessionId: this.ssoToken
+      },
+      { 'Content-Type': 'application/json' }
+    )
 
     // 轮询 token
     for (let i = 0; i < 30; i++) {
-      resp = await this.doPost(this.cfg.oidcBase + '/token', {
-        clientId: this.clientId, clientSecret: this.clientSecret,
-        deviceCode: this.deviceCode,
-        grantType: 'urn:ietf:params:oauth:grant-type:device_code'
-      }, { 'Content-Type': 'application/json' })
+      resp = await this.doPost(
+        this.cfg.oidcBase + '/token',
+        {
+          clientId: this.clientId,
+          clientSecret: this.clientSecret,
+          deviceCode: this.deviceCode,
+          grantType: 'urn:ietf:params:oauth:grant-type:device_code'
+        },
+        { 'Content-Type': 'application/json' }
+      )
 
       if (resp.status === 200) return this.parseBody(resp.body)
       await this.abortableSleep(2000)
@@ -1551,10 +2064,16 @@ export class Registrar {
     this.log('[Kiểm tra] Làm mới Token và đọc hạn mức')
     const refreshToken = (awsToken.refreshToken as string) || ''
 
-    const resp = await this.doPost('https://oidc.us-east-1.amazonaws.com/token', {
-      clientId: this.clientId, clientSecret: this.clientSecret,
-      refreshToken, grantType: 'refresh_token'
-    }, { 'Content-Type': 'application/json' })
+    const resp = await this.doPost(
+      'https://oidc.us-east-1.amazonaws.com/token',
+      {
+        clientId: this.clientId,
+        clientSecret: this.clientSecret,
+        refreshToken,
+        grantType: 'refresh_token'
+      },
+      { 'Content-Type': 'application/json' }
+    )
 
     if (resp.status !== 200) {
       this.log(`Làm mới Token thất bại: ${resp.status}`)
@@ -1567,14 +2086,19 @@ export class Registrar {
       awsToken.accessToken = access
     }
 
-    const usageUA = 'aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18'
+    const usageUA =
+      'aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18'
     const usageErrors: string[] = []
 
-    for (const baseURL of ['https://q.us-east-1.amazonaws.com/getUsageLimits', 'https://q.eu-central-1.amazonaws.com/getUsageLimits']) {
-      const usageURL = baseURL + '?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true'
+    for (const baseURL of [
+      'https://q.us-east-1.amazonaws.com/getUsageLimits',
+      'https://q.eu-central-1.amazonaws.com/getUsageLimits'
+    ]) {
+      const usageURL =
+        baseURL + '?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true'
       const usageResp = await this.doGet(usageURL, {
-        'Accept': 'application/json',
-        'Authorization': 'Bearer ' + access,
+        Accept: 'application/json',
+        Authorization: 'Bearer ' + access,
         'User-Agent': usageUA
       })
 
@@ -1592,7 +2116,10 @@ export class Registrar {
         usageErrors.push(`${baseURL} -> ${usageResp.status}`)
       }
     }
-    return { alive: false, error: `usage query failed${usageErrors.length ? ` (${usageErrors.join(' | ')})` : ''}` }
+    return {
+      alive: false,
+      error: `usage query failed${usageErrors.length ? ` (${usageErrors.join(' | ')})` : ''}`
+    }
   }
 
   private parseUsage(body: string): Record<string, unknown> {
@@ -1600,9 +2127,10 @@ export class Registrar {
     const userInfo = (usage.userInfo as Record<string, unknown>) || {}
     const emailAddr = (userInfo.email as string) || ''
     const subInfo = (usage.subscriptionInfo as Record<string, unknown>) || {}
-    let sub = (subInfo.subscriptionTitle as string) || 'Free'
+    const sub = (subInfo.subscriptionTitle as string) || 'Free'
 
-    let totalLimit = 0, totalUsed = 0
+    let totalLimit = 0,
+      totalUsed = 0
     const breakdown = usage.usageBreakdownList as Array<Record<string, unknown>> | undefined
     if (breakdown) {
       for (const item of breakdown) {
@@ -1610,7 +2138,8 @@ export class Registrar {
         const dn = item.displayName as string
         if (rt === 'CREDIT' || dn === 'Credits') {
           totalLimit = (item.usageLimitWithPrecision as number) || (item.usageLimit as number) || 0
-          totalUsed = (item.currentUsageWithPrecision as number) || (item.currentUsage as number) || 0
+          totalUsed =
+            (item.currentUsageWithPrecision as number) || (item.currentUsage as number) || 0
 
           const ft = item.freeTrialInfo as Record<string, unknown> | undefined
           if (ft?.freeTrialStatus === 'ACTIVE') {
@@ -1623,7 +2152,13 @@ export class Registrar {
     }
 
     this.log(`Kiểm tra thành công! Email=${emailAddr} Gói=${sub} Credit=${totalUsed}/${totalLimit}`)
-    return { alive: true, email: emailAddr, subscription: sub, credit_used: totalUsed, credit_limit: totalLimit }
+    return {
+      alive: true,
+      email: emailAddr,
+      subscription: sub,
+      credit_used: totalUsed,
+      credit_limit: totalLimit
+    }
   }
 
   // ============ 主流程 ============
@@ -1642,20 +2177,52 @@ export class Registrar {
 
       // 幂等只读步骤：retry 次数 + 整体超时看门狗 + session refresh。
       // OIDC 为首步（失败即废号）保留自带 3 次重试不快速超时；Email 创建有副作用不重试。
-      const initSteps: Array<{ name: string; fn: StepFn; retry?: number; timeoutMs?: number; refreshSession?: boolean }> = [
+      const initSteps: Array<{
+        name: string
+        fn: StepFn
+        retry?: number
+        timeoutMs?: number
+        refreshSession?: boolean
+      }> = [
         { name: 'OIDC', fn: () => this.step1OIDC() },
-        { name: 'Device', fn: () => this.step2Device(), retry: 2, timeoutMs: 30000, refreshSession: true },
-        { name: 'Portal', fn: () => this.step4Portal(), retry: 3, timeoutMs: 35000, refreshSession: true },
-        { name: 'WorkflowInit', fn: () => this.step5WorkflowInit(), retry: 2, timeoutMs: 35000, refreshSession: true },
+        {
+          name: 'Device',
+          fn: () => this.step2Device(),
+          retry: 2,
+          timeoutMs: 30000,
+          refreshSession: true
+        },
+        {
+          name: 'Portal',
+          fn: () => this.step4Portal(),
+          retry: 3,
+          timeoutMs: 35000,
+          refreshSession: true
+        },
+        {
+          name: 'WorkflowInit',
+          fn: () => this.step5WorkflowInit(),
+          retry: 2,
+          timeoutMs: 35000,
+          refreshSession: true
+        },
         { name: 'Email', fn: () => this.step3Email() }
       ]
       for (const s of initSteps) {
         this.checkAborted()
         try {
-          if (s.retry) await this.retryStep(s.name, s.fn, s.retry, { timeoutMs: s.timeoutMs, refreshSession: s.refreshSession })
+          if (s.retry)
+            await this.retryStep(s.name, s.fn, s.retry, {
+              timeoutMs: s.timeoutMs,
+              refreshSession: s.refreshSession
+            })
           else await s.fn()
         } catch (err) {
-          return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}` }
+          return {
+            status: 'failed',
+            email: this.email,
+            error: `[${s.name}] ${(err as Error).message}`
+          }
         }
         await this.humanDelay()
       }
@@ -1663,7 +2230,13 @@ export class Registrar {
       this.checkAborted()
       // 非幂等步骤统一加整体超时看门狗（默认 55s）：卡住时快速失败释放并发槽，不死等 3×25s
       const STEP_TIMEOUT = 55000
-      const emailStatus = await this.withTimeout(this.step6SubmitEmail(), STEP_TIMEOUT, 'SubmitEmail')
+      // Ngân sách chờ OTP: 120s do waitForCode khai báo + biên cho request cuối cùng đang bay.
+      const OTP_WAIT_TIMEOUT = 150_000
+      const emailStatus = await this.withTimeout(
+        this.step6SubmitEmail(),
+        STEP_TIMEOUT,
+        'SubmitEmail'
+      )
 
       if (emailStatus === 'signup') {
         const signupSteps: Array<{ name: string; fn: StepFn }> = [
@@ -1675,16 +2248,33 @@ export class Registrar {
         ]
         for (const s of signupSteps) {
           this.checkAborted()
-          try { await this.withTimeout(s.fn(), STEP_TIMEOUT, s.name) } catch (err) {
-            return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}` }
+          try {
+            await this.withTimeout(s.fn(), STEP_TIMEOUT, s.name)
+          } catch (err) {
+            return {
+              status: 'failed',
+              email: this.email,
+              error: `[${s.name}] ${(err as Error).message}`
+            }
           }
           await this.humanDelay()
         }
 
         this.checkAborted()
         let otp: string
-        try { otp = await this.step10GetOTP() } catch (err) {
-          return { status: 'failed', email: this.email, error: `[GetOTP] ${(err as Error).message}` }
+        // Bước duy nhất trong run() trước đây không có withTimeout. waitForCode/waitForOTP
+        // tính maxRetries = timeoutSec / intervalSec rồi cộng thêm một request tối đa 15s
+        // (IMAP 30s) mỗi vòng, nên "ngân sách 120s" thực tế có thể chạy ~40 × 18s ≈ 12 phút:
+        // task giữ slot concurrency suốt thời gian đó và OTP của AWS (~10 phút) hết hạn
+        // trước khi tới step11CreateIdentity.
+        try {
+          otp = await this.withTimeout(this.step10GetOTP(), OTP_WAIT_TIMEOUT, 'GetOTP')
+        } catch (err) {
+          return {
+            status: 'failed',
+            email: this.email,
+            error: `[GetOTP] ${(err as Error).message}`
+          }
         }
 
         for (const s of [
@@ -1692,8 +2282,14 @@ export class Registrar {
           { name: 'SetPassword', fn: () => this.step12SetPassword() }
         ] as Array<{ name: string; fn: StepFn }>) {
           this.checkAborted()
-          try { await this.withTimeout(s.fn(), STEP_TIMEOUT, s.name) } catch (err) {
-            return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}` }
+          try {
+            await this.withTimeout(s.fn(), STEP_TIMEOUT, s.name)
+          } catch (err) {
+            return {
+              status: 'failed',
+              email: this.email,
+              error: `[${s.name}] ${(err as Error).message}`
+            }
           }
           await this.humanDelay()
         }
@@ -1719,11 +2315,17 @@ export class Registrar {
         } catch (err) {
           const errMsg = (err as Error).message
           if (ssoAttempt < SSO_MAX_RETRIES) {
-            this.log(`[SSO] Bước cuối thất bại, thử lại nội bộ (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`)
+            this.log(
+              `[SSO] Bước cuối thất bại, thử lại nội bộ (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`
+            )
             await this.abortableSleep(3000 + Math.floor(Math.random() * 2000))
           } else {
             // 最终失败：账号已创建但拿不到 Token
-            return { status: 'failed', email: this.email, error: `[SSOToken] ${errMsg} (tài khoản đã được tạo, có thể nhập thủ công để làm mới)` }
+            return {
+              status: 'failed',
+              email: this.email,
+              error: `[SSOToken] ${errMsg} (tài khoản đã được tạo, có thể nhập thủ công để làm mới)`
+            }
           }
         }
       }
@@ -1733,6 +2335,16 @@ export class Registrar {
       const verify = await this.withTimeout(this.verifyAlive(token), 60000, 'VerifyAlive')
       if (verify.suspended) {
         return { status: 'failed', email: this.email, error: 'suspended' }
+      }
+      // Chỉ kiểm tra 'suspended' là chưa đủ: verifyAlive còn trả { alive: false } khi làm mới token
+      // thất bại hoặc truy vấn hạn mức thất bại. Trước đây các tài khoản chưa hề được xác minh vẫn
+      // được báo là 'success', thêm vào pool rồi lỗi ở mọi request thật.
+      if (verify.alive !== true) {
+        return {
+          status: 'failed',
+          email: this.email,
+          error: String(verify.error || 'verification failed')
+        }
       }
 
       this.emitStep('done')
@@ -1760,11 +2372,16 @@ export class Registrar {
    */
   private resolvedProxyUrl(): string | undefined {
     // 代理链启用时 cfg.proxy 是本地中继地址，审计应显示真正的目标代理
-    return (this.chainTargetProxy && this.chainTargetProxy.trim())
-      || (this.cfg.proxy && this.cfg.proxy.trim())
-      || process.env.HTTPS_PROXY || process.env.https_proxy
-      || process.env.HTTP_PROXY || process.env.http_proxy
-      || getSystemProxy() || undefined
+    return (
+      (this.chainTargetProxy && this.chainTargetProxy.trim()) ||
+      (this.cfg.proxy && this.cfg.proxy.trim()) ||
+      process.env.HTTPS_PROXY ||
+      process.env.https_proxy ||
+      process.env.HTTP_PROXY ||
+      process.env.http_proxy ||
+      getSystemProxy() ||
+      undefined
+    )
   }
 
   /** 输出本次注册使用的指纹摘要（用于审计与后续复用） */
@@ -1801,15 +2418,24 @@ export class Registrar {
   }
 
   /** 手动模式 - 设置邮箱后继续注册流程到发送 OTP */
-  async runManualPhase2(email: string, fullName?: string): Promise<{ success: boolean; error?: string }> {
+  async runManualPhase2(
+    email: string,
+    fullName?: string
+  ): Promise<{ success: boolean; error?: string }> {
     this.email = email
     if (fullName) this.cfg.fullName = fullName
 
     try {
       // 幂等只读步骤：retry + 超时看门狗 + session refresh；后续非幂等步骤仅加超时快速失败
       const STEP_TIMEOUT = 55000
-      await this.retryStep('Portal', () => this.step4Portal(), 3, { timeoutMs: 35000, refreshSession: true })
-      await this.retryStep('WorkflowInit', () => this.step5WorkflowInit(), 2, { timeoutMs: 35000, refreshSession: true })
+      await this.retryStep('Portal', () => this.step4Portal(), 3, {
+        timeoutMs: 35000,
+        refreshSession: true
+      })
+      await this.retryStep('WorkflowInit', () => this.step5WorkflowInit(), 2, {
+        timeoutMs: 35000,
+        refreshSession: true
+      })
 
       const status = await this.withTimeout(this.step6SubmitEmail(), STEP_TIMEOUT, 'SubmitEmail')
       if (status !== 'signup') return { success: false, error: 'Email này đã được đăng ký' }
@@ -1845,10 +2471,16 @@ export class Registrar {
         } catch (err) {
           const errMsg = (err as Error).message
           if (ssoAttempt < SSO_MAX_RETRIES) {
-            this.log(`[SSO] Bước cuối thất bại, thử lại nội bộ (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`)
+            this.log(
+              `[SSO] Bước cuối thất bại, thử lại nội bộ (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`
+            )
             await this.abortableSleep(3000 + Math.floor(Math.random() * 2000))
           } else {
-            return { status: 'failed', email: this.email, error: `[SSOToken] ${errMsg} (tài khoản đã được tạo, có thể nhập thủ công để làm mới)` }
+            return {
+              status: 'failed',
+              email: this.email,
+              error: `[SSOToken] ${errMsg} (tài khoản đã được tạo, có thể nhập thủ công để làm mới)`
+            }
           }
         }
       }
@@ -1857,6 +2489,14 @@ export class Registrar {
       const verify = await this.withTimeout(this.verifyAlive(token), 60000, 'VerifyAlive')
       if (verify.suspended) {
         return { status: 'failed', email: this.email, error: 'suspended' }
+      }
+      // Xem chú thích ở run(): { alive: false } cũng là thất bại, không được báo là thành công.
+      if (verify.alive !== true) {
+        return {
+          status: 'failed',
+          email: this.email,
+          error: String(verify.error || 'verification failed')
+        }
       }
 
       return {

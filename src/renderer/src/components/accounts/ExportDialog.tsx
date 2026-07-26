@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Button, Badge } from '../ui'
 import { X, FileJson, FileText, Table, Clipboard, Check, Download, Key, Braces } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, copyText } from '@/lib/utils'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account } from '@/types/account'
@@ -38,7 +38,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
   // 生成导出内容
   const generateContent = (format: ExportFormat): string => {
     switch (format) {
-      case 'json':
+      case 'json': {
         // 使用 store 的 exportAccounts 函数导出完整数据
         const exportData = exportAccounts(accounts.map(a => a.id))
         // 如果不包含凭证，移除敏感信息
@@ -54,6 +54,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
           }))
         }
         return JSON.stringify(exportData, null, 2)
+      }
 
       case 'oidc': {
         // 精简 JSON：只含关键凭证（邮箱/密码/refreshToken/clientId/clientSecret/provider）
@@ -96,9 +97,9 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
           return lines.join('\n')
         }).join('\n\n---\n\n')
 
-      case 'csv':
+      case 'csv': {
         // CSV 格式：包含凭证时可用于导入
-        const headers = includeCredentials 
+        const headers = includeCredentials
           ? ['邮箱', '昵称', '登录方式', 'RefreshToken', 'ClientId', 'ClientSecret', 'Region']
           : ['邮箱', '昵称', '登录方式', '订阅类型', '订阅标题', '已用量', '总额度']
         const rows = accounts.map(acc => includeCredentials 
@@ -122,9 +123,10 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
             ]
         )
         // 添加 BOM 以支持 Excel 中文
-        return '\ufeff' + [headers, ...rows].map(row => 
+        return '\ufeff' + [headers, ...rows].map(row =>
           row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')
         ).join('\n')
+      }
 
       case 'kami':
         // 卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret----登录方式
@@ -164,7 +166,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
     const count = accounts.length
 
     if (selectedFormat === 'clipboard') {
-      await navigator.clipboard.writeText(content)
+      await copyText(content)
       setCopied(true)
       setTimeout(() => {
         setCopied(false)
@@ -290,7 +292,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
           {(selectedFormat === 'kami' || selectedFormat === 'oidc') && (
             <Button variant="outline" disabled={copied} onClick={async () => {
               const content = generateContent(selectedFormat)
-              await navigator.clipboard.writeText(content)
+              await copyText(content)
               setCopied(true)
               setTimeout(() => {
                 setCopied(false)

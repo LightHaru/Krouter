@@ -4,7 +4,7 @@ import { execFile, spawn } from 'child_process'
 import { promises as fs, readFileSync } from 'fs'
 import os from 'os'
 import path from 'path'
-import { WebStore, hashPassword, verifyPassword, type UserRecord } from './store'
+import { WebStore, hashPasswordAsync, verifyPasswordAsync, type UserRecord } from './store'
 import {
   type AccountLike,
   checkAccountStatus,
@@ -36,6 +36,7 @@ import {
   ensureKiroSettingsFile,
   ensureMcpConfig,
   ensureSteeringFolder,
+  getKiroAvailableModels,
   getKiroSettings,
   readSteeringFile,
   saveKiroSettings,
@@ -93,13 +94,18 @@ import {
 } from './services/protonBrowserRuntime'
 import { getDashboardTunnelRuntime } from './services/dashboardTunnel'
 import { mergePeerAccountData, pushAccountDataToRemote, summarizeAccounts } from './services/accountSync'
+import type { AccountMergeResult } from './services/accountSync'
 import {
   getProxyMaintenanceRuntime,
   IPLOCATE_PROXY_SOURCE
 } from './services/proxyMaintenance'
+import type { ProxyMaintenanceRuntime } from './services/proxyMaintenance'
 
 type JsonValue = unknown
-type SseClient = ServerResponse
+// Mỗi kết nối SSE nhớ luôn user sở hữu để sự kiện riêng tư không phát tán ra
+// mọi client đang mở.
+type SseClient = { res: ServerResponse; userId: string }
+type EmitFn = (channel: string, ...args: unknown[]) => void
 
 function loadRuntimeEnvFile(): void {
   const configuredDataDir = process.env.KROUTER_DATA_DIR
@@ -150,11 +156,25 @@ const LEGACY_SESSION_COOKIE_NAME = 'kam_session'
 const TOKEN_REFRESH_BEFORE_EXPIRY_MS = 5 * 60 * 1000
 const BACKEND_AUTO_REFRESH_MIN_INTERVAL_MS = 60 * 1000
 const backendAutoRefreshTimers = new Map<string, ReturnType<typeof setInterval>>()
+/** Chu kỳ (ms) mà timer hiện tại của mỗi user đang chạy — dùng để tránh dựng lại timer vô ích. */
+const backendAutoRefreshIntervals = new Map<string, number>()
 const backendAutoRefreshRunning = new Set<string>()
 const KROUTER_NPM_PACKAGE = '@lightharu/krouter'
 const KROUTER_NPM_LATEST_URL = 'https://registry.npmjs.org/@lightharu%2Fkrouter/latest'
 const KROUTER_NPM_PACKAGE_URL = 'https://registry.npmjs.org/@lightharu%2Fkrouter'
 const ACCOUNT_SYNC_PASSWORD_SETTING_KEY = 'accountSyncPassword'
+const DEFAULT_MAX_JSON_BODY_BYTES = 1024 * 1024
+const ACCOUNT_SYNC_MAX_BODY_BYTES = 16 * 1024 * 1024
+// /api/ipc đã qua xác thực và mang cả tài liệu account (saveAccounts,
+// mergePeerAccounts) nên cần hạn mức rộng hơn mặc định.
+const IPC_MAX_BODY_BYTES = 16 * 1024 * 1024
+const PROXY_LOGS_MAX_ENTRIES = 1000
+const PROXY_LOGS_MAX_BYTES = 1024 * 1024
+const AUTH_ATTEMPT_WINDOW_MS = 5 * 60 * 1000
+const AUTH_ATTEMPT_LIMIT = 10
+const AUTH_BLOCK_MAX_MS = 15 * 60 * 1000
+const AUTH_ATTEMPT_MAP_LIMIT = 5000
+const SHUTDOWN_TIMEOUT_MS = 10000
 let krouterUpdatePromise: Promise<Record<string, unknown>> | null = null
 
 type AccountSyncPasswordSetting = {
@@ -195,7 +215,7 @@ const serveStaticAssets = shouldServeStatic()
 
 function packageVersion(): string {
   try {
-    const raw = require('fs').readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')
+    const raw = readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')
     return JSON.parse(raw).version || '0.0.0'
   } catch {
     return '0.0.0'
@@ -218,42 +238,103 @@ function sendHtml(response: ServerResponse, status: number, html: string): void 
   response.end(html)
 }
 
-function parseCookies(request: IncomingMessage): Record<string, string> {
-  const header = request.headers.cookie || ''
-  return Object.fromEntries(
-    header
-      .split(';')
-      .map((part) => part.trim())
-      .filter(Boolean)
-      .map((part) => {
-        const index = part.indexOf('=')
-        if (index === -1) return [part, '']
-        return [decodeURIComponent(part.slice(0, index)), decodeURIComponent(part.slice(index + 1))]
-      })
-  )
+// Một cookie hỏng (ví dụ lạc dấu '%') không được phép làm hỏng cả request:
+// decodeURIComponent ném URIError nên phải bọc try/catch và lấy chuỗi thô.
+function decodeCookiePart(value: string): string | undefined {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return undefined
+  }
 }
 
-function sessionCookie(sessionId: string, expiresAt: number): string {
-  const secure = process.env.COOKIE_SECURE === 'true' ? '; Secure' : ''
-  return [
+function parseCookies(request: IncomingMessage): Record<string, string> {
+  const header = request.headers.cookie || ''
+  const cookies: Record<string, string> = {}
+  for (const rawPart of header.split(';')) {
+    const part = rawPart.trim()
+    if (!part) continue
+    const index = part.indexOf('=')
+    if (index === -1) {
+      cookies[part] = ''
+      continue
+    }
+    const rawName = part.slice(0, index)
+    const rawValue = part.slice(index + 1)
+    cookies[decodeCookiePart(rawName) ?? rawName] = decodeCookiePart(rawValue) ?? rawValue
+  }
+  return cookies
+}
+
+function isSecureRequest(request: IncomingMessage): boolean {
+  if ((request.socket as { encrypted?: boolean }).encrypted) return true
+  const forwardedProto = String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase()
+  return forwardedProto === 'https'
+}
+
+// Mặc định bật Secure vì sản phẩm publish dashboard qua cloudflared. Chỉ tắt khi
+// COOKIE_SECURE=false hoặc khi request đến bằng HTTP thuần trên loopback (dev).
+function shouldMarkCookieSecure(request: IncomingMessage): boolean {
+  if (process.env.COOKIE_SECURE === 'false') return false
+  if (process.env.COOKIE_SECURE === 'true') return true
+  if (isSecureRequest(request)) return true
+  return !isLoopbackRequest(request)
+}
+
+function sessionCookie(request: IncomingMessage, sessionId: string, expiresAt: number): string {
+  const parts = [
     `${SESSION_COOKIE_NAME}=${encodeURIComponent(sessionId)}`,
     'HttpOnly',
     'SameSite=Lax',
     'Path=/',
-    `Expires=${new Date(expiresAt).toUTCString()}`,
-    secure
-  ].join('; ')
+    `Expires=${new Date(expiresAt).toUTCString()}`
+  ]
+  if (shouldMarkCookieSecure(request)) parts.push('Secure')
+  return parts.join('; ')
 }
 
 function clearCookie(name: string): string {
   return `${name}=; HttpOnly; SameSite=Lax; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT`
 }
 
-async function readJson(request: IncomingMessage): Promise<any> {
+function httpError(statusCode: number, message: string): Error {
+  return Object.assign(new Error(message), { statusCode })
+}
+
+// Chặn body khổng lồ trên các endpoint chưa xác thực: đếm dồn từng chunk và
+// hủy kết nối ngay khi vượt ngưỡng thay vì gom hết vào RAM.
+async function readJson(request: IncomingMessage, maxBytes = DEFAULT_MAX_JSON_BODY_BYTES): Promise<Record<string, unknown> | null> {
+  const contentType = String(request.headers['content-type'] || '').trim()
+  // Thiếu content-type vẫn chấp nhận để không phá client cũ.
+  if (contentType && !/^application\/json\b/i.test(contentType)) {
+    throw httpError(415, 'Unsupported content type, expected application/json')
+  }
+  // pause() chứ KHÔNG destroy(): IncomingMessage.destroy() phá luôn socket bên dưới khi
+  // request chưa đọc hết, nên phản hồi 413 viết sau đó rơi vào socket đã chết và client
+  // chỉ thấy ECONNRESET. Ngừng đọc là đủ để không phình RAM; socket được đóng ở tầng
+  // gửi phản hồi (Connection: close).
+  const declaredLength = Number(request.headers['content-length'])
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    request.pause()
+    throw httpError(413, 'Payload too large')
+  }
   const chunks: Buffer[] = []
-  for await (const chunk of request) chunks.push(Buffer.from(chunk))
+  let total = 0
+  for await (const chunk of request) {
+    const buffer = Buffer.from(chunk)
+    total += buffer.length
+    if (total > maxBytes) {
+      request.pause()
+      throw httpError(413, 'Payload too large')
+    }
+    chunks.push(buffer)
+  }
   if (chunks.length === 0) return null
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  } catch {
+    throw httpError(400, 'Invalid JSON body')
+  }
 }
 
 function getUser(request: IncomingMessage): UserRecord | undefined {
@@ -269,12 +350,20 @@ function isLoopbackRequest(request: IncomingMessage): boolean {
     address === 'localhost'
 }
 
+// So sánh bí mật theo thời gian hằng định: băm cả hai vế trước để độ dài luôn
+// bằng nhau, tránh lộ độ dài/tiền tố token qua thời gian phản hồi.
+function secretsMatch(provided: string, expected: string): boolean {
+  const providedHash = crypto.createHash('sha256').update(provided).digest()
+  const expectedHash = crypto.createHash('sha256').update(expected).digest()
+  return crypto.timingSafeEqual(providedHash, expectedHash)
+}
+
 function getCliUser(request: IncomingMessage): UserRecord | undefined {
   if (!isLoopbackRequest(request)) return undefined
   const expected = String(process.env.KROUTER_CLI_TOKEN || process.env.KAM_CLI_TOKEN || '').trim()
   if (!expected) return undefined
   const provided = String(request.headers['x-krouter-cli-token'] || request.headers['x-kam-cli-token'] || '').trim()
-  if (provided !== expected) return undefined
+  if (!secretsMatch(provided, expected)) return undefined
   return store.getUsers().find(item => item.role === 'admin') || store.getUsers()[0]
 }
 
@@ -298,21 +387,74 @@ function getAccountSyncPasswordSetting(user: UserRecord): AccountSyncPasswordSet
   return store.getUserSetting<AccountSyncPasswordSetting>(user.id, ACCOUNT_SYNC_PASSWORD_SETTING_KEY, {})
 }
 
-function verifyAccountSyncPassword(user: UserRecord, password: string): boolean {
+async function verifyAccountSyncPassword(user: UserRecord, password: string): Promise<boolean> {
   const setting = getAccountSyncPasswordSetting(user)
   if (!setting.enabled || !setting.hash || !setting.salt || !password) return false
-  const { hash } = hashPassword(password, setting.salt)
+  const { hash } = await hashPasswordAsync(password, setting.salt)
   const expected = Buffer.from(setting.hash, 'hex')
   const actual = Buffer.from(hash, 'hex')
-  if (expected.length !== actual.length) return false
+  if (expected.length === 0 || expected.length !== actual.length) return false
   return crypto.timingSafeEqual(actual, expected)
+}
+
+// Đếm số lần thử sai theo IP để chặn brute-force và chặn luôn việc dội PBKDF2
+// làm nghẽn tiến trình. Chặn tăng dần: 2^n phút, tối đa 15 phút.
+type AuthAttemptRecord = { count: number; firstAt: number; blockCount: number; blockedUntil?: number }
+const authAttempts = new Map<string, AuthAttemptRecord>()
+
+function clientIp(request: IncomingMessage): string {
+  return request.socket.remoteAddress || 'unknown'
+}
+
+function pruneAuthAttempts(now: number): void {
+  if (authAttempts.size <= AUTH_ATTEMPT_MAP_LIMIT) return
+  for (const [key, record] of authAttempts) {
+    const blocked = record.blockedUntil !== undefined && record.blockedUntil > now
+    if (!blocked && now - record.firstAt > AUTH_ATTEMPT_WINDOW_MS) authAttempts.delete(key)
+  }
+}
+
+function authRetryAfterSeconds(key: string, now = Date.now()): number {
+  const record = authAttempts.get(key)
+  if (!record || record.blockedUntil === undefined) return 0
+  if (record.blockedUntil <= now) return 0
+  return Math.max(1, Math.ceil((record.blockedUntil - now) / 1000))
+}
+
+function registerAuthFailure(key: string, now = Date.now()): void {
+  pruneAuthAttempts(now)
+  const record = authAttempts.get(key)
+  if (!record || now - record.firstAt > AUTH_ATTEMPT_WINDOW_MS) {
+    authAttempts.set(key, { count: 1, firstAt: now, blockCount: record?.blockCount || 0 })
+    return
+  }
+  record.count += 1
+  if (record.count > AUTH_ATTEMPT_LIMIT) {
+    record.blockCount += 1
+    record.blockedUntil = now + Math.min(2 ** record.blockCount * 60 * 1000, AUTH_BLOCK_MAX_MS)
+    record.count = 0
+    record.firstAt = now
+  }
+}
+
+function clearAuthFailures(key: string): void {
+  authAttempts.delete(key)
+}
+
+function rejectWhenThrottled(request: IncomingMessage, response: ServerResponse, scope: string): boolean {
+  const key = `${scope}:${clientIp(request)}`
+  const retryAfter = authRetryAfterSeconds(key)
+  if (retryAfter <= 0) return false
+  response.setHeader('Retry-After', String(retryAfter))
+  sendJson(response, 429, { error: 'Too many failed attempts. Please try again later.', retryAfter })
+  return true
 }
 
 async function saveAccountSyncPassword(user: UserRecord, password: string): Promise<AccountSyncPasswordSetting> {
   const cleanPassword = String(password || '').trim()
   if (cleanPassword.length < 8) throw new Error('Account sync password must be at least 8 characters')
   const current = getAccountSyncPasswordSetting(user)
-  const { hash, salt } = hashPassword(cleanPassword)
+  const { hash, salt } = await hashPasswordAsync(cleanPassword)
   const now = Date.now()
   const next: AccountSyncPasswordSetting = {
     enabled: true,
@@ -344,16 +486,42 @@ function publicUser(user: UserRecord): { id: string; email: string; name?: strin
   return { id: user.id, email: user.email, name: user.name, role: user.role }
 }
 
-function emit(channel: string, ...args: unknown[]): void {
+function broadcast(userId: string | undefined, channel: string, args: unknown[]): void {
   const payload = JSON.stringify({ channel, args })
   for (const client of sseClients) {
-    client.write(`data: ${payload}\n\n`)
+    if (userId !== undefined && client.userId !== userId) continue
+    try {
+      client.res.write(`data: ${payload}\n\n`)
+    } catch (error) {
+      console.warn('[Server] Không gửi được sự kiện SSE:', error instanceof Error ? error.message : error)
+    }
   }
+}
+
+// emit() chỉ dành cho sự kiện thật sự toàn cục (không mang dữ liệu riêng của user).
+function emit(channel: string, ...args: unknown[]): void {
+  broadcast(undefined, channel, args)
+}
+
+// Sự kiện gắn với một user chỉ được gửi tới đúng các socket của user đó.
+function emitToUser(userId: string, channel: string, ...args: unknown[]): void {
+  broadcast(userId, channel, args)
+}
+
+const userEmitters = new Map<string, EmitFn>()
+
+function emitForUser(userId: string): EmitFn {
+  let emitter = userEmitters.get(userId)
+  if (!emitter) {
+    emitter = (channel: string, ...args: unknown[]): void => emitToUser(userId, channel, ...args)
+    userEmitters.set(userId, emitter)
+  }
+  return emitter
 }
 
 async function startAutoProxyRuntimes(): Promise<void> {
   for (const user of store.getUsers()) {
-    const runtime = getProxyRuntime(store, user.id, emit)
+    const runtime = getProxyRuntime(store, user.id, emitForUser(user.id))
     const result = await runtime.ensureAutoStarted('server-boot')
     if (!result.success) {
       console.error(`[Server] Proxy auto-start skipped for ${user.email}: ${result.error}`)
@@ -365,7 +533,7 @@ async function startAutoKProxyRuntimes(): Promise<void> {
   for (const user of store.getUsers()) {
     const config = store.getUserSetting<Record<string, unknown>>(user.id, 'kproxyConfig', {})
     if (!config.autoStart) continue
-    const runtime = getKProxyRuntime(store, user.id, emit)
+    const runtime = getKProxyRuntime(store, user.id, emitForUser(user.id))
     const result = await runtime.start(config)
     if (!result.success) {
       console.error(`[Server] K-Proxy auto-start skipped for ${user.email}: ${result.error}`)
@@ -426,7 +594,7 @@ function defaultAccountData(): Record<string, unknown> {
       failureThreshold: 3,
       testUrl: 'https://api.ipify.org?format=json',
       testTimeoutMs: 8000,
-      maxUsableLatencyMs: 1000,
+      maxUsableLatencyMs: 2500,
       autoValidateIntervalMin: 0,
       autoValidateConcurrency: 5,
       upstreamProxy: '',
@@ -508,12 +676,11 @@ function mergeAccountData(currentRaw: unknown, incomingRaw: unknown): Record<str
     : {}
   const maxUsableLatencyMs = Math.max(
     100,
-    Number(incomingProxyPoolConfig.maxUsableLatencyMs ?? currentProxyPoolConfig.maxUsableLatencyMs) || 1000
+    Number(incomingProxyPoolConfig.maxUsableLatencyMs ?? currentProxyPoolConfig.maxUsableLatencyMs) || 2500
   )
   const proxyPoolConfig = {
     ...currentProxyPoolConfig,
     ...incomingProxyPoolConfig,
-    sourceRemoveDead: true,
     maxUsableLatencyMs
   }
   const currentBindings = current.accountProxyBindings && typeof current.accountProxyBindings === 'object'
@@ -542,20 +709,6 @@ function mergeAccountData(currentRaw: unknown, incomingRaw: unknown): Record<str
     const removed = (proxyPool[id] || currentProxyPool[id]) as Record<string, unknown> | undefined
     if (typeof removed?.url === 'string') rejectedProxyUrls.add(removed.url)
     delete proxyPool[id]
-  }
-  for (const [id, value] of Object.entries(proxyPool)) {
-    const entry = value && typeof value === 'object' ? value as Record<string, unknown> : {}
-    const latencyMs = Number(entry.latencyMs)
-    const usable = entry.enabled === true &&
-      entry.status === 'alive' &&
-      Number.isFinite(latencyMs) &&
-      latencyMs >= 0 &&
-      latencyMs <= maxUsableLatencyMs
-    if (!usable) {
-      rejectedProxyIds.add(id)
-      if (typeof entry.url === 'string') rejectedProxyUrls.add(entry.url)
-      delete proxyPool[id]
-    }
   }
   for (const [accountId, binding] of Object.entries(accountProxyBindings)) {
     if (rejectedProxyIds.has(binding) || rejectedProxyUrls.has(binding)) {
@@ -628,7 +781,11 @@ async function checkForUpdatesManual(): Promise<Record<string, unknown>> {
       headers: { 'Accept': 'application/json' }
     })
     if (!latestResponse.ok) throw new Error(`npm registry returned ${latestResponse.status}`)
-    const latest = await latestResponse.json() as Record<string, any>
+    const latest = (await latestResponse.json()) as {
+      version?: string
+      description?: string
+      dist?: { tarball?: string; unpackedSize?: number }
+    }
     const latestVersion = String(latest.version || currentVersion).replace(/^v/i, '')
     let publishedAt: string | undefined
     try {
@@ -636,7 +793,7 @@ async function checkForUpdatesManual(): Promise<Record<string, unknown>> {
         headers: { 'Accept': 'application/json' }
       })
       if (packageResponse.ok) {
-        const metadata = await packageResponse.json() as Record<string, any>
+        const metadata = (await packageResponse.json()) as { time?: Record<string, string> }
         publishedAt = metadata.time?.[latestVersion]
       }
     } catch {
@@ -658,11 +815,18 @@ async function checkForUpdatesManual(): Promise<Record<string, unknown>> {
         size: latest.dist.unpackedSize || 0
       }] : []
     }
-  } catch (error) {
+  } catch {
     try {
       const response = await fetch('https://api.github.com/repos/LightHaru/Krouter/releases/latest')
       if (!response.ok) throw new Error(`GitHub returned ${response.status}`)
-      const release = await response.json() as Record<string, any>
+      const release = (await response.json()) as {
+        tag_name?: string
+        name?: string
+        body?: string
+        html_url?: string
+        published_at?: string
+        assets?: Array<{ name?: string; browser_download_url?: string; size?: number }>
+      }
       const latestVersion = String(release.tag_name || currentVersion).replace(/^v/i, '')
       return {
         hasUpdate: compareVersions(latestVersion, currentVersion) > 0,
@@ -822,8 +986,11 @@ type StoredAccountData = Record<string, unknown> & {
   proxyPool?: Record<string, { id?: string; url?: string; enabled?: boolean; status?: string }>
 }
 
-function errorMessageFromResult(result: any): string {
-  return result?.error?.message || result?.error || 'Unknown error'
+function errorMessageFromResult(result: unknown): string {
+  const error = isPlainRecord(result) ? result.error : undefined
+  if (isPlainRecord(error) && typeof error.message === 'string' && error.message) return error.message
+  if (typeof error === 'string' && error) return error
+  return 'Unknown error'
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -923,8 +1090,40 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
   return Math.max(min, Math.min(parsed, max))
 }
 
-function normalizeBackgroundStatusData(data: any): Record<string, unknown> {
-  const credentials = data?.newCredentials as { accessToken?: string; refreshToken?: string; expiresAt?: number } | undefined
+/**
+ * Hình dạng phần `data` mà checkAccountStatus trả về — chỉ liệt kê những field mà server
+ * thật sự đọc. API upstream có thể trả thêm field khác, chúng đi qua nguyên vẹn.
+ */
+interface BackgroundStatusData {
+  newCredentials?: { accessToken?: string; refreshToken?: string; expiresAt?: number }
+  subscription?: Record<string, unknown> & {
+    type?: string
+    title?: string
+    rawType?: string
+    subscriptionManagementTarget?: string
+    managementTarget?: string
+  }
+  usage?: unknown
+  subscriptionType?: string
+  subscriptionTitle?: string
+  daysRemaining?: number
+  expiresAt?: number
+  email?: string
+  userId?: string
+  profileArn?: string
+  status?: string
+  errorMessage?: string
+}
+
+/** Kết quả bọc ngoài của checkAccountStatus. */
+interface BackgroundStatusResult {
+  success?: boolean
+  data?: BackgroundStatusData
+  error?: unknown
+}
+
+function normalizeBackgroundStatusData(data: BackgroundStatusData | undefined): Record<string, unknown> {
+  const credentials = data?.newCredentials
   const subscription = data?.subscription || {}
   return {
     accessToken: credentials?.accessToken,
@@ -946,6 +1145,61 @@ function normalizeBackgroundStatusData(data: any): Record<string, unknown> {
     profileArn: data?.profileArn,
     status: data?.status,
     errorMessage: data?.errorMessage
+  }
+}
+
+// Payload phát ra ngoài không được mang bí mật. Bản đầy đủ vẫn phải giữ lại cho
+// applyRefreshDataToStoredAccount (nó cần accessToken/refreshToken để lưu store),
+// nên chỉ lọc đúng ở ranh giới phát sự kiện.
+type BackgroundResultPayload = { id: string; success: boolean; data?: unknown; error?: string }
+
+function sanitizeBackgroundPayloadForEmit(payload: BackgroundResultPayload): BackgroundResultPayload {
+  if (!isPlainRecord(payload.data)) return payload
+  const safeData: Record<string, unknown> = { ...payload.data }
+  delete safeData.accessToken
+  delete safeData.refreshToken
+  delete safeData.clientSecret
+  // expiresIn/expiresAt phải đi cùng token. Nếu để lại, renderer sẽ fallback về accessToken
+  // CŨ (accounts.ts: `refreshData?.accessToken || account.credentials.accessToken`) rồi gắn
+  // hạn MỚI cho nó, ghi đè bản đúng của server -> token chết bị coi là còn sống và
+  // accountNeedsBackendRefresh không bao giờ chọn nó nữa.
+  delete safeData.expiresIn
+  delete safeData.expiresAt
+  return { ...payload, data: safeData }
+}
+
+/**
+ * Đối chiếu kết quả merge với những gì store thật sự giữ lại sau khi ghi.
+ * setAccountData còn chạy enforceDeletionTombstones nên một account vừa merge vẫn có thể
+ * bị loại; nếu báo cáo dựng từ dữ liệu trước khi lọc thì API sẽ báo thành công cho account
+ * đã biến mất.
+ */
+function reconcileMergeWithStore(
+  merged: AccountMergeResult,
+  userId: string
+): {
+  storedAccounts: Record<string, unknown>
+  addedAccountIds: string[]
+  droppedAccountIds: string[]
+  syncedAccountIds: string[]
+} {
+  const stored = store.getAccountData(userId) as Record<string, unknown> | undefined
+  const rawAccounts = stored?.accounts
+  const storedAccounts = rawAccounts && typeof rawAccounts === 'object' ? (rawAccounts as Record<string, unknown>) : {}
+  const addedAccountIds: string[] = []
+  const droppedAccountIds: string[] = []
+  for (const entry of merged.addedAccountTargets) {
+    if (entry.targetId in storedAccounts) addedAccountIds.push(entry.sourceId)
+    else droppedAccountIds.push(entry.sourceId)
+  }
+  if (droppedAccountIds.length > 0) {
+    console.warn(`[AccountSync] ${droppedAccountIds.length} account bị store loại bỏ sau khi ghi:`, droppedAccountIds)
+  }
+  return {
+    storedAccounts,
+    addedAccountIds,
+    droppedAccountIds,
+    syncedAccountIds: merged.syncedAccountIds.filter((id) => !droppedAccountIds.includes(id))
   }
 }
 
@@ -1050,7 +1304,7 @@ function getStoredAccounts(accountData: StoredAccountData): Record<string, Store
 function applyRefreshDataToStoredAccount(
   id: string,
   account: StoredAccount,
-  data: Record<string, any> | undefined,
+  data: Record<string, unknown> | undefined,
   now: number
 ): StoredAccount {
   const credentials = account.credentials || {}
@@ -1150,7 +1404,7 @@ async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): P
       if (lifecycleChanged) {
         accountData.accounts = accounts
         await store.setAccountData(user.id, accountData)
-        await getProxyRuntime(store, user.id, emit).syncAccountsFromStoreAsync()
+        await getProxyRuntime(store, user.id, emitForUser(user.id)).syncAccountsFromStoreAsync()
       }
       return
     }
@@ -1174,7 +1428,7 @@ async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): P
       if (lifecycleChanged) {
         accountData.accounts = accounts
         await store.setAccountData(user.id, accountData)
-        await getProxyRuntime(store, user.id, emit).syncAccountsFromStoreAsync()
+        await getProxyRuntime(store, user.id, emitForUser(user.id)).syncAccountsFromStoreAsync()
       }
       return
     }
@@ -1187,7 +1441,7 @@ async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): P
     // Collect refresh outcomes instead of mutating the stale snapshot. The write-back
     // re-reads fresh store state so a delete that lands during the (slow, networked)
     // refresh loop is not clobbered — otherwise the stale snapshot resurrects it.
-    const refreshPayloads: Array<{ id: string; success: boolean; data?: Record<string, any>; error?: string; finishedAt: number }> = []
+    const refreshPayloads: Array<{ id: string; success: boolean; data?: Record<string, unknown>; error?: string; finishedAt: number }> = []
     console.log(`[BackendAutoRefresh] ${user.email}: processing ${pending.length} account(s), reason=${reason}, syncInfo=${syncInfo}`)
 
     for (let index = 0; index < pending.length; index += concurrency) {
@@ -1207,7 +1461,9 @@ async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): P
               ? { id, success: true, data: refresh.data }
               : { id, success: false, error: errorMessageFromResult(refresh) }
           } else {
-            const status = await checkAccountStatus(accountForStatusCheck(backgroundAccount, needsTokenRefresh)) as any
+            const status = (await checkAccountStatus(
+          accountForStatusCheck(backgroundAccount, needsTokenRefresh)
+        )) as BackgroundStatusResult
             payload = status?.success && status.data
               ? { id, success: true, data: normalizeBackgroundStatusData(status.data) }
               : { id, success: false, error: errorMessageFromResult(status) }
@@ -1225,16 +1481,16 @@ async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): P
         refreshPayloads.push({
           id,
           success: payload.success,
-          data: payload.data as Record<string, any> | undefined,
+          data: payload.data as Record<string, unknown> | undefined,
           error: payload.error,
           finishedAt
         })
         changed = true
-        emit('background-refresh-result', payload)
+        emitToUser(user.id, 'background-refresh-result', sanitizeBackgroundPayloadForEmit(payload))
       }))
 
       completed += batch.length
-      emit('background-refresh-progress', { completed, total: pending.length, success: successCount, failed: failedCount })
+      emitToUser(user.id, 'background-refresh-progress', { completed, total: pending.length, success: successCount, failed: failedCount })
       if (index + concurrency < pending.length) await new Promise((resolve) => setTimeout(resolve, 100))
     }
 
@@ -1273,7 +1529,7 @@ async function runBackendAutoRefreshForUser(user: UserRecord, reason: string): P
 
       freshData.accounts = freshAccounts
       await store.setAccountData(user.id, freshData)
-      await getProxyRuntime(store, user.id, emit).syncAccountsFromStoreAsync()
+      await getProxyRuntime(store, user.id, emitForUser(user.id)).syncAccountsFromStoreAsync()
       await store.audit(user.id, 'backend-token-refresh', {
         reason,
         completed,
@@ -1292,11 +1548,14 @@ function clearBackendAutoRefreshForUser(userId: string): void {
   const timer = backendAutoRefreshTimers.get(userId)
   if (timer) clearInterval(timer)
   backendAutoRefreshTimers.delete(userId)
+  backendAutoRefreshIntervals.delete(userId)
 }
 
 function scheduleBackendAutoRefreshForUser(user: UserRecord, runNow: boolean): void {
-  clearBackendAutoRefreshForUser(user.id)
-  if (!backendAutoRefreshEnabled()) return
+  if (!backendAutoRefreshEnabled()) {
+    clearBackendAutoRefreshForUser(user.id)
+    return
+  }
   const accountData = (store.getAccountData(user.id) || defaultAccountData()) as StoredAccountData
   if (accountData.autoRefreshEnabled === false) {
     console.log(`[BackendAutoRefresh] ${user.email}: token refresh disabled; account lifecycle reconciliation remains enabled`)
@@ -1304,11 +1563,28 @@ function scheduleBackendAutoRefreshForUser(user: UserRecord, runNow: boolean): v
 
   const intervalMinutes = clampNumber(accountData.autoRefreshInterval, 5, 1, 1440)
   const intervalMs = Math.max(BACKEND_AUTO_REFRESH_MIN_INTERVAL_MS, intervalMinutes * 60 * 1000)
+
+  // Hàm này được gọi lại sau MỌI lần saveAccounts, mà dashboard autosave 30 giây/lần.
+  // Nếu vô điều kiện clearInterval + setInterval thì chu kỳ 5 phút không bao giờ chạm mốc
+  // và token trên VPS hết hạn mà không có gì refresh. Chỉ dựng lại timer khi chu kỳ đổi.
+  const existing = backendAutoRefreshTimers.get(user.id)
+  if (existing && backendAutoRefreshIntervals.get(user.id) === intervalMs) {
+    if (runNow) {
+      const bootTimer = setTimeout(() => {
+        void runBackendAutoRefreshForUser(user, 'server-boot')
+      }, 2000)
+      bootTimer.unref?.()
+    }
+    return
+  }
+
+  clearBackendAutoRefreshForUser(user.id)
   const timer = setInterval(() => {
     void runBackendAutoRefreshForUser(user, 'interval')
   }, intervalMs)
   timer.unref?.()
   backendAutoRefreshTimers.set(user.id, timer)
+  backendAutoRefreshIntervals.set(user.id, intervalMs)
 
   if (runNow) {
     const initialTimer = setTimeout(() => {
@@ -1328,9 +1604,9 @@ async function startBackendAutoRefreshRuntimes(): Promise<void> {
   }
 }
 
-function proxyMaintenanceRuntimeForUser(user: UserRecord) {
-  return getProxyMaintenanceRuntime(store, user.id, emit, async () => {
-    await getProxyRuntime(store, user.id, emit).syncAccountsFromStoreAsync()
+function proxyMaintenanceRuntimeForUser(user: UserRecord): ProxyMaintenanceRuntime {
+  return getProxyMaintenanceRuntime(store, user.id, emitForUser(user.id), async () => {
+    await getProxyRuntime(store, user.id, emitForUser(user.id)).syncAccountsFromStoreAsync()
   })
 }
 
@@ -1344,7 +1620,7 @@ async function startProxyMaintenanceRuntimes(): Promise<void> {
   }
 }
 
-async function handleBackgroundBatch(method: string, args: unknown[]): Promise<{
+async function handleBackgroundBatch(method: string, args: unknown[], user: UserRecord): Promise<{
   success: boolean
   completed: number
   successCount: number
@@ -1372,7 +1648,9 @@ async function handleBackgroundBatch(method: string, args: unknown[]): Promise<{
             : { id: account.id, success: false, error: errorMessageFromResult(refresh) }
         } else {
           const allowRefresh = isRefresh && Boolean(account.needsTokenRefresh)
-          const status = await checkAccountStatus(accountForStatusCheck(account, allowRefresh)) as any
+          const status = (await checkAccountStatus(
+            accountForStatusCheck(account, allowRefresh)
+          )) as BackgroundStatusResult
           payload = status?.success && status.data
             ? { id: account.id, success: true, data: normalizeBackgroundStatusData(status.data) }
             : { id: account.id, success: false, error: errorMessageFromResult(status) }
@@ -1383,11 +1661,13 @@ async function handleBackgroundBatch(method: string, args: unknown[]): Promise<{
 
       if (payload.success) successCount++
       else failedCount++
-      emit(resultChannel, payload)
+      // Luồng này do chính user gọi và renderer cần token mới trả về để cập nhật
+      // store phía client, nên giữ nguyên payload nhưng chỉ gửi cho đúng user đó.
+      emitToUser(user.id, resultChannel, payload)
     }))
 
     completed += batch.length
-    emit(progressChannel, { completed, total: accounts.length, success: successCount, failed: failedCount })
+    emitToUser(user.id, progressChannel, { completed, total: accounts.length, success: successCount, failed: failedCount })
     if (index + concurrency < accounts.length) await new Promise((resolve) => setTimeout(resolve, 100))
   }
 
@@ -1396,8 +1676,8 @@ async function handleBackgroundBatch(method: string, args: unknown[]): Promise<{
 
 async function handleIpc(method: string, args: unknown[], user: UserRecord): Promise<unknown> {
   const settings = store.getUserSettings(user.id)
-  const proxyRuntime = getProxyRuntime(store, user.id, emit)
-  const kproxyRuntime = getKProxyRuntime(store, user.id, emit)
+  const proxyRuntime = getProxyRuntime(store, user.id, emitForUser(user.id))
+  const kproxyRuntime = getKProxyRuntime(store, user.id, emitForUser(user.id))
   switch (method) {
     case 'accountSyncGetStatus':
       return accountSyncPasswordStatus(user)
@@ -1428,16 +1708,19 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
       return packageVersion()
     case 'loadAccounts':
       {
-        const accountData = (store.getAccountData(user.id) || defaultAccountData()) as Record<string, unknown>
-        const hydrated = await hydrateAccountDataProfileArns(accountData)
-        if (hydrated.changed) await store.setAccountData(user.id, hydrated.data)
-        return hydrated.data
+        // Loading the Accounts page must remain a local operation. Resolving a
+        // missing profile ARN can refresh credentials and call Kiro endpoints;
+        // doing that here made one slow/offline account block the whole UI.
+        // Proxy maintenance and explicit account checks perform hydration where
+        // network failures can be isolated per account.
+        return (store.getAccountData(user.id) || defaultAccountData()) as Record<string, unknown>
       }
     case 'saveAccounts':
       {
         const merged = mergeAccountData(store.getAccountData(user.id), args[0])
         const hydrated = await hydrateAccountDataProfileArns(merged)
         await store.setAccountData(user.id, hydrated.data)
+        await getProxyRuntime(store, user.id, emitForUser(user.id)).syncRoutingStateFromStore()
         scheduleBackendAutoRefreshForUser(user, false)
         scheduleProxyMaintenanceForUser(user, false)
       }
@@ -1447,22 +1730,22 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
         const merged = mergePeerAccountData(store.getAccountData(user.id) || defaultAccountData(), args[0])
         const hydrated = await hydrateAccountDataProfileArns(merged.data)
         await store.setAccountData(user.id, hydrated.data)
+        await getProxyRuntime(store, user.id, emitForUser(user.id)).syncRoutingStateFromStore()
         scheduleBackendAutoRefreshForUser(user, false)
         scheduleProxyMaintenanceForUser(user, false)
-        const hydratedAccounts = hydrated.data.accounts && typeof hydrated.data.accounts === 'object'
-          ? hydrated.data.accounts as Record<string, unknown>
-          : {}
+        const reconciled = reconcileMergeWithStore(merged, user.id)
         return {
           success: true,
           totalIncoming: merged.totalIncoming,
-          added: merged.added,
+          added: reconciled.addedAccountIds.length,
           skipped: merged.skipped,
-          addedAccountIds: merged.addedAccountIds,
+          addedAccountIds: reconciled.addedAccountIds,
+          droppedAccountIds: reconciled.droppedAccountIds,
           skippedAccountIds: merged.skippedAccountIds,
           skippedAccounts: merged.skippedAccounts,
-          syncedAccountIds: merged.syncedAccountIds,
-          remoteAccounts: summarizeAccounts(hydratedAccounts),
-          remoteTotal: Object.keys(hydratedAccounts).length
+          syncedAccountIds: reconciled.syncedAccountIds,
+          remoteAccounts: summarizeAccounts(reconciled.storedAccounts),
+          remoteTotal: Object.keys(reconciled.storedAccounts).length
         }
       }
     case 'syncAccountsToRemote':
@@ -1488,7 +1771,7 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
     case 'cancelIamSsoLogin':
       return cancelIamSsoLogin()
     case 'startSocialLogin':
-      return startSocialLogin(args[0] as 'Google' | 'Github')
+      return startSocialLogin(args[0] as 'Google' | 'Github', user.id)
     case 'exchangeSocialToken':
       return exchangeSocialToken(String(args[0] || ''), String(args[1] || ''))
     case 'cancelSocialLogin':
@@ -1566,6 +1849,10 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
       return applyKrouterUpdate()
     case 'proxyGetStatus':
       return proxyRuntime.getStatus()
+    case 'proxyGetUsageAnalytics':
+      return proxyRuntime.getUsageAnalytics(args[0] as Parameters<typeof proxyRuntime.getUsageAnalytics>[0])
+    case 'proxyClearUsageAnalytics':
+      return proxyRuntime.clearUsageAnalytics()
     case 'proxyStart':
       return proxyRuntime.start(args[0] as Record<string, unknown>)
     case 'proxyStop':
@@ -1582,9 +1869,22 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
       return proxyRuntime.getLogsCount()
     case 'proxyClearLogs':
       return proxyRuntime.clearLogs()
-    case 'proxySaveLogs':
-      await store.setUserSetting(user.id, 'proxyLogs', args[0] || [])
+    case 'proxySaveLogs': {
+      // store.json bị ghi lại toàn bộ ở mỗi lần mutate, nên log của client phải
+      // bị chặn cả về kiểu, số dòng lẫn kích thước đã serialize.
+      const incomingLogs = args[0]
+      if (!Array.isArray(incomingLogs)) {
+        return { success: false, error: 'proxySaveLogs requires an array of log entries' }
+      }
+      const trimmedLogs = incomingLogs.slice(-PROXY_LOGS_MAX_ENTRIES)
+      const serializedBytes = Buffer.byteLength(JSON.stringify(trimmedLogs), 'utf8')
+      if (serializedBytes > PROXY_LOGS_MAX_BYTES) {
+        console.warn(`[Server] proxySaveLogs bị từ chối: ${serializedBytes} bytes vượt giới hạn ${PROXY_LOGS_MAX_BYTES}`)
+        return { success: false, error: 'Proxy logs payload is too large' }
+      }
+      await store.setUserSetting(user.id, 'proxyLogs', trimmedLogs)
       return { success: true }
+    }
     case 'proxyLoadLogs':
       return { success: true, logs: store.getUserSetting(user.id, 'proxyLogs', []) }
     case 'proxyAuditLog':
@@ -1625,10 +1925,26 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
       return proxyRuntime.testBedrock(args[0] as Parameters<typeof proxyRuntime.testBedrock>[0])
     case 'proxyGetBedrockStatus':
       return proxyRuntime.getBedrockStatus()
+    case 'chatgptOAuthGetStatus':
+      return proxyRuntime.getChatGPTOAuthStatus()
+    case 'chatgptOAuthStart':
+      return proxyRuntime.startChatGPTOAuth()
+    case 'chatgptOAuthSubmitCallback':
+      return proxyRuntime.submitChatGPTOAuthCallback(String(args[0] || ''))
+    case 'chatgptOAuthRefresh':
+      return proxyRuntime.refreshChatGPTCodexState(String(args[0] || '') || undefined)
+    case 'chatgptOAuthCancel':
+      return proxyRuntime.cancelChatGPTOAuth()
+    case 'chatgptOAuthLogout':
+      return proxyRuntime.logoutChatGPTAccount(String(args[0] || '') || undefined)
     case 'proxyTestXpixi':
       return proxyRuntime.testXpixi(args[0] as Parameters<typeof proxyRuntime.testXpixi>[0])
+    case 'proxyTestCustomApi':
+      return proxyRuntime.testCustomApi(args[0] as Parameters<typeof proxyRuntime.testCustomApi>[0])
     case 'getKiroAvailableModels':
-      return proxyRuntime.getModels()
+      return getKiroAvailableModels(
+        store.getAccountData(user.id) as { accounts?: Record<string, unknown> } | undefined
+      )
     case 'getKiroSettings':
       return getKiroSettings()
     case 'saveKiroSettings':
@@ -1703,9 +2019,9 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
     case 'dashboardTunnelStop':
       return dashboardTunnelRuntime.stop()
     case 'registrationStartAuto':
-      return registrationStartAuto(args[0] as Parameters<typeof registrationStartAuto>[0], emit)
+      return registrationStartAuto(args[0] as Parameters<typeof registrationStartAuto>[0], emitForUser(user.id))
     case 'registrationManualPhase1':
-      return registrationManualPhase1(args[0] as Parameters<typeof registrationManualPhase1>[0], emit)
+      return registrationManualPhase1(args[0] as Parameters<typeof registrationManualPhase1>[0], emitForUser(user.id))
     case 'registrationManualPhase2':
       return registrationManualPhase2(String(args[0] || ''), args[1] as string | undefined)
     case 'registrationManualPhase3':
@@ -1754,24 +2070,28 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
       return kproxyRuntime.resetStats()
     case 'accountSetProxyBinding': {
       const [accountId, proxyUrl] = args as [string, string | undefined]
-      const accountData = (store.getAccountData(user.id) || defaultAccountData()) as Record<string, any>
-      accountData.accountProxyBindings = { ...(accountData.accountProxyBindings || {}) }
+      const accountData = (store.getAccountData(user.id) || defaultAccountData()) as Record<string, unknown>
+      // Giữ tham chiếu có kiểu để không phải ép kiểu lại ở từng lần truy cập.
+      const bindings: Record<string, string> = {
+        ...((accountData.accountProxyBindings as Record<string, string> | undefined) || {})
+      }
+      accountData.accountProxyBindings = bindings
       if (!proxyUrl) {
-        delete accountData.accountProxyBindings[accountId]
+        delete bindings[accountId]
       } else {
-        const proxyPool = accountData.proxyPool || {}
+        const proxyPool = (accountData.proxyPool as Record<string, unknown> | undefined) || {}
         const matchingProxyId = Object.entries(proxyPool).find(([, proxy]) => {
           const entry = proxy as { id?: string; url?: string }
           return entry.id === proxyUrl || entry.url === proxyUrl
         })?.[0]
-        accountData.accountProxyBindings[accountId] = matchingProxyId || proxyUrl
+        bindings[accountId] = matchingProxyId || proxyUrl
       }
       await store.setAccountData(user.id, accountData)
       return { success: true }
     }
     case 'backgroundBatchRefresh':
     case 'backgroundBatchCheck':
-      return handleBackgroundBatch(method, args)
+      return handleBackgroundBatch(method, args, user)
     // Phase 13: Skills system
     case 'fetchSkillsList':
       return proxyRuntime.fetchSkillsList()
@@ -1797,6 +2117,8 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
       return kproxyRuntime.getHostsStatus()
     case 'kproxyToggleHosts':
       return kproxyRuntime.toggleHosts(Boolean(args[0]))
+    case 'kproxySetHostsIdeTypes':
+      return kproxyRuntime.setHostsIdeTypes(Array.isArray(args[0]) ? args[0] as string[] : [])
     // Phase 12: MITM HTTPS server
     case 'mitmGetStatus':
       return kproxyRuntime.mitmGetStatus()
@@ -1812,7 +2134,7 @@ async function handleIpc(method: string, args: unknown[], user: UserRecord): Pro
 async function handleAuth(request: IncomingMessage, response: ServerResponse, pathname: string): Promise<void> {
   if (pathname === '/api/auth/social/callback' && request.method === 'GET') {
     const callbackUrl = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`)
-    const result = handleSocialCallback(callbackUrl, emit)
+    const result = handleSocialCallback(callbackUrl, (uid) => (uid ? emitForUser(uid) : emit))
     sendAuthHtml(response, result.title, result.body)
     return
   }
@@ -1858,7 +2180,7 @@ async function handleAuth(request: IncomingMessage, response: ServerResponse, pa
       const session = await store.createSession(user.id)
       scheduleBackendAutoRefreshForUser(user, false)
       scheduleProxyMaintenanceForUser(user, false)
-      response.setHeader('Set-Cookie', sessionCookie(session.id, session.expiresAt))
+      response.setHeader('Set-Cookie', sessionCookie(request, session.id, session.expiresAt))
       sendJson(response, 200, {
         authenticated: true,
         setupRequired: false,
@@ -1876,17 +2198,21 @@ async function handleAuth(request: IncomingMessage, response: ServerResponse, pa
       sendJson(response, 428, { error: 'Krouter setup is required first', setupRequired: true })
       return
     }
+    if (rejectWhenThrottled(request, response, 'login')) return
+    const throttleKey = `login:${clientIp(request)}`
     const body = await readJson(request)
     const email = String(body?.email || '').trim()
     const user = email
       ? store.findUserByEmail(email)
       : store.getUsers().find(item => item.role === 'admin') || store.getUsers()[0]
-    if (!user || !verifyPassword(String(body?.password || ''), user)) {
+    if (!user || !(await verifyPasswordAsync(String(body?.password || ''), user))) {
+      registerAuthFailure(throttleKey)
       sendJson(response, 401, { error: email ? 'Invalid email or password' : 'Invalid password' })
       return
     }
+    clearAuthFailures(throttleKey)
     const session = await store.createSession(user.id)
-    response.setHeader('Set-Cookie', sessionCookie(session.id, session.expiresAt))
+    response.setHeader('Set-Cookie', sessionCookie(request, session.id, session.expiresAt))
     sendJson(response, 200, { authenticated: true, user: publicUser(user) })
     return
   }
@@ -1921,33 +2247,38 @@ async function handleAccountSyncMerge(request: IncomingMessage, response: Server
     sendJson(response, 403, { error: 'Account sync password is not configured. Run krouter sync-password on the VPS.' })
     return
   }
+  if (rejectWhenThrottled(request, response, 'account-sync')) return
+  const throttleKey = `account-sync:${clientIp(request)}`
 
-  const body = await readJson(request)
+  // Endpoint này mang nhiều account nên cần hạn mức body lớn hơn mặc định.
+  const body = await readJson(request, ACCOUNT_SYNC_MAX_BODY_BYTES)
   const syncPassword = String(body?.syncPassword || '')
-  if (!verifyAccountSyncPassword(user, syncPassword)) {
+  if (!(await verifyAccountSyncPassword(user, syncPassword))) {
+    registerAuthFailure(throttleKey)
     sendJson(response, 401, { error: 'Invalid account sync password' })
     return
   }
+  clearAuthFailures(throttleKey)
 
   const incoming = body?.accountData && typeof body.accountData === 'object' ? body.accountData : body
   const merged = mergePeerAccountData(store.getAccountData(user.id) || defaultAccountData(), incoming)
   const hydrated = await hydrateAccountDataProfileArns(merged.data)
   await store.setAccountData(user.id, hydrated.data)
+  await getProxyRuntime(store, user.id, emitForUser(user.id)).syncRoutingStateFromStore()
   scheduleBackendAutoRefreshForUser(user, false)
-  const hydratedAccounts = hydrated.data.accounts && typeof hydrated.data.accounts === 'object'
-    ? hydrated.data.accounts as Record<string, unknown>
-    : {}
+  const reconciled = reconcileMergeWithStore(merged, user.id)
   sendJson(response, 200, {
     success: true,
     totalIncoming: merged.totalIncoming,
-    added: merged.added,
+    added: reconciled.addedAccountIds.length,
     skipped: merged.skipped,
-    addedAccountIds: merged.addedAccountIds,
+    addedAccountIds: reconciled.addedAccountIds,
+    droppedAccountIds: reconciled.droppedAccountIds,
     skippedAccountIds: merged.skippedAccountIds,
     skippedAccounts: merged.skippedAccounts,
-    syncedAccountIds: merged.syncedAccountIds,
-    remoteAccounts: summarizeAccounts(hydratedAccounts),
-    remoteTotal: Object.keys(hydratedAccounts).length
+    syncedAccountIds: reconciled.syncedAccountIds,
+    remoteAccounts: summarizeAccounts(reconciled.storedAccounts),
+    remoteTotal: Object.keys(reconciled.storedAccounts).length
   })
 }
 
@@ -2156,12 +2487,23 @@ async function serveStatic(response: ServerResponse, pathname: string): Promise<
       : ext === '.svg' ? 'image/svg+xml'
       : ext === '.png' ? 'image/png'
       : 'application/octet-stream'
-    response.writeHead(200, { 'Content-Type': contentType })
+    const cacheControl = ext === '.html'
+      ? 'no-store, no-cache, must-revalidate'
+      : requested.startsWith('/assets/')
+        ? 'public, max-age=31536000, immutable'
+        : 'no-cache'
+    response.writeHead(200, {
+      'Content-Type': contentType,
+      'Cache-Control': cacheControl,
+    })
     response.end(data)
   } catch {
     const indexPath = path.join(dist, 'index.html')
     try {
-      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      response.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+      })
       response.end(await fs.readFile(indexPath))
     } catch {
       sendJson(response, 404, { error: 'Web build not found. Run npm run build:web first.' })
@@ -2213,8 +2555,9 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       Connection: 'keep-alive'
     })
     response.write('data: {"channel":"connected","args":[]}\n\n')
-    sseClients.add(response)
-    request.on('close', () => sseClients.delete(response))
+    const client: SseClient = { res: response, userId: user.id }
+    sseClients.add(client)
+    request.on('close', () => sseClients.delete(client))
     return
   }
 
@@ -2224,7 +2567,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       sendJson(response, 401, { error: 'Unauthorized' })
       return
     }
-    const body = await readJson(request)
+    const body = await readJson(request, IPC_MAX_BODY_BYTES)
     const method = String(body?.method || '')
     const args = Array.isArray(body?.args) ? body.args : []
     const result = await handleIpc(method, args, user)
@@ -2257,25 +2600,103 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   })
 }
 
+function errorStatusCode(error: unknown): number {
+  const candidate = (error as { statusCode?: unknown })?.statusCode
+  return typeof candidate === 'number' && candidate >= 400 && candidate <= 599 ? candidate : 500
+}
+
+// Không có handler nào cho unhandledRejection/uncaughtException thì một lỗi lẻ
+// cũng đủ giết tiến trình mà không để lại dấu vết. Ở đây luôn log thật to.
+process.on('unhandledRejection', (reason) => {
+  console.error('[Server] Unhandled promise rejection:', reason)
+})
+
+process.on('uncaughtException', (error) => {
+  console.error('[Server] Uncaught exception:', error)
+  const code = (error as NodeJS.ErrnoException).code
+  // Lỗi socket lẻ tẻ (client tự ngắt, header đã gửi) không làm hỏng state nên
+  // tiếp tục chạy. Mọi lỗi khác có thể để lại state dở dang: thoát khác 0 sau
+  // một nhịp ngắn cho log kịp flush để supervisor khởi động lại.
+  if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'ERR_HTTP_HEADERS_SENT') return
+  setTimeout(() => process.exit(1), 100)
+})
+
 async function main(): Promise<void> {
   await store.load()
-  void startAutoProxyRuntimes()
-  void startAutoKProxyRuntimes()
-  void startBackendAutoRefreshRuntimes()
-  void startProxyMaintenanceRuntimes()
+  startAutoProxyRuntimes().catch((error) => console.error('[startup] startAutoProxyRuntimes failed:', error))
+  startAutoKProxyRuntimes().catch((error) => console.error('[startup] startAutoKProxyRuntimes failed:', error))
+  startBackendAutoRefreshRuntimes().catch((error) => console.error('[startup] startBackendAutoRefreshRuntimes failed:', error))
+  startProxyMaintenanceRuntimes().catch((error) => console.error('[startup] startProxyMaintenanceRuntimes failed:', error))
   const port = Number(process.env.PORT || 4010)
   const host = process.env.HOST || '127.0.0.1'
   const server = http.createServer((request, response) => {
     route(request, response).catch((error) => {
       console.error('[Server] Request failed:', error)
-      sendJson(response, 500, { error: error instanceof Error ? error.message : 'Internal server error' })
+      if (response.headersSent) {
+        response.end()
+        return
+      }
+      const status = errorStatusCode(error)
+      // Body bị chặn vì quá lớn: request chưa đọc hết nên phải đóng kết nối sau khi
+      // đã ghi xong phản hồi, nếu không client sẽ tiếp tục gửi vào một socket đã hết ý nghĩa.
+      if (status === 413) {
+        response.writeHead(413, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          Connection: 'close'
+        })
+        response.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Payload too large' }), () => {
+          request.destroy()
+        })
+        return
+      }
+      sendJson(response, status, { error: error instanceof Error ? error.message : 'Internal server error' })
     })
   })
+
+  // Điểm tắt máy duy nhất của tiến trình: ngừng nhận kết nối mới, dừng tunnel,
+  // ghi nốt store rồi mới thoát. Module tunnel không được tự ý gọi process.exit.
+  let shuttingDown = false
+  const shutdown = (signal: string): void => {
+    if (shuttingDown) return
+    shuttingDown = true
+    console.log(`[Server] Nhận ${signal}, đang tắt an toàn...`)
+    const forceExit = setTimeout(() => {
+      console.error(`[Server] Tắt an toàn quá ${SHUTDOWN_TIMEOUT_MS}ms, thoát cưỡng bức`)
+      process.exit(1)
+    }, SHUTDOWN_TIMEOUT_MS)
+    void (async () => {
+      try {
+        server.close()
+        for (const client of sseClients) {
+          try {
+            client.res.end()
+          } catch {
+            // best effort
+          }
+        }
+        sseClients.clear()
+        dashboardTunnelRuntime.stopSync()
+        await store.save()
+      } catch (error) {
+        console.error('[Server] Lỗi khi tắt an toàn:', error)
+      } finally {
+        clearTimeout(forceExit)
+        process.exit(0)
+      }
+    })()
+  }
+  process.once('SIGINT', () => shutdown('SIGINT'))
+  process.once('SIGTERM', () => shutdown('SIGTERM'))
+
   server.listen(port, host, () => {
     const mode = serveStaticAssets ? 'fullstack web/API' : 'backend CLI API'
-    void startDashboardTunnelIfConfigured()
+    startDashboardTunnelIfConfigured().catch((error) => console.error('[startup] startDashboardTunnelIfConfigured failed:', error))
     console.log(`[Server] Krouter ${mode} đang chạy tại http://${host}:${port}`)
   })
 }
 
-void main()
+main().catch((error) => {
+  console.error('[Server] Fatal startup failure:', error)
+  process.exit(1)
+})

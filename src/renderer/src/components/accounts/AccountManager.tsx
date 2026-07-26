@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { AccountToolbar, type AccountViewMode } from './AccountToolbar'
@@ -6,22 +6,34 @@ import { AccountGrid } from './AccountGrid'
 import { AccountList } from './AccountList'
 import { AddAccountDialog } from './AddAccountDialog'
 import { BedrockAccountsPanel } from './BedrockAccountsPanel'
-import { XpixiAccountsPanel } from './XpixiAccountsPanel'
+import { CustomApiAccountsPanel } from './CustomApiAccountsPanel'
+import { ChatGPTOAuthPanel } from '../proxy/ChatGPTOAuthPanel'
 import { EditAccountDialog } from './EditAccountDialog'
 import { GroupManageDialog } from './GroupManageDialog'
 import { TagManageDialog } from './TagManageDialog'
 import { ExportDialog } from './ExportDialog'
-import { Button } from '../ui'
+import { Badge, Button } from '../ui'
 import { useIsMobile } from '@/hooks/useIsMobile'
 import type { Account } from '@/types/account'
+import type { AccountProviderRoute } from '@/lib/docsRoute'
 import { splitCredentialLine } from '@/lib/utils'
-import { ArrowLeft, Loader2, Users, Cloud, Key, SlidersHorizontal, ChevronUp } from 'lucide-react'
+import { ArrowLeft, Loader2, Users, Cloud, Bot, Key, SlidersHorizontal, ChevronUp } from 'lucide-react'
 
 interface AccountManagerProps {
   onBack?: () => void
+  provider?: AccountProviderRoute
+  onProviderChange?: (provider: AccountProviderRoute) => void
+  customApiProviderId?: string | null
+  onCustomApiProviderChange?: (providerId: string | null) => void
 }
 
-export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode {
+export function AccountManager({
+  onBack,
+  provider = 'kiro',
+  onProviderChange,
+  customApiProviderId = null,
+  onCustomApiProviderChange
+}: AccountManagerProps): React.ReactNode {
   const {
     isLoading,
     accounts,
@@ -33,8 +45,14 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   } = useAccountsStore()
 
   const [showAddDialog, setShowAddDialog] = useState(false)
-  const [accountTab, setAccountTab] = useState<'kiro' | 'bedrock' | 'xpixi'>('kiro')
-  const [addDialogMode, setAddDialogMode] = useState<'login' | 'bedrock' | 'xpixi' | undefined>(undefined)
+  const [localProvider, setLocalProvider] = useState<AccountProviderRoute>(provider)
+  useEffect(() => setLocalProvider(provider), [provider])
+  const accountTab = onProviderChange ? provider : localProvider
+  const selectAccountTab = (nextProvider: AccountProviderRoute): void => {
+    if (onProviderChange) onProviderChange(nextProvider)
+    else setLocalProvider(nextProvider)
+  }
+  const [addDialogMode, setAddDialogMode] = useState<'login' | 'bedrock' | 'customApi' | undefined>(undefined)
   const [bedrockRefreshKey, setBedrockRefreshKey] = useState(0)
   const [editingAccount, setEditingAccount] = useState<Account | null>(null)
   const [showGroupDialog, setShowGroupDialog] = useState(false)
@@ -55,6 +73,15 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   }, [viewMode])
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
+  const kiroSummary = useMemo(() => {
+    const list = Array.from(accounts.values())
+    return {
+      total: list.length,
+      active: list.filter((account) => account.status === 'active').length,
+      attention: list.filter((account) => account.status !== 'active').length,
+      groups: groups.size
+    }
+  }, [accounts, groups])
 
   // 获取要导出的账号列表
   const getExportAccounts = () => {
@@ -245,7 +272,7 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   return (
     <div className="flex flex-col h-full">
       {/* 顶部工具栏 - 玻璃态（relative z-20 抬升 stacking context，确保下拉菜单浮在卡片之上） */}
-      <header className="relative z-20 flex flex-wrap items-center justify-between gap-3 px-3 py-3 glass-toolbar">
+      <header className="accounts-workspace-head relative z-20 flex flex-wrap items-center justify-between gap-3 px-3 py-3">
         <div className="flex flex-wrap items-center gap-3 sm:gap-4">
           {onBack && (
             <Button variant="ghost" size="icon" onClick={onBack}>
@@ -270,27 +297,38 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
               {toolbarOpen ? <ChevronUp className="h-4 w-4" /> : <SlidersHorizontal className="h-4 w-4" />}
             </Button>
           )}
-          <div className="flex items-center gap-1 p-1 rounded-xl bg-muted/50 border">
+          <div className="provider-switcher flex max-w-full items-center gap-1 overflow-x-auto p-1 rounded-xl bg-muted/50 border">
             <button
               className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-all font-medium ${accountTab === 'kiro' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
-              onClick={() => setAccountTab('kiro')}
+              onClick={() => selectAccountTab('kiro')}
+              aria-current={accountTab === 'kiro' ? 'page' : undefined}
             >
               <Users className="h-4 w-4" />
               {isEn ? 'Kiro' : 'Kiro'}
             </button>
             <button
               className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-all font-medium ${accountTab === 'bedrock' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
-              onClick={() => setAccountTab('bedrock')}
+              onClick={() => selectAccountTab('bedrock')}
+              aria-current={accountTab === 'bedrock' ? 'page' : undefined}
             >
               <Cloud className="h-4 w-4" />
               Bedrock
             </button>
             <button
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-all font-medium ${accountTab === 'xpixi' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
-              onClick={() => setAccountTab('xpixi')}
+              className={`flex shrink-0 items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-all font-medium ${accountTab === 'chatgpt' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => selectAccountTab('chatgpt')}
+              aria-current={accountTab === 'chatgpt' ? 'page' : undefined}
+            >
+              <Bot className="h-4 w-4" />
+              ChatGPT
+            </button>
+            <button
+              className={`flex shrink-0 items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-all font-medium ${accountTab === 'customApi' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => selectAccountTab('customApi')}
+              aria-current={accountTab === 'customApi' ? 'page' : undefined}
             >
               <Key className="h-4 w-4" />
-              Xpixi
+              Custom API
             </button>
           </div>
         </div>
@@ -316,9 +354,9 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
                 {isEn ? 'Add Bedrock' : 'Thêm Bedrock'}
               </Button>
             )}
-            {accountTab === 'xpixi' && (
-              <Button onClick={() => { setAddDialogMode('xpixi'); setShowAddDialog(true) }} className="rounded-xl">
-                {isEn ? 'Add Xpixi' : 'Thêm Xpixi'}
+            {accountTab === 'customApi' && (
+              <Button onClick={() => { setAddDialogMode('customApi'); setShowAddDialog(true) }} className="rounded-xl">
+                {isEn ? 'Add Custom API' : 'Thêm Custom API'}
               </Button>
             )}
           </div>
@@ -327,11 +365,28 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
 
       {/* 主内容区域 */}
       <div className="flex-1 overflow-hidden flex flex-col px-3 py-3 gap-3">
+        {accountTab === 'kiro' && (
+          <div className="kiro-provider-summary">
+            <div className="provider-identity"><div className="provider-brand"><Users /></div><div><div className="provider-title-line"><h2>Kiro</h2><Badge variant="success">{kiroSummary.active} {isEn ? 'active' : 'dang hoat dong'}</Badge></div><p>{isEn ? 'Managed account pool with quota-aware rotation and failover.' : 'Pool tai khoan co xoay vong theo quota va failover.'}</p></div></div>
+            <div className="kiro-summary-signals"><div><small>{isEn ? 'TOTAL' : 'TONG'}</small><strong>{kiroSummary.total}</strong></div><div><small>{isEn ? 'HEALTHY' : 'ON DINH'}</small><strong>{kiroSummary.active}</strong></div><div><small>{isEn ? 'ATTENTION' : 'CAN CHU Y'}</small><strong>{kiroSummary.attention}</strong></div><div><small>{isEn ? 'GROUPS' : 'NHOM'}</small><strong>{kiroSummary.groups}</strong></div></div>
+          </div>
+        )}
         <div className="flex-1 overflow-hidden">
-          {accountTab === 'bedrock' ? (
+          {accountTab === 'chatgpt' ? (
+            <div className="h-full overflow-auto pr-1">
+              <ChatGPTOAuthPanel isEn={isEn} variant="accounts" />
+            </div>
+          ) : accountTab === 'bedrock' ? (
             <BedrockAccountsPanel key={bedrockRefreshKey} isEn={isEn} onAddBedrock={() => { setAddDialogMode('bedrock'); setShowAddDialog(true) }} />
-          ) : accountTab === 'xpixi' ? (
-            <XpixiAccountsPanel key={bedrockRefreshKey} isEn={isEn} onAddXpixi={() => { setAddDialogMode('xpixi'); setShowAddDialog(true) }} />
+          ) : accountTab === 'customApi' ? (
+            <CustomApiAccountsPanel
+              key={bedrockRefreshKey}
+              isEn={isEn}
+              selectedProviderId={customApiProviderId}
+              onOpenProvider={(providerId) => onCustomApiProviderChange?.(providerId)}
+              onBackToProviders={() => onCustomApiProviderChange?.(null)}
+              onAddProvider={() => { setAddDialogMode('customApi'); setShowAddDialog(true) }}
+            />
           ) : viewMode === 'grid' ? (
             <AccountGrid
               onAddAccount={() => { setAddDialogMode(undefined); setShowAddDialog(true) }}

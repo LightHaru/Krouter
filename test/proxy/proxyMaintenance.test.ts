@@ -204,13 +204,14 @@ describe('proxy maintenance backend service', () => {
     expect(status.proxiesChecked).toBe(4)
     expect(validateCalls).toHaveLength(4)
     expect(validateCalls.every((call) => call.requireAwsSigninRoute === true)).toBe(true)
-    expect(status.proxiesAlive).toBe(2)
-    expect(status.proxiesAdded).toBe(2)
+    expect(status.proxiesAlive).toBe(3)
+    expect(status.proxiesAdded).toBe(3)
     expect(status.proxiesRemoved).toBe(2)
     expect(status.accountsChecked).toBe(5)
     expect(status.accountsRemoved).toBe(1)
     expect(Object.keys(data.proxyPool).sort()).toEqual(expect.arrayContaining(['manual']))
-    expect(Object.values(data.proxyPool).filter((proxy: any) => proxy.source === IPLOCATE_PROXY_SOURCE)).toHaveLength(2)
+    expect(Object.values(data.proxyPool).filter((proxy: any) => proxy.source === IPLOCATE_PROXY_SOURCE)).toHaveLength(3)
+    expect(Object.values(data.proxyPool).some((proxy: any) => proxy.status === 'slow' && proxy.latencyMs === 1600)).toBe(true)
     expect(data.proxyPool.staleSource).toBeUndefined()
     expect(data.proxyPool.deadSource).toBeUndefined()
     expect(data.proxyPoolConfig.maxUsableLatencyMs).toBe(1000)
@@ -230,5 +231,67 @@ describe('proxy maintenance backend service', () => {
     expect(data._deletedAccountIds).toEqual(expect.arrayContaining(['invalid']))
     expect(data._deletedAccountIds).not.toContain('suspended')
     expect(data._deletedProxyIds).toEqual(expect.arrayContaining(['staleSource', 'deadSource']))
+  })
+
+  it('keeps failed source proxies visible when remove-dead is disabled', async () => {
+    const { store, userId } = await createStore()
+    const now = Date.now()
+    await store.setAccountData(userId, {
+      accounts: {},
+      proxyPool: {
+        sourceProxy: {
+          id: 'sourceProxy',
+          url: 'http://5.5.5.5:8080',
+          protocol: 'http',
+          host: '5.5.5.5',
+          port: 8080,
+          source: IPLOCATE_PROXY_SOURCE,
+          status: 'alive',
+          latencyMs: 120,
+          usedCount: 0,
+          failCount: 0,
+          enabled: true,
+          createdAt: now
+        }
+      },
+      accountProxyBindings: {},
+      proxyPoolConfig: {
+        backendMaintenanceEnabled: true,
+        backendMaintenanceIntervalMin: 30,
+        sourceSyncEnabled: true,
+        sourceUrl: 'memory://iplocate',
+        sourceValidateConcurrency: 1,
+        sourceRemoveDead: false,
+        maxUsableLatencyMs: 1000,
+        accountHealthCheckEnabled: false,
+        accountDeleteDead: false,
+        accountFailureThreshold: 2,
+        accountCheckConcurrency: 1,
+        testUrl: 'https://example.test/ip',
+        testTimeoutMs: 1000
+      }
+    })
+
+    const runtime = new ProxyMaintenanceRuntime(store, userId, () => undefined, {
+      fetchSourceText: async () => [
+        'http://5.5.5.5:8080',
+        'http://6.6.6.6:8080',
+        'http://7.7.7.7:8080'
+      ].join('\n'),
+      validateProxy: async ({ url }) => url.includes('5.5.5.5')
+        ? { success: false, error: 'connect timeout' }
+        : { success: true, latencyMs: 200, externalIp: '6.6.6.6' },
+      checkAccount: async () => ({ success: true, data: { status: 'active' } })
+    })
+    await runtime.runNow('test-keep-dead')
+    const data = store.getAccountData(userId) as Record<string, any>
+
+    expect(data.proxyPool.sourceProxy).toMatchObject({
+      enabled: true,
+      status: 'dead',
+      failCount: 1
+    })
+    expect(data.proxyPoolConfig.sourceRemoveDead).toBe(false)
+    expect(data._deletedProxyIds || []).not.toContain('sourceProxy')
   })
 })

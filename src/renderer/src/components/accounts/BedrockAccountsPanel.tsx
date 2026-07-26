@@ -1,226 +1,103 @@
-﻿import { useCallback, useEffect, useState } from 'react'
-import { Button, Card, CardContent, Badge } from '../ui'
-import { Cloud, Loader2, RefreshCw, Trash2, Plus, CheckCircle2, AlertTriangle, Server } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { AlertTriangle, CheckCircle2, Cloud, Loader2, Plus, RefreshCw, Search, Trash2, Zap } from 'lucide-react'
+import { Badge, Button, Card, CardContent, Input } from '../ui'
 
-interface BedrockConfigView {
-  enabled?: boolean
-  accessKeyId?: string
-  secretAccessKey?: string
-  region?: string
-  models?: string[]
-}
+interface BedrockConfigView { enabled?: boolean; accessKeyId?: string; secretAccessKey?: string; sessionToken?: string; region?: string; models?: string[] }
+interface BedrockModelView { id: string; name?: string; provider?: string; kind: 'foundation' | 'profile' }
+interface Props { isEn: boolean; onAddBedrock: () => void }
 
-interface BedrockModelView {
-  id: string
-  name?: string
-  provider?: string
-  kind: 'foundation' | 'profile'
-}
+function maskKey(key?: string): string { return key ? `${key.slice(0, 4)}...${key.slice(-4)}` : '-' }
 
-interface BedrockAccountsPanelProps {
-  isEn: boolean
-  onAddBedrock: () => void
-}
-
-function maskKey(key?: string): string {
-  if (!key) return ''
-  if (key.length <= 10) return key
-  return `${key.slice(0, 4)}...${key.slice(-4)}`
-}
-
-export function BedrockAccountsPanel({ isEn, onAddBedrock }: BedrockAccountsPanelProps): React.ReactNode {
+export function BedrockAccountsPanel({ isEn, onAddBedrock }: Props): React.ReactNode {
   const [config, setConfig] = useState<BedrockConfigView | null>(null)
-  const [loading, setLoading] = useState(true)
   const [models, setModels] = useState<BedrockModelView[]>([])
+  const [loading, setLoading] = useState(true)
   const [testing, setTesting] = useState(false)
+  const [busyModel, setBusyModel] = useState<string | null>(null)
+  const [query, setQuery] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [removing, setRemoving] = useState(false)
+  const [results, setResults] = useState<Record<string, { ok: boolean; latencyMs?: number; error?: string }>>({})
 
-  const loadConfig = useCallback(async () => {
+  const loadConfig = useCallback(async (): Promise<void> => {
     setLoading(true)
     setError(null)
     try {
       const status = await window.api.proxyGetStatus()
-      const cfg = (status?.config as { bedrock?: BedrockConfigView } | undefined)?.bedrock || null
-      setConfig(cfg)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load config')
-    } finally {
-      setLoading(false)
-    }
+      setConfig(((status?.config as { bedrock?: BedrockConfigView })?.bedrock) || null)
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Failed to load Bedrock') }
+    finally { setLoading(false) }
   }, [])
 
-  useEffect(() => {
-    void loadConfig()
-  }, [loadConfig])
+  useEffect(() => { void loadConfig() }, [loadConfig])
+  const configured = Boolean(config?.enabled && config.accessKeyId && config.secretAccessKey)
 
-  const configured = Boolean(config?.enabled && config?.accessKeyId && config?.secretAccessKey)
-
-  const testAndLoad = useCallback(async () => {
+  const discover = useCallback(async (): Promise<void> => {
     if (!configured) return
-    setTesting(true)
-    setError(null)
+    setTesting(true); setError(null)
     try {
-      const result = await window.api.proxyTestBedrock({
-        accessKeyId: config?.accessKeyId,
-        secretAccessKey: config?.secretAccessKey,
-        region: config?.region
-      })
-      if (result.success) {
-        setModels(result.models || [])
-      } else {
-        setError(result.error || (isEn ? 'Credential test failed' : 'Kiểm tra key thất bại'))
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Test failed')
-    } finally {
-      setTesting(false)
-    }
-  }, [configured, config, isEn])
+      const result = await window.api.proxyTestBedrock({ accessKeyId: config?.accessKeyId, secretAccessKey: config?.secretAccessKey, sessionToken: config?.sessionToken, region: config?.region })
+      if (!result.success) throw new Error(result.error || 'Credential test failed')
+      setModels(result.models || [])
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Credential test failed') }
+    finally { setTesting(false) }
+  }, [configured, config])
 
-  useEffect(() => {
-    if (configured) void testAndLoad()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [configured])
+  useEffect(() => { if (configured) void discover() }, [configured, discover])
 
-  const handleRemove = async () => {
-    if (!confirm(isEn ? 'Remove this Bedrock provider? Requests will stop using it.' : 'Xóa Bedrock provider này? Backend sẽ ngừng dùng nó.')) return
-    setRemoving(true)
-    setError(null)
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLowerCase()
+    return needle ? models.filter((model) => `${model.id} ${model.provider || ''} ${model.kind}`.toLowerCase().includes(needle)) : models
+  }, [models, query])
+
+  const profiles = models.filter((model) => model.kind === 'profile').length
+  const exposed = config?.models?.length || models.length
+
+  const testModel = async (modelId: string): Promise<void> => {
+    setBusyModel(modelId)
     try {
-      await window.api.proxyUpdateConfig({ bedrock: { enabled: false, accessKeyId: '', secretAccessKey: '', sessionToken: '', models: [] } })
-      setConfig(null)
-      setModels([])
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Remove failed')
-    } finally {
-      setRemoving(false)
-    }
+      const response = await window.api.proxyProbeModels({ modelIds: [modelId], concurrency: 1 })
+      const probe = response.results?.find((item) => item.modelId === modelId && item.tier === 'bedrock')
+      setResults((current) => ({ ...current, [modelId]: { ok: Boolean(probe?.ok), latencyMs: probe?.latencyMs, error: probe?.error || response.error } }))
+    } finally { setBusyModel(null) }
   }
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-full text-muted-foreground">
-        <Loader2 className="h-5 w-5 animate-spin mr-2" />
-        {isEn ? 'Loading Bedrock provider...' : 'Đang tải Bedrock...'}
-      </div>
-    )
+  const remove = async (): Promise<void> => {
+    if (!confirm(isEn ? 'Remove AWS Bedrock?' : 'Xóa AWS Bedrock?')) return
+    await window.api.proxyUpdateConfig({ bedrock: { enabled: false, accessKeyId: '', secretAccessKey: '', sessionToken: '', models: [] } })
+    setConfig(null); setModels([])
   }
 
-  if (!configured) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-6">
-        <div className="p-4 rounded-full bg-primary/10">
-          <Cloud className="h-8 w-8 text-primary" />
-        </div>
-        <div>
-          <p className="font-medium">{isEn ? 'No Bedrock provider yet' : 'Chưa có Bedrock provider'}</p>
-          <p className="text-sm text-muted-foreground mt-1 max-w-md">
-            {isEn
-              ? 'Add an AWS Bedrock provider to route premium models (Opus, Sonnet 4.6...) that your free Kiro accounts do not have.'
-              : 'Thêm AWS Bedrock để định tuyến các model premium (Opus, Sonnet 4.6...) mà tài khoản Kiro free của bạn không có.'}
-          </p>
-        </div>
-        <Button onClick={onAddBedrock} className="rounded-xl">
-          <Plus className="h-4 w-4 mr-1.5" />
-          {isEn ? 'Add Bedrock' : 'Thêm Bedrock'}
-        </Button>
-      </div>
-    )
-  }
-
-  const profileModels = models.filter(m => m.kind === 'profile')
-  const foundationModels = models.filter(m => m.kind === 'foundation')
-  const exposed = config?.models && config.models.length > 0 ? config.models : null
+  if (loading) return <ProviderLoader text={isEn ? 'Loading Bedrock workspace...' : 'Đang tải không gian Bedrock...'} />
+  if (!configured) return <ProviderEmpty icon={Cloud} title={isEn ? 'Connect AWS Bedrock' : 'Kết nối AWS Bedrock'} body={isEn ? 'Add an AWS identity to unlock premium and cross-region models.' : 'Thêm AWS identity để dùng model premium và cross-region.'} action={isEn ? 'Add Bedrock' : 'Thêm Bedrock'} onClick={onAddBedrock} />
 
   return (
-    <div className="h-full overflow-y-auto px-1 py-1 space-y-4">
-      <Card className="border bg-background">
-        <CardContent className="p-4 space-y-4">
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-center gap-3">
-              <div className="p-2.5 rounded-xl bg-primary/10">
-                <Server className="h-5 w-5 text-primary" />
-              </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="font-semibold">AWS Bedrock</span>
-                  <Badge className="bg-success/15 text-success border-success/20">
-                    <CheckCircle2 className="h-3 w-3 mr-1" />
-                    {isEn ? 'Active' : 'Đang bật'}
-                  </Badge>
-                </div>
-                <div className="text-xs text-muted-foreground mt-0.5 space-x-2">
-                  <span>{isEn ? 'Region' : 'Vùng'}: <code className="font-mono">{config?.region || 'us-east-1'}</code></span>
-                  <span>Key: <code className="font-mono">{maskKey(config?.accessKeyId)}</code></span>
-                </div>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button variant="outline" size="sm" onClick={testAndLoad} disabled={testing} className="rounded-lg">
-                {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                <span className="ml-1.5">{isEn ? 'Reload models' : 'Tải lại model'}</span>
-              </Button>
-              <Button variant="outline" size="sm" onClick={handleRemove} disabled={removing} className="rounded-lg text-destructive hover:bg-destructive hover:text-white">
-                {removing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-              </Button>
-            </div>
-          </div>
+    <div className="provider-workspace">
+      <div className="provider-workspace-head">
+        <div className="provider-identity"><div className="provider-brand bedrock"><Cloud /></div><div><div className="provider-title-line"><h2>AWS Bedrock</h2><Badge variant="success"><CheckCircle2 /> {isEn ? 'Connected' : 'Đã kết nối'}</Badge></div><p>{config?.region || 'us-east-1'} · {maskKey(config?.accessKeyId)} · {isEn ? 'Managed AWS route' : 'Tuyến AWS được quản lý'}</p></div></div>
+        <div className="provider-actions"><Button variant="outline" onClick={() => void discover()} disabled={testing}>{testing ? <Loader2 className="animate-spin" /> : <RefreshCw />}{isEn ? 'Discover models' : 'Tải model'}</Button><Button variant="outline" size="icon" className="text-destructive" onClick={() => void remove()}><Trash2 /></Button></div>
+      </div>
 
-          {error && (
-            <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
-              <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
-              <span>{error}</span>
-            </div>
-          )}
+      {error && <div className="provider-alert"><AlertTriangle /><span>{error}</span></div>}
 
-          <div className="flex flex-wrap items-center gap-2 text-xs">
-            <Badge variant="secondary" className="border-0">{isEn ? 'Total' : 'Tổng'}: {models.length}</Badge>
-            <Badge variant="secondary" className="border-0 bg-amber-500/15 text-amber-600 dark:text-amber-400">Profiles: {profileModels.length}</Badge>
-            <Badge variant="secondary" className="border-0">Foundation: {foundationModels.length}</Badge>
-            {exposed && <Badge variant="secondary" className="border-0 bg-primary/15 text-primary">{isEn ? 'Exposed' : 'Đang expose'}: {exposed.length}</Badge>}
-          </div>
+      <div className="provider-stat-row">
+        <ProviderStat label={isEn ? 'Discovered' : 'Đã tìm thấy'} value={models.length} detail="models" />
+        <ProviderStat label="Inference profiles" value={profiles} detail={isEn ? 'cross-region' : 'đa vùng'} />
+        <ProviderStat label={isEn ? 'Foundation' : 'Nền tảng'} value={models.length - profiles} detail="on-demand" />
+        <ProviderStat label={isEn ? 'Exposed routes' : 'Tuyến công khai'} value={exposed} detail="API proxy" />
+      </div>
 
-          {testing ? (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              {isEn ? 'Loading models...' : 'Đang tải model...'}
-            </div>
-          ) : models.length > 0 ? (
-            <div className="space-y-3">
-              {profileModels.length > 0 && (
-                <div>
-                  <p className="text-xs font-medium text-muted-foreground mb-1.5">{isEn ? 'Inference profiles (cross-region, e.g. Opus/Sonnet)' : 'Inference profiles (cross-region, vd Opus/Sonnet)'}</p>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
-                    {profileModels.map(m => (
-                      <div key={m.id} className={cn('flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs', exposed && !exposed.includes(m.id) ? 'opacity-40' : '')}>
-                        <span className="h-1.5 w-1.5 rounded-full bg-amber-500 shrink-0" />
-                        <code className="truncate font-mono">{m.id}</code>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {foundationModels.length > 0 && (
-                <div>
-                  <p className="text-xs font-medium text-muted-foreground mb-1.5">{isEn ? 'Foundation models (on-demand)' : 'Foundation models (on-demand)'}</p>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-64 overflow-y-auto pr-1">
-                    {foundationModels.map(m => (
-                      <div key={m.id} className={cn('flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs', exposed && !exposed.includes(m.id) ? 'opacity-40' : '')}>
-                        <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 shrink-0" />
-                        <code className="truncate font-mono">{m.id}</code>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="text-sm text-muted-foreground py-2">{isEn ? 'No invokable models found for this identity.' : 'Không tìm thấy model dùng được cho tài khoản này.'}</div>
-          )}
-        </CardContent>
-      </Card>
+      <div className="provider-catalog-bar"><div><span>{isEn ? 'MODEL CATALOG' : 'DANH MỤC MODEL'}</span><strong>{filtered.length} {isEn ? 'available routes' : 'tuyến khả dụng'}</strong></div><div className="provider-search"><Search /><Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={isEn ? 'Search model or provider...' : 'Tìm model hoặc provider...'} /></div></div>
+
+      <div className="provider-model-grid">
+        {testing && models.length === 0 ? <ProviderLoader text={isEn ? 'Discovering invokable models...' : 'Đang tìm model có thể gọi...'} /> : filtered.map((model) => {
+          const result = results[model.id]
+          return <Card key={model.id} className="provider-model-card"><CardContent><div className="model-card-top"><span className={`model-kind ${model.kind}`}><Zap />{model.kind}</span><span className={result ? (result.ok ? 'model-health ok' : 'model-health fail') : 'model-health'}>{result ? (result.ok ? `${result.latencyMs || 0}ms` : 'Failed') : 'Untested'}</span></div><code title={model.id}>{model.id}</code><div className="model-card-foot"><span>{model.provider || model.id.split('.')[1] || 'AWS'}</span><Button size="sm" variant="ghost" onClick={() => void testModel(model.id)} disabled={busyModel === model.id}>{busyModel === model.id ? <Loader2 className="animate-spin" /> : (isEn ? 'Test route' : 'Kiểm tra')}</Button></div></CardContent></Card>
+        })}
+      </div>
     </div>
   )
 }
+
+function ProviderStat({ label, value, detail }: { label: string; value: number; detail: string }): React.ReactNode { return <div className="provider-stat"><small>{label}</small><strong>{value}</strong><span>{detail}</span></div> }
+function ProviderLoader({ text }: { text: string }): React.ReactNode { return <div className="provider-loader"><Loader2 className="animate-spin" /><span>{text}</span></div> }
+function ProviderEmpty({ icon: Icon, title, body, action, onClick }: { icon: React.ElementType; title: string; body: string; action: string; onClick: () => void }): React.ReactNode { return <div className="provider-empty"><div className="provider-brand bedrock"><Icon /></div><h2>{title}</h2><p>{body}</p><Button onClick={onClick}><Plus />{action}</Button></div> }

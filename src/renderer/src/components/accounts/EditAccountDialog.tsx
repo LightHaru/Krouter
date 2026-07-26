@@ -4,6 +4,7 @@ import { Button, Card, CardContent, CardHeader, CardTitle } from '../ui'
 import { useAccountsStore } from '@/store'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account, SubscriptionType } from '@/types/account'
+import { copyText } from '@/lib/utils'
 
 interface EditAccountDialogProps {
   open: boolean
@@ -62,7 +63,7 @@ export function EditAccountDialog({
 
   const handleCopyAccessToken = (): void => {
     if (accountInfo?.accessToken) {
-      navigator.clipboard.writeText(accountInfo.accessToken)
+      copyText(accountInfo.accessToken)
       setCopiedToken(true)
       setTimeout(() => setCopiedToken(false), 2000)
     }

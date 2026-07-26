@@ -436,5 +436,6 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
   )
 }
 
-// 导出工具函数供其他组件使用
-export { toRgba, parseArgb, toArgb }
+// (Đã bỏ `export { toRgba, parseArgb, toArgb }`: không file nào import từ đây — chỉ
+//  TagManageDialog được import — nên đó là export chết, đồng thời làm hỏng Fast Refresh.
+//  Bản dùng chung của toRgba đã có sẵn ở ./_helpers.)

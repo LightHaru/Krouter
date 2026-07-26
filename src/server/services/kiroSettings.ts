@@ -345,3 +345,93 @@ export async function deleteMcpServer(name: string): Promise<{ success: boolean;
     return { success: false, error: error instanceof Error ? error.message : 'Failed to delete MCP server' }
   }
 }
+
+type KiroModelUiRecord = {
+  id: string
+  name?: string
+  description?: string
+  inputTypes?: string[]
+  maxInputTokens?: number | null
+  maxOutputTokens?: number | null
+}
+
+/** Hình dạng tối thiểu của một account trong store mà hàm dưới đây cần đọc. */
+type StoredKiroAccount = {
+  id?: string
+  email?: string
+  isActive?: boolean
+  status?: string
+  profileArn?: string
+  credentials?: {
+    accessToken?: string
+    refreshToken?: string
+    expiresAt?: number
+    clientId?: string
+    clientSecret?: string
+    region?: string
+    authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp' | 'api_key' | 'apikey'
+  }
+}
+
+/**
+ * Danh sách model của RIÊNG Kiro cho màn hình Kiro Settings.
+ *
+ * Trước đây case 'getKiroAvailableModels' phía server alias thẳng sang
+ * proxyRuntime.getModels(), tức catalog gộp cả Bedrock/custom-API/ChatGPT — và khi không có
+ * account Kiro nào thì chỉ còn đúng những model đó. KiroSettingsPage đổ kết quả này vào
+ * dropdown kiroAgent.modelSelection nên người dùng ghi vào settings.json những id mà Kiro IDE
+ * không thể phân giải. Bản này mirror đúng logic của main/index.ts ('get-kiro-available-models').
+ */
+export async function getKiroAvailableModels(
+  accountData: { accounts?: Record<string, unknown> } | undefined
+): Promise<{ models: KiroModelUiRecord[]; error?: string }> {
+  try {
+    const accounts = accountData?.accounts
+    if (!accounts || typeof accounts !== 'object') return { models: [] }
+
+    const all = Object.values(accounts) as StoredKiroAccount[]
+    const account =
+      all.find((acc) => acc?.isActive && acc?.credentials?.accessToken) ||
+      all.find((acc) => acc?.status === 'active' && acc?.credentials?.accessToken)
+    if (!account?.credentials?.accessToken) return { models: [] }
+
+    const { fetchKiroModels } = await import('../../main/proxy/kiroApi')
+    const { KIRO_PROXY_MODEL_PRESETS } = await import('../../main/proxy/modelCatalog')
+
+    const models = await fetchKiroModels({
+      id: account.id || account.email || 'active-kiro-account',
+      email: account.email,
+      accessToken: account.credentials.accessToken,
+      refreshToken: account.credentials.refreshToken,
+      profileArn: account.profileArn,
+      expiresAt: account.credentials.expiresAt,
+      clientId: account.credentials.clientId,
+      clientSecret: account.credentials.clientSecret,
+      region: account.credentials.region || 'us-east-1',
+      authMethod: account.credentials.authMethod
+    })
+
+    const output: KiroModelUiRecord[] = models.map((m) => ({
+      id: m.modelId,
+      name: m.modelName,
+      description: m.description
+    }))
+    const seen = new Set(output.map((m) => m.id))
+    for (const preset of KIRO_PROXY_MODEL_PRESETS) {
+      if (seen.has(preset.id)) continue
+      seen.add(preset.id)
+      output.push({
+        id: preset.id,
+        name: preset.name,
+        description: preset.description,
+        inputTypes: preset.inputTypes,
+        maxInputTokens: preset.maxInputTokens,
+        maxOutputTokens: preset.maxOutputTokens
+      })
+    }
+    return { models: output }
+  } catch (error) {
+    console.error('[KiroSettings] Failed to fetch models:', error)
+    return { models: [], error: error instanceof Error ? error.message : 'Failed to fetch models' }
+  }
+}

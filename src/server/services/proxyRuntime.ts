@@ -8,7 +8,9 @@ import { getRuntimeUserDataPath } from '../../main/runtimePaths'
 import { resolveProfileArn } from '../../main/proxy/kiroApi'
 import { testBedrockCredentials, type BedrockConfig, type BedrockAvailableModel } from '../../main/proxy/bedrock'
 import { testXpixiCredentials } from '../../main/proxy/xpixi'
+import { normalizeCustomProvider, testCustomApiProvider, type CustomApiProviderConfig } from '../../main/proxy/customApi'
 import type { ApiKey, ProxyAccount, ProxyConfig, ProxyStats, ModelProbeResult } from '../../main/proxy/types'
+import { UsageAnalyticsStore, type UsageAnalyticsPeriod } from '../../main/proxy/usageAnalytics'
 import { refreshTokenByMethod } from './kiroAccounts'
 import { hydrateAccountDataProfileArns } from './accountProfileHydration'
 import type { WebStore } from '../store'
@@ -255,12 +257,36 @@ export class ProxyRuntime {
   private server: ProxyServer | null = null
   private autoStartInFlight: Promise<{ success: boolean; port?: number; error?: string }> | null = null
   private pendingAccountPersist: Promise<void> | null = null
+  private readonly usageAnalytics: UsageAnalyticsStore
+
+  private async discoverCustomProviderModels(
+    providers: CustomApiProviderConfig[]
+  ): Promise<CustomApiProviderConfig[]> {
+    return await Promise.all(providers.map(async (providerInput) => {
+      const provider = normalizeCustomProvider(providerInput)
+      if (provider.modelDiscoveryMode === 'manual' || provider.models?.length) return provider
+      const result = await testCustomApiProvider({ ...provider, models: [] })
+      if (!result.success) {
+        return {
+          ...provider,
+          modelsSyncError: result.error || 'Automatic model discovery failed'
+        }
+      }
+      return {
+        ...provider,
+        models: (result.models || []).map((model) => model.upstreamId),
+        modelsSyncedAt: Date.now(),
+        modelsSyncError: undefined
+      }
+    }))
+  }
 
   constructor(
     private readonly store: WebStore,
     private readonly userId: string,
     private readonly emit: EmitFn
   ) {
+    this.usageAnalytics = new UsageAnalyticsStore(`web:${userId}`)
     proxyLogStore.initialize(getRuntimeUserDataPath())
     interceptConsole()
   }
@@ -308,7 +334,17 @@ export class ProxyRuntime {
   }
 
   async ensureAutoStarted(reason = 'auto'): Promise<{ success: boolean; port?: number; error?: string }> {
-    const server = this.getOrCreateServer()
+    // getOrCreateServer() đọc savedConfig -> unprotect() -> giải mã. Trước đây nó
+    // nằm ngoài try nên một lỗi giải mã sẽ thoát ra ngoài và giết tiến trình lúc
+    // khởi động. Bọc lại để mọi lỗi đều thành kết quả có error.
+    let server: ProxyServer
+    try {
+      server = this.getOrCreateServer()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to initialise proxy server'
+      console.error('[ProxyRuntime] Auto-start failed while creating server:', message)
+      return { success: false, error: message }
+    }
     if (server.isRunning()) return { success: true, port: server.getConfig().port }
     if (this.autoStartInFlight) return this.autoStartInFlight
 
@@ -338,9 +374,15 @@ export class ProxyRuntime {
 
     this.server = new ProxyServer(this.savedConfig, {
       onRequest: (info) => this.emit('proxy-request', info),
-      onResponse: (info) => this.emit('proxy-response', info),
+      onResponse: (info) => {
+        this.emit('proxy-response', info)
+        void this.usageAnalytics.append(info).catch((error) => {
+          console.warn('[UsageAnalytics] Failed to persist request:', error instanceof Error ? error.message : error)
+        })
+      },
       onError: (error) => this.emit('proxy-error', error.message),
       onStatusChange: (running, port) => this.emit('proxy-status-change', { running, port }),
+      onConfigChanged: () => { void this.persistConfig() },
       onTokenRefresh: async (account) => {
         const result = await refreshTokenByMethod({
           refreshToken: account.refreshToken || '',
@@ -372,17 +414,19 @@ export class ProxyRuntime {
           suspendedAt: Date.now()
         })
         // Persist suspended state to backend store
-        const accountData = (this.store.getAccountData(this.userId) || {}) as AccountDataShape
-        const existing = accountData.accounts?.[info.accountId]
-        if (existing) {
+        // Ghi qua updateAccountData: mutator nhận tài liệu mới nhất nên trạng
+        // thái khóa không bị một luồng ghi credentials cũ hơn nuốt mất.
+        await this.store.updateAccountData(this.userId, (data) => {
+          const accountData = data as AccountDataShape
+          const existing = accountData.accounts?.[info.accountId]
+          if (!existing) return
           existing.status = 'blocked'
           existing.lastError = `[${info.reason}] ${info.message}`
           existing.usage = existing.usage || {}
           existing.usage.suspendedAt = Date.now()
           existing.usage.suspendReason = info.reason
           existing.usage.suspendMessage = info.message
-          await this.store.setAccountData(this.userId, accountData)
-        }
+        })
       },
       onAccountQuotaExhausted: async (info) => {
         this.emit('proxy-account-quota-exhausted', {
@@ -391,9 +435,10 @@ export class ProxyRuntime {
           resetAt: info.resetAt,
           message: info.message
         })
-        const accountData = (this.store.getAccountData(this.userId) || {}) as AccountDataShape
-        const existing = accountData.accounts?.[info.accountId]
-        if (existing) {
+        await this.store.updateAccountData(this.userId, (data) => {
+          const accountData = data as AccountDataShape
+          const existing = accountData.accounts?.[info.accountId]
+          if (!existing) return
           existing.status = 'quota_exhausted'
           existing.lastError = 'Quota exhausted until reset'
           existing.usage = {
@@ -403,8 +448,7 @@ export class ProxyRuntime {
               ? new Date(info.resetAt).toISOString().slice(0, 10)
               : existing.usage?.nextResetDate
           }
-          await this.store.setAccountData(this.userId, accountData)
-        }
+        })
       },
       onCreditsUpdate: (totalCredits) => void this.store.setUserSetting(this.userId, 'proxyTotalCredits', totalCredits),
       onTokensUpdate: (inputTokens, outputTokens) => {
@@ -423,12 +467,26 @@ export class ProxyRuntime {
         await this.syncAccountsFromStoreAsync()
       }
     })
+    // Parity với main/index.ts: runtime web trước đây KHÔNG wire webhook trigger, nên
+    // proxy-account-suspended / proxy-all-exhausted / proxy-pool-low không bao giờ tới
+    // renderer và không cảnh báo nào được gửi. Proxy `on*` của browserApi tự sinh
+    // subscriber nên guard optional-chain vẫn pass, khiến lỗi này tàng hình.
+    // Phải phát HAI tham số rời (không phải một object): EmitFn là (channel, ...args) và
+    // browserApi trải envelope.args ra cho callback (event, payload).
+    this.server.setWebhookTrigger((event, payload) => {
+      this.emit('proxy-webhook-trigger', event, payload)
+    })
     this.restorePersistedStats(this.server)
     return this.server
   }
 
   private async updatePersistedAccountCredentials(account: ProxyAccount): Promise<void> {
-    const accountData = (this.store.getAccountData(this.userId) || {}) as AccountDataShape
+    await this.store.updateAccountData(this.userId, (data) => {
+      this.applyAccountCredentials(data as AccountDataShape, account)
+    })
+  }
+
+  private applyAccountCredentials(accountData: AccountDataShape, account: ProxyAccount): void {
     const existing = accountData.accounts?.[account.id]
     if (!existing) return
     existing.profileArn = account.profileArn || existing.profileArn
@@ -463,7 +521,6 @@ export class ProxyRuntime {
     } else if (existing.lastError === 'Quota exhausted until reset') {
       existing.lastError = undefined
     }
-    await this.store.setAccountData(this.userId, accountData)
   }
 
   syncAccountsFromStore(): { success: boolean; accountCount: number } {
@@ -474,7 +531,7 @@ export class ProxyRuntime {
     const accountEntries = Object.entries(accountMap)
     const bindings = accountData.accountProxyBindings || {}
     const proxyPool = accountData.proxyPool || {}
-    const maxUsableLatencyMs = Math.max(100, Number(accountData.proxyPoolConfig?.maxUsableLatencyMs) || 1000)
+    const maxUsableLatencyMs = Math.max(100, Number(accountData.proxyPoolConfig?.maxUsableLatencyMs) || 2500)
     const proxyAccounts: ProxyAccount[] = []
     let skippedNoProfileArn = 0
     let lifecycleChanged = false
@@ -584,9 +641,12 @@ export class ProxyRuntime {
   async getStatus(): Promise<{ running: boolean; config: ProxyConfig; stats: unknown; sessionStats: unknown }> {
     await this.ensureAutoStarted('status')
     const server = this.getOrCreateServer()
+    const config = server.getConfig()
+    const publicConfig = { ...config }
+    delete publicConfig.chatgptAccounts
     return {
       running: server.isRunning(),
-      config: server.getConfig(),
+      config: publicConfig,
       stats: serializeStats(server.getStats()),
       sessionStats: server.getSessionStats()
     }
@@ -595,7 +655,16 @@ export class ProxyRuntime {
   async updateConfig(config: Partial<ProxyConfig>): Promise<{ success: boolean; config?: ProxyConfig; error?: string }> {
     try {
       const server = this.getOrCreateServer()
-      server.updateConfig({ ...config, enabled: true, autoStart: true })
+      const nextConfig: Partial<ProxyConfig> = { ...config, enabled: true, autoStart: true }
+      if (config.customApiProviders) {
+        nextConfig.customApiProviders = await this.discoverCustomProviderModels(config.customApiProviders)
+      }
+      const providerCatalogChanged = 'customApiProviders' in config || 'bedrock' in config || 'chatgptCodex' in config
+      server.updateConfig(nextConfig)
+      if (providerCatalogChanged) {
+        server.clearModelCache()
+        server.requestPoolCapabilityScan()
+      }
       await this.persistConfig()
       if (server.needsRestart()) {
         await this.syncAccountsFromStoreAsync()
@@ -607,6 +676,11 @@ export class ProxyRuntime {
         if (!started.success) {
           return { success: false, config: server.getConfig(), error: started.error }
         }
+      }
+      if (providerCatalogChanged) {
+        void server.getAvailableModels().catch((error) => {
+          console.warn('[ProxyRuntime] Automatic model catalog warmup failed:', error instanceof Error ? error.message : error)
+        })
       }
       return { success: true, config: server.getConfig() }
     } catch (error) {
@@ -677,6 +751,7 @@ export class ProxyRuntime {
 
   async getModels(): Promise<{ success: boolean; models: unknown[]; fromCache?: boolean; error?: string }> {
     try {
+      await this.syncAccountsFromStoreAsync()
       const result = await this.getOrCreateServer().getAvailableModels()
       return { success: true, ...result }
     } catch (error) {
@@ -727,14 +802,7 @@ export class ProxyRuntime {
    * actually invoke. Does NOT persist anything; the UI decides whether to save.
    */
   getBedrockStatus(): { configured: boolean; error?: string; lastChecked?: number } {
-    const server = this.getOrCreateServer()
-    const cfg = (server as any).config?.bedrock
-    if (!cfg?.enabled) return { configured: false }
-    const lastError = (server as any).bedrockLastError as { message: string; timestamp: number } | null | undefined
-    if (lastError) {
-      return { configured: true, error: lastError.message, lastChecked: lastError.timestamp }
-    }
-    return { configured: true }
+    return this.getOrCreateServer().getBedrockStatus()
   }
 
   async testBedrock(input: { accessKeyId?: string; secretAccessKey?: string; sessionToken?: string; region?: string }): Promise<{ success: boolean; region?: string; models?: BedrockAvailableModel[]; error?: string }> {
@@ -759,6 +827,56 @@ export class ProxyRuntime {
       apiKey: input?.apiKey?.trim(),
       baseUrl: input?.baseUrl?.trim()
     })
+  }
+
+  async getUsageAnalytics(input?: {
+    period?: UsageAnalyticsPeriod | string
+    recentLimit?: number
+  }): Promise<Awaited<ReturnType<UsageAnalyticsStore['getSnapshot']>>> {
+    return this.usageAnalytics.getSnapshot(input?.period || 'today', input?.recentLimit || 100)
+  }
+
+  async clearUsageAnalytics(): Promise<{ success: true }> {
+    return this.usageAnalytics.clear()
+  }
+
+  async syncRoutingStateFromStore(): Promise<{ success: boolean; accountCount: number }> {
+    const result = await this.syncAccountsFromStoreAsync()
+    const server = this.getOrCreateServer()
+    server.clearModelCache()
+    server.requestPoolCapabilityScan()
+    void server.getAvailableModels().catch((error) => {
+      console.warn('[ProxyRuntime] Automatic routing catalog refresh failed:', error instanceof Error ? error.message : error)
+    })
+    return result
+  }
+
+  getChatGPTOAuthStatus(): ReturnType<ProxyServer['getChatGPTOAuthStatus']> {
+    return this.getOrCreateServer().getChatGPTOAuthStatus()
+  }
+
+  startChatGPTOAuth(): ReturnType<ProxyServer['startChatGPTOAuth']> {
+    return this.getOrCreateServer().startChatGPTOAuth('manual')
+  }
+
+  submitChatGPTOAuthCallback(callbackUrl: string): ReturnType<ProxyServer['submitChatGPTOAuthCallback']> {
+    return this.getOrCreateServer().submitChatGPTOAuthCallback(callbackUrl)
+  }
+
+  refreshChatGPTCodexState(accountId?: string): ReturnType<ProxyServer['refreshChatGPTCodexState']> {
+    return this.getOrCreateServer().refreshChatGPTCodexState(accountId)
+  }
+
+  cancelChatGPTOAuth(): ReturnType<ProxyServer['cancelChatGPTOAuth']> {
+    return this.getOrCreateServer().cancelChatGPTOAuth()
+  }
+
+  logoutChatGPTAccount(accountId?: string): ReturnType<ProxyServer['logoutChatGPTAccount']> {
+    return this.getOrCreateServer().logoutChatGPTAccount(accountId)
+  }
+
+  async testCustomApi(input: CustomApiProviderConfig): Promise<Awaited<ReturnType<typeof testCustomApiProvider>>> {
+    return testCustomApiProvider(input)
   }
 
 
@@ -892,6 +1010,7 @@ export class ProxyRuntime {
     modelId: string
     modelName?: string
     models?: ProxyClientModel[]
+    reasoningEffort?: string
   }): Promise<unknown> {
     const config = this.getOrCreateServer().getConfig()
     const apiKey = await this.getOrCreateClientApiKey()
@@ -903,7 +1022,8 @@ export class ProxyRuntime {
       apiKey: apiKey.key,
       modelId: input.modelId,
       modelName: input.modelName,
-      models: input.models
+      models: input.models,
+      reasoningEffort: input.reasoningEffort
     })
     return {
       ...result,
@@ -936,30 +1056,26 @@ export class ProxyRuntime {
 
   // Phase 8: Account health
   getAccountHealth(): { accounts: unknown[] } {
-    const server = this.getOrCreateServer()
-    const pool = (server as any).accountPool
-    if (!pool) return { accounts: [] }
+    const pool = this.getOrCreateServer().getAccountPool()
     const accounts = pool.getAllAccounts()
     return {
-      accounts: accounts.map((a: any) => ({
-        id: a.id,
-        email: a.email,
-        tier: a.subscriptionType,
-        isAvailable: a.isAvailable !== false,
-        health: pool.getAccountHealth(a.id),
-        lastUsed: a.lastUsed,
-        requestCount: a.requestCount || 0,
-        quotaUsed: a.quotaUsed || 0,
-        quotaLimit: a.quotaLimit
+      accounts: accounts.map((account) => ({
+        id: account.id,
+        email: account.email,
+        tier: account.subscriptionType,
+        isAvailable: account.isAvailable !== false,
+        health: pool.getAccountHealth(account.id),
+        lastUsed: account.lastUsed,
+        requestCount: account.requestCount || 0,
+        quotaUsed: account.quotaUsed || 0,
+        quotaLimit: account.quotaLimit
       }))
     }
   }
 
   // Phase 9: Quota predictions
   getQuotaPredictions(): { predictions: unknown[]; status: unknown } {
-    const server = this.getOrCreateServer()
-    const pool = (server as any).accountPool
-    if (!pool) return { predictions: [], status: { total: 0, available: 0, exhausted: 0, cooldown: 0 } }
+    const pool = this.getOrCreateServer().getAccountPool()
     return {
       predictions: pool.getQuotaPredictions(),
       status: pool.getQuotaStatus()

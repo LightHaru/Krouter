@@ -83,17 +83,18 @@ describe('configureProxyClients E2E (sandboxed HOME)', () => {
     )
   })
 
-  it('Codex CLI -> ~/.codex/auth.json + config.toml with model_providers.kiro', () => {
+  it('Codex CLI -> ~/.codex/auth.json + config.toml with model_providers.krouter', () => {
     const auth = join(SANDBOX, '.codex', 'auth.json')
     const conf = join(SANDBOX, '.codex', 'config.toml')
     expect(existsSync(auth)).toBe(true)
     expect(existsSync(conf)).toBe(true)
     expect(readJson(auth).OPENAI_API_KEY).toBe(INPUT.apiKey)
     const toml = readFileSync(conf, 'utf-8')
-    expect(toml).toContain('model_provider = "kiro"')
+    expect(toml).toContain('model_provider = "krouter"')
     expect(toml).toContain('model = "claude-sonnet-4.5"')
-    expect(toml).toContain('[model_providers.kiro]')
+    expect(toml).toContain('[model_providers.krouter]')
     expect(toml).toContain('base_url = "http://127.0.0.1:5580/v1"')
+    expect(toml).toContain('env_key = "OPENAI_API_KEY"')
     expect(toml).toContain('wire_api = "responses"')
   })
 
@@ -109,15 +110,20 @@ describe('configureProxyClients E2E (sandboxed HOME)', () => {
     expect(readJson(settings).security.auth.selectedType).toBe('gemini-api-key')
   })
 
-  it('Hermes -> ~/.hermes/config.yaml with kiro custom provider', () => {
+  it('Hermes -> config.yaml plus secret-only .env with named custom provider', () => {
     const p = join(SANDBOX, '.hermes', 'config.yaml')
+    const envPath = join(SANDBOX, '.hermes', '.env')
     expect(existsSync(p)).toBe(true)
+    expect(existsSync(envPath)).toBe(true)
     const yaml = readFileSync(p, 'utf-8')
     expect(yaml).toContain('custom_providers:')
-    expect(yaml).toContain('- name: kiro')
+    expect(yaml).toContain('- name: krouter')
     expect(yaml).toContain('base_url: http://127.0.0.1:5580/v1')
-    expect(yaml).toContain(`api_key: ${INPUT.apiKey}`)
-    expect(yaml).toContain('default: "kiro/claude-sonnet-4.5"')
+    expect(yaml).toContain('key_env: KROUTER_API_KEY')
+    expect(yaml).toContain('api_mode: chat_completions')
+    expect(yaml).toContain('provider: "custom:krouter"')
+    expect(yaml).not.toContain(INPUT.apiKey)
+    expect(readFileSync(envPath, 'utf-8')).toContain(`KROUTER_API_KEY=${INPUT.apiKey}`)
   })
 
   it('OpenClaw -> ~/.openclaw/openclaw.json with krouter provider', () => {
@@ -130,16 +136,20 @@ describe('configureProxyClients E2E (sandboxed HOME)', () => {
     expect(provider.apiKey).toBe(INPUT.apiKey)
     expect(provider.api).toBe('openai-completions')
     expect(provider.auth).toBe('api-key')
+    expect(provider.timeoutSeconds).toBe(1800)
     expect(Array.isArray(provider.models)).toBe(true)
     expect(provider.models.map((m: any) => m.id)).toEqual(
       expect.arrayContaining(['claude-sonnet-4.5', 'claude-opus-4.8', 'claude-haiku-4.5'])
     )
     // agents.defaults.model primary + fallbacks reference the krouter provider
     expect(cfg.agents.defaults.model.primary).toBe('krouter/claude-sonnet-4.5')
+    expect(cfg.agents.defaults.timeoutSeconds).toBe(1800)
     expect(Array.isArray(cfg.agents.defaults.model.fallbacks)).toBe(true)
     for (const ref of cfg.agents.defaults.model.fallbacks) {
       expect(String(ref).startsWith('krouter/')).toBe(true)
     }
+    expect(existsSync(join(SANDBOX, '.openclaw', 'skills', 'krouter-image', 'SKILL.md'))).toBe(true)
+    expect(existsSync(join(SANDBOX, '.openclaw', 'skills', 'krouter-image', 'scripts', 'generate-image.cjs'))).toBe(true)
   })
 
   it('merges + backs up an existing OpenClaw config instead of clobbering', async () => {
@@ -149,7 +159,8 @@ describe('configureProxyClients E2E (sandboxed HOME)', () => {
     mkdirSync(dir, { recursive: true })
     const file = join(dir, 'openclaw.json')
     writeFileSync(file, JSON.stringify({
-      models: { providers: { myProvider: { baseUrl: 'http://x', models: [] } } },
+      models: { providers: { myProvider: { baseUrl: 'http://x', models: [] }, krouter: { timeoutSeconds: 3600 } } },
+      agents: { defaults: { timeoutSeconds: 5400 } },
       somethingElse: { keep: true }
     }, null, 2))
 
@@ -170,8 +181,46 @@ describe('configureProxyClients E2E (sandboxed HOME)', () => {
     expect(cfg.somethingElse.keep).toBe(true)
     // krouter provider added
     expect(cfg.models.providers.krouter).toBeTruthy()
+    expect(cfg.models.providers.krouter.timeoutSeconds).toBe(3600)
+    expect(cfg.agents.defaults.timeoutSeconds).toBe(5400)
     // a backup file was created
     const backups = readdirSync(dir).filter((f) => f.includes('.kiro-backup-'))
     expect(backups.length).toBeGreaterThan(0)
+  })
+
+  it('writes ChatGPT model capabilities and selected reasoning effort for Codex, Hermes and OpenClaw', async () => {
+    const chatgptInput = {
+      ...INPUT,
+      clients: ['codex', 'hermes', 'openclaw'] as const,
+      modelId: 'chatgpt/gpt-5.6-sol',
+      modelName: 'GPT-5.6 Sol',
+      reasoningEffort: 'max',
+      models: [{
+        id: 'chatgpt/gpt-5.6-sol',
+        name: 'GPT-5.6 Sol',
+        inputTypes: ['TEXT', 'IMAGE'],
+        maxInputTokens: 272000,
+        maxOutputTokens: 128000,
+        supportsThinking: true,
+        thinkingEfforts: ['auto', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+        modelProvider: 'chatgpt'
+      }]
+    }
+    const configured = await configureProxyClients({ ...chatgptInput, clients: [...chatgptInput.clients] })
+    expect(configured.success).toBe(true)
+
+    const toml = readFileSync(join(SANDBOX, '.codex', 'config.toml'), 'utf-8')
+    expect(toml).toContain('model = "chatgpt/gpt-5.6-sol"')
+    expect(toml).toContain('model_reasoning_effort = "xhigh"')
+
+    const yaml = readFileSync(join(SANDBOX, '.hermes', 'config.yaml'), 'utf-8')
+    expect(yaml).toContain('reasoning_effort: xhigh')
+    expect(yaml).toContain('default: "chatgpt/gpt-5.6-sol"')
+    expect(yaml).toContain('provider: "custom:krouter"')
+
+    const openclaw = readJson(join(SANDBOX, '.openclaw', 'openclaw.json'))
+    const model = openclaw.models.providers.krouter.models.find((item: any) => item.id === 'chatgpt/gpt-5.6-sol')
+    expect(model.reasoning).toBe(true)
+    expect(openclaw.agents.defaults.models['krouter/chatgpt/gpt-5.6-sol'].params.extra_body.reasoning_effort).toBe('xhigh')
   })
 })

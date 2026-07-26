@@ -132,7 +132,7 @@ function registerNetworkRouteValidateHandler(): void {
     timeoutMs?: number
   }) => {
     const proxyUrl = getSystemProxy()
-    return validateNetworkRequest({
+    return await validateNetworkRequest({
       testUrl: params?.testUrl,
       timeoutMs: params?.timeoutMs,
       proxyUrl,

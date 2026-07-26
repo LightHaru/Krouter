@@ -4,7 +4,7 @@ import { isPlaceholderProfileArn, useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { IdpType, SubscriptionType } from '@/types/account'
 import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff } from 'lucide-react'
-import { splitCredentialLine } from '@/lib/utils'
+import { copyText, splitCredentialLine } from '@/lib/utils'
 
 interface AddAccountDialogProps {
   isOpen: boolean
@@ -73,7 +73,7 @@ interface OidcCredential {
   machineId?: string
 }
 
-type ImportMode = 'oidc' | 'sso' | 'login' | 'apiKey' | 'bedrock' | 'xpixi'
+type ImportMode = 'oidc' | 'sso' | 'login' | 'apiKey' | 'bedrock' | 'customApi'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso'
 
 export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDialogProps): React.ReactNode {
@@ -144,11 +144,14 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
   const [bedrockTested, setBedrockTested] = useState(false)
   const [bedrockSelectedModels, setBedrockSelectedModels] = useState<string[]>([])
 
-  // Xpixi (third-party API provider)
+  // Generic OpenAI/Anthropic-compatible upstream provider.
+  const [customProviderName, setCustomProviderName] = useState('')
+  const [customProtocol, setCustomProtocol] = useState<'openai' | 'anthropic'>('openai')
+  const [customRoutePrefix, setCustomRoutePrefix] = useState('')
   const [xpixiApiKey, setXpixiApiKey] = useState('')
-  const [xpixiBaseUrl, setXpixiBaseUrl] = useState('https://api.xpiki.com')
+  const [xpixiBaseUrl, setXpixiBaseUrl] = useState('https://api.openai.com')
   const [xpixiTesting, setXpixiTesting] = useState(false)
-  const [xpixiModels, setXpixiModels] = useState<Array<{ id: string }>>([])
+  const [xpixiModels, setXpixiModels] = useState<Array<{ id: string; upstreamId?: string }>>([])
   const [xpixiTested, setXpixiTested] = useState(false)
   const [xpixiSelectedModels, setXpixiSelectedModels] = useState<string[]>([])
 
@@ -243,6 +246,20 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
     }
   }, [])
 
+  // Đóng hộp thoại vẫn giữ component mounted (AccountManager render vô điều kiện),
+  // nên phải tự dừng vòng poll device-auth ở đây; nếu không nó chạy mãi mỗi 5 giây
+  // và mở/đóng nhiều lần sẽ chồng thêm interval.
+  useEffect(() => {
+    if (isOpen) return
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current)
+      pollIntervalRef.current = null
+    }
+    setIsLoggingIn(false)
+    setBuilderIdLoginData(null)
+    setIamSsoLoginData(null)
+  }, [isOpen])
+
   // 打开弹窗时默认选中"当前打开的分组"（activeGroupTab 为真实分组时），否则未分组
   useEffect(() => {
     if (!isOpen) return
@@ -255,7 +272,8 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
     if (!isLoggingIn || loginType === 'builderid') return
 
     const unsubscribe = window.api.onSocialAuthCallback(async (data) => {
-      console.log('[AddAccountDialog] Social auth callback:', data)
+      // Không log nguyên payload: nó chứa authorization code còn dùng được và state
+      console.log('[AddAccountDialog] Social auth callback received', { hasCode: !!data.code, error: data.error })
       
       if (data.error) {
         setError(`登录失败: ${data.error}`)
@@ -409,7 +427,7 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
         window.api.openExternal(result.verificationUri, usePrivateMode)
 
         // 开始轮询
-        startPolling(result.interval || 5)
+        startPolling(result.interval || 5, result.expiresIn || 600)
       } else {
         setError(result.error || '启动登录失败')
         setIsLoggingIn(false)
@@ -448,7 +466,7 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
         window.api.openExternal(verificationUri, usePrivateMode)
 
         // 开始轮询（device flow 轮询 AWS；旧 Electron 流程轮询本地回调结果）
-        startIamSsoPolling(result.interval || 3)
+        startIamSsoPolling(result.interval || 3, result.expiresIn || 600)
       } else {
         setError(result.error || (isEn ? 'Failed to start login' : '启动登录失败'))
         setIsLoggingIn(false)
@@ -460,12 +478,25 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
   }
 
   // 开始轮询 IAM SSO 授权
-  const startIamSsoPolling = (interval: number) => {
+  const startIamSsoPolling = (interval: number, expiresIn: number) => {
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current)
     }
 
+    // Chặn thời gian poll theo expiresIn của device auth (kẹp trong 1~15 phút)
+    const deadline = Date.now() + Math.min(Math.max(expiresIn, 60), 900) * 1000
+
     pollIntervalRef.current = setInterval(async () => {
+      if (Date.now() >= deadline) {
+        if (pollIntervalRef.current) {
+          clearInterval(pollIntervalRef.current)
+          pollIntervalRef.current = null
+        }
+        setError(isEn ? 'Authorization code expired, please try again' : '授权码已过期，请重新登录')
+        setIsLoggingIn(false)
+        setIamSsoLoginData(null)
+        return
+      }
       try {
         const result = await window.api.pollIamSsoAuth(region)
         
@@ -508,12 +539,25 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
   }
 
   // 开始轮询 Builder ID 授权
-  const startPolling = (interval: number) => {
+  const startPolling = (interval: number, expiresIn: number) => {
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current)
     }
 
+    // Chặn thời gian poll theo expiresIn của device auth (kẹp trong 1~15 phút)
+    const deadline = Date.now() + Math.min(Math.max(expiresIn, 60), 900) * 1000
+
     pollIntervalRef.current = setInterval(async () => {
+      if (Date.now() >= deadline) {
+        if (pollIntervalRef.current) {
+          clearInterval(pollIntervalRef.current)
+          pollIntervalRef.current = null
+        }
+        setError(isEn ? 'Authorization code expired, please try again' : '授权码已过期，请重新登录')
+        setIsLoggingIn(false)
+        setBuilderIdLoginData(null)
+        return
+      }
       try {
         const result = await window.api.pollBuilderIdAuth(region)
         
@@ -652,7 +696,7 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
 
   const handleCopyUserCode = async () => {
     if (builderIdLoginData?.userCode) {
-      await navigator.clipboard.writeText(builderIdLoginData.userCode)
+      await copyText(builderIdLoginData.userCode)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     }
@@ -1310,66 +1354,91 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
     }
   }
 
-  // Test Xpixi credentials
+  // Test a generic OpenAI/Anthropic-compatible provider.
   const handleXpixiTest = async () => {
     const apiKey = xpixiApiKey.trim()
     if (!apiKey) {
-      setError(isEn ? 'Enter Xpixi API key' : 'Nhập Xpixi API key')
+      setError(isEn ? 'Enter an API key' : 'Nhập API key')
       return
     }
     setXpixiTesting(true)
     setError(null)
     try {
-      const result = await window.api.proxyTestXpixi({
+      const id = (customRoutePrefix || customProviderName || 'custom').trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-')
+      const result = await window.api.proxyTestCustomApi({
+        id,
+        name: customProviderName.trim() || id,
+        enabled: true,
+        protocol: customProtocol,
+        authType: customProtocol === 'anthropic' ? 'x-api-key' : 'bearer',
         apiKey,
-        baseUrl: xpixiBaseUrl.trim() || 'https://api.xpiki.com'
+        baseUrl: xpixiBaseUrl.trim(),
+        routePrefix: customRoutePrefix.trim() || id
       })
       if (result.success) {
         setXpixiTested(true)
-        setXpixiModels(result.models || [])
+        setXpixiModels((result.models || []).map((model) => ({ id: model.upstreamId || model.id, upstreamId: model.upstreamId })))
         setXpixiSelectedModels([])
         setError(null)
       } else {
         setXpixiTested(false)
         setXpixiModels([])
-        setError(result.error || (isEn ? 'Xpixi API key test failed' : 'Kiểm tra key Xpixi thất bại'))
+        setError(result.error || (isEn ? 'Custom API test failed' : 'Kiểm tra Custom API thất bại'))
       }
     } catch (e) {
       setXpixiTested(false)
-      setError(e instanceof Error ? e.message : (isEn ? 'Xpixi API key test failed' : 'Kiểm tra key Xpixi thất bại'))
+      setError(e instanceof Error ? e.message : (isEn ? 'Custom API test failed' : 'Kiểm tra Custom API thất bại'))
     } finally {
       setXpixiTesting(false)
     }
   }
 
-  // Save Xpixi credentials into the proxy config
+  // Append the provider without replacing existing providers.
   const handleXpixiSave = async () => {
     const apiKey = xpixiApiKey.trim()
     if (!apiKey) {
-      setError(isEn ? 'Enter Xpixi API key' : 'Nhập Xpixi API key')
+      setError(isEn ? 'Enter an API key' : 'Nhập API key')
       return
     }
     setIsSubmitting(true)
     setError(null)
     try {
-      const result = await window.api.proxyUpdateConfig({
-        xpixi: {
+      const status = await window.api.proxyGetStatus()
+      const current = ((status.config as { customApiProviders?: unknown[] } | undefined)?.customApiProviders || [])
+      const id = (customRoutePrefix || customProviderName || `custom-${Date.now()}`).trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-')
+      const providerConfig = {
           enabled: true,
+          id,
+          name: customProviderName.trim() || id,
+          protocol: customProtocol,
+          authType: customProtocol === 'anthropic' ? 'x-api-key' as const : 'bearer' as const,
           apiKey,
-          baseUrl: xpixiBaseUrl.trim() || 'https://api.xpiki.com',
+          keys: [{
+            id: `${id}-key-1`,
+            name: 'Key 1',
+            apiKey,
+            enabled: true,
+            createdAt: Date.now()
+          }],
+          baseUrl: xpixiBaseUrl.trim(),
+          routePrefix: customRoutePrefix.trim() || id,
+          reasoningEffort: 'auto' as const,
+          modelDiscoveryMode: 'auto' as const,
           models: xpixiTested && xpixiModels.length > 0 && xpixiSelectedModels.length < xpixiModels.length
             ? xpixiSelectedModels
             : []
-        }
+      }
+      const result = await window.api.proxyUpdateConfig({
+        customApiProviders: [...current, providerConfig]
       })
       if (result.success) {
         resetForm()
         onClose()
       } else {
-        setError(result.error || (isEn ? 'Failed to save Xpixi provider' : 'Lưu Xpixi thất bại'))
+        setError(result.error || (isEn ? 'Failed to save Custom API provider' : 'Lưu Custom API thất bại'))
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : (isEn ? 'Failed to save Xpixi provider' : 'Lưu Xpixi thất bại'))
+      setError(e instanceof Error ? e.message : (isEn ? 'Failed to save Custom API provider' : 'Lưu Custom API thất bại'))
     } finally {
       setIsSubmitting(false)
     }
@@ -1398,6 +1467,14 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
     setBedrockModels([])
     setBedrockSelectedModels([])
     setBedrockTested(false)
+    setCustomProviderName('')
+    setCustomProtocol('openai')
+    setCustomRoutePrefix('')
+    setXpixiApiKey('')
+    setXpixiBaseUrl('https://api.openai.com')
+    setXpixiModels([])
+    setXpixiSelectedModels([])
+    setXpixiTested(false)
     setBedrockTesting(false)
     setVerifiedData(null)
     setError(null)
@@ -1837,7 +1914,7 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
                                 variant="ghost"
                                 size="sm"
                                 onClick={() => {
-                                  navigator.clipboard.writeText(iamSsoLoginData.userCode)
+                                  copyText(iamSsoLoginData.userCode)
                                   setCopied(true)
                                   setTimeout(() => setCopied(false), 2000)
                                 }}
@@ -1933,7 +2010,7 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
                    <div className="flex-1">
                       <p className="text-sm font-semibold text-primary mb-1.5">{isEn ? 'How to get Token?' : '如何获取 Token?'}</p>
                       <ol className="text-xs text-primary/90 list-decimal list-inside space-y-1.5">
-                        <li>{isEn ? 'Visit and login:' : '在浏览器中访问并登录:'} <a href="https://view.awsapps.com/start/#/device?user_code=PQCF-FCCN/start/#/device?user_code=PQCF-FCCN" target="_blank" className="underline hover:text-primary/80 font-medium">view.awsapps.com/start/#/device?user_code=PQCF-FCCN</a></li>
+                        <li>{isEn ? 'Visit and login:' : '在浏览器中访问并登录:'} <a href="https://view.awsapps.com/start/#/device?user_code=PQCF-FCCN/start/#/device?user_code=PQCF-FCCN" target="_blank" rel="noreferrer" className="underline hover:text-primary/80 font-medium">view.awsapps.com/start/#/device?user_code=PQCF-FCCN</a></li>
                         <li>{isEn ? 'Press F12 → Application → Cookies' : '按 F12 打开开发者工具 → Application → Cookies'}</li>
                         <li>{isEn ? 'Find and copy' : '找到并复制'} <code className="px-1 py-0.5 bg-primary/15 rounded font-mono text-[10px]">x-amz-sso_authn</code> {isEn ? 'value' : '的值'}</li>
                       </ol>
@@ -2172,19 +2249,30 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
             </div>
           )}
 
-          {/* Xpixi provider config */}
-          {importMode === 'xpixi' && !verifiedData && (
+          {/* Generic Custom API provider config */}
+          {importMode === 'customApi' && !verifiedData && (
             <div className="space-y-5">
               <div className="p-3 bg-muted/60 rounded-xl border text-xs text-muted-foreground">
                 {isEn
-                  ? 'Connect Xpixi as a third-party API provider. The API key is stored in proxy config and Claude models from xpiki.com become routable through Krouter.'
-                  : 'Kết nối Xpixi làm nhà cung cấp API bên thứ ba. Key được lưu trong config proxy; các model Claude từ xpiki.com sẽ định tuyến được qua Krouter.'}
+                  ? 'Connect any OpenAI- or Anthropic-compatible endpoint. Krouter discovers its models and exposes them through an isolated prefix.'
+                  : 'Kết nối endpoint tương thích OpenAI hoặc Anthropic từ bất kỳ website nào. Krouter sẽ tải model và expose qua prefix riêng.'}
               </div>
 
               <div className="space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <Label className="text-sm font-medium">{isEn ? 'Provider name' : 'Tên provider'}</Label>
+                    <Input value={customProviderName} onChange={(e) => { setCustomProviderName(e.target.value); setXpixiTested(false) }} placeholder="OpenAI, Claude Gateway..." />
+                  </div>
+                  <div className="space-y-2">
+                    <Label className="text-sm font-medium">Protocol</Label>
+                    <Select value={customProtocol} onChange={(value) => { setCustomProtocol(value as 'openai' | 'anthropic'); setXpixiTested(false) }} options={[{ value: 'openai', label: 'OpenAI compatible' }, { value: 'anthropic', label: 'Anthropic compatible' }]} />
+                  </div>
+                </div>
+
                 <div className="space-y-2">
                   <Label className="text-sm font-medium">
-                    Xpixi API Key <span className="text-destructive">*</span>
+                    API Key <span className="text-destructive">*</span>
                   </Label>
                   <Input
                     type="password"
@@ -2198,13 +2286,19 @@ export function AddAccountDialog({ isOpen, onClose, defaultMode }: AddAccountDia
                 </div>
 
                 <div className="space-y-2">
-                  <Label className="text-sm font-medium">{isEn ? 'Base URL (optional)' : 'Base URL (tùy chọn)'}</Label>
+                  <Label className="text-sm font-medium">Base URL <span className="text-destructive">*</span></Label>
                   <Input
                     value={xpixiBaseUrl}
                     onChange={(e) => { setXpixiBaseUrl(e.target.value); setXpixiTested(false) }}
-                    placeholder="https://api.xpiki.com"
+                    placeholder={customProtocol === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com'}
                     className="font-mono"
                   />
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">{isEn ? 'Model route prefix' : 'Prefix định tuyến model'}</Label>
+                  <Input value={customRoutePrefix} onChange={(e) => { setCustomRoutePrefix(e.target.value); setXpixiTested(false) }} placeholder="my-provider" className="font-mono" />
+                  <p className="text-xs text-muted-foreground">{isEn ? 'Example: my-provider/gpt-4.1 prevents collisions with other providers.' : 'Ví dụ: my-provider/gpt-4.1 giúp không trùng model giữa các provider.'}</p>
                 </div>
 
                 <div>
@@ -2641,7 +2735,7 @@ email----password----refreshToken----clientId----clientSecret`
             </div>
           )}
 
-          {importMode === 'xpixi' && (
+          {importMode === 'customApi' && (
             <div className="flex justify-end gap-3 pt-4 border-t">
               <Button type="button" variant="outline" onClick={() => setImportMode('login')} className="rounded-xl h-10 px-6">
                 {isEn ? 'Back' : 'Quay lại'}
@@ -2652,7 +2746,7 @@ email----password----refreshToken----clientId----clientSecret`
                 className="rounded-xl h-10 px-6"
               >
                 {isSubmitting && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-                {isEn ? 'Save Provider' : 'Lưu Xpixi'}
+                {isEn ? 'Save Provider' : 'Lưu Custom API'}
               </Button>
             </div>
           )}

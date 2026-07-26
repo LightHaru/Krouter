@@ -1,4 +1,4 @@
-import { promises as fs } from 'fs'
+import { promises as fs, mkdirSync, readFileSync, writeFileSync, renameSync } from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 
@@ -31,6 +31,22 @@ export interface WebStoreData {
 
 const SENSITIVE_KEY_RE = /^(accessToken|refreshToken|csrfToken|clientSecret|password|apiKey|key|token|secret|secretAccessKey|sessionToken)$/i
 const ENCRYPTED_MARKER = '__kiroWebEncrypted'
+// Khóa mặc định hardcode của các bản cũ. Chỉ dùng để giải mã dữ liệu cũ.
+const LEGACY_ENCRYPTION_KEY = 'development-only-change-me'
+const LEGACY_SESSION_SECRET = 'development-session-secret'
+const INSTANCE_SECRETS_FILE = 'instance-secrets.json'
+const MAX_SESSIONS_PER_USER = 20
+/** Trần cho mọi danh sách tombstone (account và proxy) để chúng không phình theo vòng đời app. */
+const MAX_TOMBSTONES = 5000
+const PBKDF2_ITERATIONS = 120000
+
+interface InstanceSecrets {
+  encryptionKey: string
+  sessionSecret: string
+}
+
+let cachedInstanceSecrets: InstanceSecrets | null = null
+let instanceSecretsUnavailable = false
 
 function dataDir(): string {
   return path.resolve(process.env.KROUTER_DATA_DIR || process.env.KAM_DATA_DIR || process.env.KIRO_WEB_DATA_DIR || '.web-data')
@@ -40,14 +56,98 @@ function storePath(): string {
   return path.join(dataDir(), 'store.json')
 }
 
+function backupPath(): string {
+  return `${storePath()}.bak`
+}
+
+function instanceSecretsPath(): string {
+  return path.join(dataDir(), INSTANCE_SECRETS_FILE)
+}
+
+// Bí mật riêng cho từng bản cài. Lần đầu chạy sẽ sinh ngẫu nhiên và ghi xuống
+// đĩa với quyền 0600, nhờ vậy không còn bản cài nào dùng chung khóa hardcode.
+function instanceSecrets(): InstanceSecrets | null {
+  if (cachedInstanceSecrets) return cachedInstanceSecrets
+  if (instanceSecretsUnavailable) return null
+  try {
+    const parsed = JSON.parse(readFileSync(instanceSecretsPath(), 'utf8')) as Partial<InstanceSecrets>
+    if (parsed && typeof parsed.encryptionKey === 'string' && parsed.encryptionKey
+      && typeof parsed.sessionSecret === 'string' && parsed.sessionSecret) {
+      cachedInstanceSecrets = { encryptionKey: parsed.encryptionKey, sessionSecret: parsed.sessionSecret }
+      return cachedInstanceSecrets
+    }
+    // File tồn tại nhưng hỏng/thiếu trường: TUYỆT ĐỐI không sinh khóa mới đè lên.
+    // Toàn bộ token trong store.json được mã hóa bằng khóa cũ; sinh lại là hủy vĩnh viễn
+    // dữ liệu đó mà chỉ để lại một dòng cảnh báo. Dừng hẳn để người dùng khôi phục được.
+    throw new Error(
+      `[Store] ${instanceSecretsPath()} tồn tại nhưng không hợp lệ. Không sinh khóa mới để tránh hủy dữ liệu đã mã hóa.`
+      + ' Hãy khôi phục file này từ backup, hoặc xóa nó nếu chấp nhận mất toàn bộ token đã lưu.'
+    )
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    // Chỉ ENOENT mới được đi tiếp sang nhánh sinh mới. Mọi lỗi khác (JSON hỏng, EACCES,
+    // EISDIR, và cả lỗi ném ở trên) phải nổi lên chứ không được nuốt.
+    if (code !== 'ENOENT') throw error
+  }
+  try {
+    const generated: InstanceSecrets = {
+      encryptionKey: crypto.randomBytes(32).toString('hex'),
+      sessionSecret: crypto.randomBytes(32).toString('hex')
+    }
+    mkdirSync(dataDir(), { recursive: true })
+    // Ghi nguyên tử: writeFileSync trực tiếp có thể để lại file cắt dở khi mất điện /
+    // hết đĩa, và chính file cắt dở đó sẽ kích hoạt nhánh "không hợp lệ" ở trên.
+    const tmpPath = `${instanceSecretsPath()}.tmp`
+    writeFileSync(tmpPath, JSON.stringify(generated, null, 2), { encoding: 'utf8', mode: 0o600 })
+    renameSync(tmpPath, instanceSecretsPath())
+    console.log(`[Store] Đã tạo bí mật riêng cho bản cài này tại ${instanceSecretsPath()}`)
+    cachedInstanceSecrets = generated
+    return cachedInstanceSecrets
+  } catch (error) {
+    instanceSecretsUnavailable = true
+    console.warn(
+      `[Store] CẢNH BÁO BẢO MẬT: không ghi được ${instanceSecretsPath()} nên đang dùng khóa mặc định công khai.`
+      + ' Hãy đặt APP_ENCRYPTION_KEY và SESSION_SECRET ngay:',
+      error
+    )
+    return null
+  }
+}
+
 function encryptionKey(): Buffer {
-  const configured = process.env.APP_ENCRYPTION_KEY || 'development-only-change-me'
+  const configured = process.env.APP_ENCRYPTION_KEY || instanceSecrets()?.encryptionKey || LEGACY_ENCRYPTION_KEY
   return crypto.createHash('sha256').update(configured).digest()
 }
 
+// Shim tương thích: dữ liệu của bản cài cũ được mã hóa bằng khóa hardcode.
+function legacyEncryptionKey(): Buffer {
+  return crypto.createHash('sha256').update(LEGACY_ENCRYPTION_KEY).digest()
+}
+
+function sessionSecret(): string {
+  return process.env.SESSION_SECRET || instanceSecrets()?.sessionSecret || LEGACY_SESSION_SECRET
+}
+
 function hashSessionId(sessionId: string): string {
-  const secret = process.env.SESSION_SECRET || 'development-session-secret'
-  return crypto.createHmac('sha256', secret).update(sessionId).digest('hex')
+  return crypto.createHmac('sha256', sessionSecret()).update(sessionId).digest('hex')
+}
+
+// Shim tương thích: phiên cũ được ký bằng secret hardcode, vẫn phải chấp nhận
+// để người dùng đang đăng nhập không bị đá ra sau khi nâng cấp.
+function legacyHashSessionId(sessionId: string): string {
+  return crypto.createHmac('sha256', LEGACY_SESSION_SECRET).update(sessionId).digest('hex')
+}
+
+function timingSafeEqualHex(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left, 'hex')
+  const rightBuffer = Buffer.from(right, 'hex')
+  if (leftBuffer.length === 0 || leftBuffer.length !== rightBuffer.length) return false
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer)
+}
+
+function sessionHashMatches(storedHash: string, sessionId: string): boolean {
+  return timingSafeEqualHex(storedHash, hashSessionId(sessionId))
+    || timingSafeEqualHex(storedHash, legacyHashSessionId(sessionId))
 }
 
 function encryptString(value: string): Record<string, string | number | boolean> {
@@ -64,10 +164,10 @@ function encryptString(value: string): Record<string, string | number | boolean>
   }
 }
 
-function decryptString(value: Record<string, unknown>): string {
+function decryptWithKey(value: Record<string, unknown>, key: Buffer): string {
   const decipher = crypto.createDecipheriv(
     'aes-256-gcm',
-    encryptionKey(),
+    key,
     Buffer.from(String(value.iv), 'base64')
   )
   decipher.setAuthTag(Buffer.from(String(value.tag), 'base64'))
@@ -76,6 +176,20 @@ function decryptString(value: Record<string, unknown>): string {
     decipher.final()
   ])
   return decrypted.toString('utf8')
+}
+
+function decryptString(value: Record<string, unknown>): string {
+  try {
+    return decryptWithKey(value, encryptionKey())
+  } catch (error) {
+    // Shim tương thích: thử lại bằng khóa hardcode cũ. Giá trị giải mã được
+    // sẽ tự động mã hóa lại bằng khóa hiện tại ở lần ghi kế tiếp.
+    try {
+      return decryptWithKey(value, legacyEncryptionKey())
+    } catch {
+      throw error
+    }
+  }
 }
 
 function protect(value: unknown, keyName?: string): unknown {
@@ -110,33 +224,64 @@ function defaultStore(): WebStoreData {
   }
 }
 
-export function hashPassword(password: string, salt = crypto.randomBytes(16).toString('hex')): {
-  hash: string
-  salt: string
-} {
-  const hash = crypto.pbkdf2Sync(password, salt, 120000, 32, 'sha256').toString('hex')
-  return { hash, salt }
+// PBKDF2 chạy bất đồng bộ trên threadpool: 120k vòng không còn chặn event loop
+// nên các endpoint chưa xác thực không thể làm treo cả tiến trình.
+function pbkdf2Async(password: string, salt: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    crypto.pbkdf2(password, salt, PBKDF2_ITERATIONS, 32, 'sha256', (error, derivedKey) => {
+      if (error) reject(error)
+      else resolve(derivedKey)
+    })
+  })
 }
 
-export function verifyPassword(password: string, user: UserRecord): boolean {
-  const { hash } = hashPassword(password, user.passwordSalt)
-  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(user.passwordHash, 'hex'))
+export async function hashPasswordAsync(
+  password: string,
+  salt = crypto.randomBytes(16).toString('hex')
+): Promise<{ hash: string; salt: string }> {
+  const derivedKey = await pbkdf2Async(password, salt)
+  return { hash: derivedKey.toString('hex'), salt }
+}
+
+export async function verifyPasswordAsync(password: string, user: UserRecord): Promise<boolean> {
+  const { hash } = await hashPasswordAsync(password, user.passwordSalt)
+  return timingSafeEqualHex(hash, user.passwordHash)
 }
 
 export class WebStore {
   private data: WebStoreData = defaultStore()
   private loaded = false
+  private saveQueue: Promise<void> = Promise.resolve()
+  private accountDataQueue: Promise<void> = Promise.resolve()
 
   async load(): Promise<void> {
     if (this.loaded) return
     await fs.mkdir(dataDir(), { recursive: true })
+    let raw: string | null = null
     try {
-      const raw = await fs.readFile(storePath(), 'utf8')
-      this.data = { ...defaultStore(), ...JSON.parse(raw) }
+      raw = await fs.readFile(storePath(), 'utf8')
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    if (raw === null) {
       this.data = defaultStore()
       await this.save()
+    } else {
+      let parsed: Partial<WebStoreData> = {}
+      try {
+        parsed = JSON.parse(raw) as Partial<WebStoreData>
+        console.log(`[Store] Đã nạp dữ liệu từ ${storePath()}`)
+      } catch (parseError) {
+        console.error(`[Store] ${storePath()} không phải JSON hợp lệ, thử khôi phục từ bản sao lưu:`, parseError)
+        try {
+          parsed = JSON.parse(await fs.readFile(backupPath(), 'utf8')) as Partial<WebStoreData>
+          console.warn(`[Store] Đã khôi phục dữ liệu từ ${backupPath()}`)
+        } catch (backupError) {
+          console.error(`[Store] Bản sao lưu ${backupPath()} cũng không dùng được:`, backupError)
+          throw parseError
+        }
+      }
+      this.data = { ...defaultStore(), ...parsed } as WebStoreData
     }
     this.loaded = true
     await this.ensureConfiguredAdminUser()
@@ -148,9 +293,28 @@ export class WebStore {
     return this.data
   }
 
+  // Mọi lần ghi đều xếp hàng qua một chuỗi promise duy nhất: hai lần ghi
+  // không bao giờ chồng lên nhau và làm store.json thành JSON hỏng.
   async save(): Promise<void> {
+    this.saveQueue = this.saveQueue.then(() => this.doSave(), () => this.doSave())
+    return this.saveQueue
+  }
+
+  private async doSave(): Promise<void> {
     await fs.mkdir(dataDir(), { recursive: true })
-    await fs.writeFile(storePath(), JSON.stringify(this.data, null, 2), 'utf8')
+    const payload = JSON.stringify(this.data, null, 2)
+    try {
+      await fs.copyFile(storePath(), backupPath())
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn(`[Store] Không tạo được bản sao lưu ${backupPath()}:`, error)
+      }
+    }
+    // Ghi ra file tạm rồi rename: rename là thao tác nguyên tử trên cùng ổ đĩa
+    // nên store.json không bao giờ ở trạng thái bị cắt dở.
+    const tempPath = `${storePath()}.tmp`
+    await fs.writeFile(tempPath, payload, 'utf8')
+    await fs.rename(tempPath, storePath())
   }
 
   isSetupRequired(): boolean {
@@ -190,7 +354,7 @@ export class WebStore {
     const password = String(input.password || '')
     if (password.length < 8) throw new Error('Password must be at least 8 characters')
     const email = String(input.email || this.adminEmailFromEnv()).trim() || 'admin@krouter.local'
-    const { hash, salt } = hashPassword(password)
+    const { hash, salt } = await hashPasswordAsync(password)
     const user: UserRecord = {
       id: crypto.randomUUID(),
       email,
@@ -215,8 +379,8 @@ export class WebStore {
 
   findUserBySession(sessionId: string | undefined): UserRecord | undefined {
     if (!sessionId) return undefined
-    const idHash = hashSessionId(sessionId)
-    const session = this.data.sessions.find((item) => item.idHash === idHash && item.expiresAt > Date.now())
+    this.pruneExpiredSessions()
+    const session = this.data.sessions.find((item) => item.expiresAt > Date.now() && sessionHashMatches(item.idHash, sessionId))
     if (!session) return undefined
     return this.data.users.find((user) => user.id === session.userId)
   }
@@ -224,21 +388,39 @@ export class WebStore {
   async createSession(userId: string): Promise<{ id: string; expiresAt: number }> {
     const id = crypto.randomBytes(32).toString('base64url')
     const expiresAt = Date.now() + 1000 * 60 * 60 * 24 * 7
+    this.pruneExpiredSessions()
     this.data.sessions.push({
       idHash: hashSessionId(id),
       userId,
       expiresAt,
       createdAt: Date.now()
     })
+    // Chặn danh sách phiên phình vô hạn: mỗi user chỉ giữ N phiên mới nhất.
+    const owned = this.data.sessions.filter((session) => session.userId === userId)
+    if (owned.length > MAX_SESSIONS_PER_USER) {
+      const dropped = new Set(
+        owned
+          .slice()
+          .sort((left, right) => left.createdAt - right.createdAt)
+          .slice(0, owned.length - MAX_SESSIONS_PER_USER)
+      )
+      this.data.sessions = this.data.sessions.filter((session) => !dropped.has(session))
+    }
     await this.save()
     return { id, expiresAt }
   }
 
   async deleteSession(sessionId: string | undefined): Promise<void> {
     if (!sessionId) return
-    const idHash = hashSessionId(sessionId)
-    this.data.sessions = this.data.sessions.filter((session) => session.idHash !== idHash)
+    this.data.sessions = this.data.sessions.filter((session) => !sessionHashMatches(session.idHash, sessionId))
     await this.save()
+  }
+
+  // Dùng khi đổi mật khẩu: mọi cookie phiên cũ phải mất hiệu lực ngay.
+  async invalidateUserSessions(userId: string): Promise<void> {
+    const before = this.data.sessions.length
+    this.data.sessions = this.data.sessions.filter((session) => session.userId !== userId)
+    if (this.data.sessions.length !== before) await this.save()
   }
 
   getAccountData(userId: string): unknown {
@@ -248,6 +430,21 @@ export class WebStore {
   async setAccountData(userId: string, accountData: unknown): Promise<void> {
     this.data.accountDataByUser[userId] = protect(this.enforceDeletionTombstones(userId, accountData))
     await this.save()
+  }
+
+  // Đọc-sửa-ghi an toàn: các luồng gọi được nối tiếp qua một hàng đợi và
+  // mutator luôn nhận tài liệu HIỆN TẠI, nên không lần ghi nào bị nuốt mất.
+  async updateAccountData(
+    userId: string,
+    mutator: (data: Record<string, unknown>) => void
+  ): Promise<void> {
+    const apply = async (): Promise<void> => {
+      const current = (this.getAccountData(userId) || {}) as Record<string, unknown>
+      mutator(current)
+      await this.setAccountData(userId, current)
+    }
+    this.accountDataQueue = this.accountDataQueue.then(apply, apply)
+    return this.accountDataQueue
   }
 
   // Safety net against deleted accounts resurrecting. Multiple writers (backend
@@ -271,8 +468,19 @@ export class WebStore {
         for (const id of source) if (typeof id === 'string') tombstones.add(id)
       }
     }
-    if (tombstones.size === 0) return accountData
-    const accounts = incoming.accounts
+    // _deletedProxyIds cũng phải bị chặn trên. Mỗi proxy iplocate được thêm lại đều nhận
+    // UUID mới nên một free-list hay biến động sinh tombstone mới mỗi chu kỳ 30 phút, mà
+    // doSave stringify toàn bộ tài liệu + copy file backup ở gần như mọi lần ghi.
+    const cappedProxyIds = Array.isArray(incoming._deletedProxyIds)
+      ? (incoming._deletedProxyIds as unknown[]).filter((id): id is string => typeof id === 'string').slice(-MAX_TOMBSTONES)
+      : undefined
+    const withCappedProxyIds = cappedProxyIds
+      ? { ...incoming, _deletedProxyIds: cappedProxyIds }
+      : incoming
+
+    if (tombstones.size === 0) return withCappedProxyIds
+    const incomingCapped = withCappedProxyIds
+    const accounts = incomingCapped.accounts
     let accountsChanged = false
     let nextAccounts = accounts
     if (accounts && typeof accounts === 'object' && !Array.isArray(accounts)) {
@@ -287,8 +495,8 @@ export class WebStore {
       nextAccounts = filtered
     }
     // Cap the tombstone list so it can't grow without bound across the app lifetime.
-    const merged = Array.from(tombstones).slice(-5000)
-    return { ...incoming, accounts: accountsChanged ? nextAccounts : accounts, _deletedAccountIds: merged }
+    const merged = Array.from(tombstones).slice(-MAX_TOMBSTONES)
+    return { ...incomingCapped, accounts: accountsChanged ? nextAccounts : accounts, _deletedAccountIds: merged }
   }
 
   getUserSettings(userId: string): Record<string, unknown> {

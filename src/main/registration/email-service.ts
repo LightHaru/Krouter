@@ -4,13 +4,48 @@ import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
 import { randomEmailPrefix } from './names'
 
 function getRegistrationProxyUrl(): string | undefined {
-  return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || getSystemProxy() || undefined
+  return (
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy ||
+    getSystemProxy() ||
+    undefined
+  )
 }
 
-async function proxyFetch(url: string, options?: RequestInit): Promise<Response> {
-  const agent = safeCreateProxyAgent(getRegistrationProxyUrl())
+/**
+ * Proxy hiệu lực cho tầng email, do registrar truyền xuống.
+ *
+ * Trước đây tầng này chỉ đọc được biến môi trường / proxy hệ thống, nên nó KHÔNG thấy được
+ * cfg.proxy hay địa chỉ ChainProxyRelay cục bộ: với strictProxy + pool proxy luân phiên, AWS thấy
+ * IP proxy nhưng nhà cung cấp mail lại thấy IP thật của người dùng cho MỌI hộp thư — đủ để liên kết
+ * mọi tài khoản "ẩn danh" về cùng một người — và mật khẩu admin x-admin-auth cũng đi ra không qua proxy.
+ */
+export interface EmailProxyOptions {
+  /** URL proxy hiệu lực (ưu tiên cao hơn biến môi trường / proxy hệ thống) */
+  proxyUrl?: string
+  /** Chế độ nghiêm ngặt: không có proxy khả dụng thì NÉM LỖI thay vì lặng lẽ đi đường trực tiếp */
+  strictProxy?: boolean
+}
+
+async function proxyFetch(
+  url: string,
+  options?: RequestInit,
+  proxyOpts?: EmailProxyOptions
+): Promise<Response> {
+  const explicit = (proxyOpts?.proxyUrl || '').trim()
+  const agent = safeCreateProxyAgent(explicit || getRegistrationProxyUrl())
   if (agent) {
-    return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+    return (await undiciFetch(url, {
+      ...options,
+      dispatcher: agent
+    } as UndiciRequestInit)) as unknown as Response
+  }
+  if (proxyOpts?.strictProxy) {
+    throw new Error(
+      'Chế độ proxy nghiêm ngặt: tầng email không có proxy khả dụng, đã dừng để không lộ IP thật'
+    )
   }
   return await fetch(url, options)
 }
@@ -56,10 +91,12 @@ export class MoEmailService implements TempEmailService {
   private baseURL: string
   private apiKey: string
   private address = ''
+  private readonly proxyOpts?: EmailProxyOptions
 
-  constructor(baseURL: string, apiKey: string) {
+  constructor(baseURL: string, apiKey: string, proxyOpts?: EmailProxyOptions) {
     this.baseURL = MoEmailService.normalizeBaseURL(baseURL)
     this.apiKey = apiKey
+    this.proxyOpts = proxyOpts
   }
 
   /**
@@ -81,7 +118,9 @@ export class MoEmailService implements TempEmailService {
       throw new Error(`Định dạng MoEmail BaseURL không hợp lệ: ${raw}`)
     }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-      throw new Error(`MoEmail BaseURL không hỗ trợ giao thức này (chỉ hỗ trợ http/https): ${u.protocol}`)
+      throw new Error(
+        `MoEmail BaseURL không hỗ trợ giao thức này (chỉ hỗ trợ http/https): ${u.protocol}`
+      )
     }
     return withScheme
   }
@@ -91,7 +130,11 @@ export class MoEmailService implements TempEmailService {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`
 
-    const resp = await proxyFetch(url, { method: 'POST', headers, signal: AbortSignal.timeout(30000) })
+    const resp = await proxyFetch(
+      url,
+      { method: 'POST', headers, signal: AbortSignal.timeout(30000) },
+      this.proxyOpts
+    )
     const data = (await resp.json()) as Record<string, unknown>
 
     const addr =
@@ -109,7 +152,11 @@ export class MoEmailService implements TempEmailService {
     return addr
   }
 
-  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
+  async waitForCode(
+    timeoutSec: number,
+    intervalSec: number,
+    signal?: AbortSignal
+  ): Promise<string> {
     if (!this.address) throw new Error('Địa chỉ email đang trống')
 
     const maxRetries = Math.floor(timeoutSec / intervalSec)
@@ -120,9 +167,11 @@ export class MoEmailService implements TempEmailService {
         const code = await this.fetchCode()
         if (code) return code
       } catch (err) {
-        if (attempt % 5 === 0) console.log(`[MoEmail] [${attempt}/${maxRetries}] Truy vấn thất bại:`, err)
+        if (attempt % 5 === 0)
+          console.log(`[MoEmail] [${attempt}/${maxRetries}] Truy vấn thất bại:`, err)
       }
-      if (attempt % 5 === 0) console.log(`[MoEmail] [${attempt}/${maxRetries}] Chưa có mã xác minh...`)
+      if (attempt % 5 === 0)
+        console.log(`[MoEmail] [${attempt}/${maxRetries}] Chưa có mã xác minh...`)
     }
     throw new Error(`Hết thời gian chờ mã xác minh (${timeoutSec} giây)`)
   }
@@ -136,7 +185,11 @@ export class MoEmailService implements TempEmailService {
     const headers: Record<string, string> = {}
     if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`
 
-    const resp = await proxyFetch(url, { headers, signal: AbortSignal.timeout(15000) })
+    const resp = await proxyFetch(
+      url,
+      { headers, signal: AbortSignal.timeout(15000) },
+      this.proxyOpts
+    )
     const raw = await resp.json()
 
     let messages: Array<Record<string, unknown>> = []
@@ -165,16 +218,18 @@ export class MoEmailService implements TempEmailService {
 export class TempMailPlusService implements TempEmailService {
   private static readonly BASE_URL = 'https://tempmail.plus/api'
 
-  private readonly tmEmail: string   // tempmail.plus 用户名（不含 @mailto.plus）
+  private readonly tmEmail: string // tempmail.plus 用户名（不含 @mailto.plus）
   private readonly epin: string
   /** 支持多域名（用户填多行/逗号/空格分隔），每次 create 随机挑一个，降低单域名被风控关联 */
   private readonly domains: string[]
   private domain = ''
   private address = ''
+  private readonly proxyOpts?: EmailProxyOptions
 
-  constructor(tmEmail: string, epin: string, domain: string) {
+  constructor(tmEmail: string, epin: string, domain: string, proxyOpts?: EmailProxyOptions) {
     this.tmEmail = tmEmail
     this.epin = epin
+    this.proxyOpts = proxyOpts
     this.domains = domain
       .split(/[\s,;]+/)
       .map((d) => d.trim().replace(/^@/, ''))
@@ -186,12 +241,13 @@ export class TempMailPlusService implements TempEmailService {
 
   private get headers(): Record<string, string> {
     return {
-      'accept': 'application/json, text/javascript, */*; q=0.01',
+      accept: 'application/json, text/javascript, */*; q=0.01',
       'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+      'user-agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
       'x-requested-with': 'XMLHttpRequest',
-      'Referer': 'https://tempmail.plus/zh/',
-      'cookie': `email=${encodeURIComponent(this.fullEmail)}`
+      Referer: 'https://tempmail.plus/zh/',
+      cookie: `email=${encodeURIComponent(this.fullEmail)}`
     }
   }
 
@@ -200,7 +256,9 @@ export class TempMailPlusService implements TempEmailService {
     this.domain = this.domains[Math.floor(Math.random() * this.domains.length)]
     this.address = `${prefix}@${this.domain}`
     if (this.domains.length > 1) {
-      console.log(`[TempMailPlus] Đã tạo email: ${this.address} (kho tên miền có ${this.domains.length} mục)`)
+      console.log(
+        `[TempMailPlus] Đã tạo email: ${this.address} (kho tên miền có ${this.domains.length} mục)`
+      )
     } else {
       console.log(`[TempMailPlus] Đã tạo email: ${this.address}`)
     }
@@ -211,7 +269,11 @@ export class TempMailPlusService implements TempEmailService {
     return this.address
   }
 
-  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
+  async waitForCode(
+    timeoutSec: number,
+    intervalSec: number,
+    signal?: AbortSignal
+  ): Promise<string> {
     if (!this.address) throw new Error('Địa chỉ email đang trống')
     const maxRetries = Math.floor(timeoutSec / intervalSec)
     const checkedIds = new Set<number>()
@@ -227,15 +289,31 @@ export class TempMailPlusService implements TempEmailService {
         for (const mail of mails) {
           const mailId = mail.mail_id as number
           if (checkedIds.has(mailId)) continue
-          checkedIds.add(mailId)
 
-          const detail = await this.fetchMailDetail(mailId)
+          // Chỉ đánh dấu "đã kiểm tra" SAU khi lấy được nội dung. Trước đây add() nằm trước
+          // fetchMailDetail: một lần lỗi mạng thoáng qua (hàm này vừa có thể ném vừa có thể
+          // trả null) là email OTP đó bị bỏ qua vĩnh viễn trong suốt 40 lượt poll còn lại.
+          // Bọc try riêng cho từng email để một lỗi không nuốt luôn các email còn lại
+          // trong lượt quét này.
+          let detail: Record<string, unknown> | null = null
+          try {
+            detail = await this.fetchMailDetail(mailId)
+          } catch (detailError) {
+            console.log(
+              `[TempMailPlus] Không đọc được email ${mailId}, sẽ thử lại lượt sau:`,
+              detailError
+            )
+            continue
+          }
           if (!detail) continue
+          checkedIds.add(mailId)
 
           // 验证收件人匹配
           const toField = String(detail.to || '').toLowerCase()
           if (!toField.includes(this.address.toLowerCase())) {
-            console.log(`[TempMailPlus] Người nhận không khớp: ${toField} (cần chứa: ${this.address})`)
+            console.log(
+              `[TempMailPlus] Người nhận không khớp: ${toField} (cần chứa: ${this.address})`
+            )
             continue
           }
 
@@ -252,7 +330,8 @@ export class TempMailPlusService implements TempEmailService {
       } catch (err) {
         console.log(`[TempMailPlus] [${attempt}/${maxRetries}] Truy vấn thất bại:`, err)
       }
-      if (attempt % 5 === 0) console.log(`[TempMailPlus] [${attempt}/${maxRetries}] Chưa có mã xác minh...`)
+      if (attempt % 5 === 0)
+        console.log(`[TempMailPlus] [${attempt}/${maxRetries}] Chưa có mã xác minh...`)
     }
     throw new Error(`Hết thời gian chờ mã xác minh (${timeoutSec} giây)`)
   }
@@ -263,7 +342,11 @@ export class TempMailPlusService implements TempEmailService {
 
   private async fetchMailList(): Promise<Array<Record<string, unknown>>> {
     const url = `${TempMailPlusService.BASE_URL}/mails?email=${encodeURIComponent(this.fullEmail)}&first_id=0&epin=${encodeURIComponent(this.epin)}`
-    const resp = await proxyFetch(url, { headers: this.headers, signal: AbortSignal.timeout(15000) })
+    const resp = await proxyFetch(
+      url,
+      { headers: this.headers, signal: AbortSignal.timeout(15000) },
+      this.proxyOpts
+    )
     const data = (await resp.json()) as Record<string, unknown>
     if (!data.result) return []
     return (data.mail_list as Array<Record<string, unknown>>) || []
@@ -271,17 +354,28 @@ export class TempMailPlusService implements TempEmailService {
 
   private async fetchMailDetail(mailId: number): Promise<Record<string, unknown> | null> {
     const url = `${TempMailPlusService.BASE_URL}/mails/${mailId}?email=${encodeURIComponent(this.fullEmail)}&epin=${encodeURIComponent(this.epin)}`
-    const resp = await proxyFetch(url, { headers: this.headers, signal: AbortSignal.timeout(15000) })
+    const resp = await proxyFetch(
+      url,
+      { headers: this.headers, signal: AbortSignal.timeout(15000) },
+      this.proxyOpts
+    )
     const data = (await resp.json()) as Record<string, unknown>
     return data.result ? data : null
   }
 
   private async deleteMail(mailId: number): Promise<void> {
     const url = `${TempMailPlusService.BASE_URL}/mails/${mailId}`
-    const headers = { ...this.headers, 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8' }
+    const headers = {
+      ...this.headers,
+      'content-type': 'application/x-www-form-urlencoded; charset=UTF-8'
+    }
     const body = `email=${encodeURIComponent(this.fullEmail)}&epin=${encodeURIComponent(this.epin)}`
     try {
-      await proxyFetch(url, { method: 'DELETE', headers, body, signal: AbortSignal.timeout(10000) })
+      await proxyFetch(
+        url,
+        { method: 'DELETE', headers, body, signal: AbortSignal.timeout(10000) },
+        this.proxyOpts
+      )
       console.log(`[TempMailPlus] Đã xóa email: ${mailId}`)
     } catch (err) {
       console.log(`[TempMailPlus] Xóa email thất bại:`, err)
@@ -310,11 +404,20 @@ export class TingamefiMailService implements TempEmailService {
   private readonly adminPassword: string
   private readonly configuredDomain: string
   private address = ''
+  private readonly proxyOpts?: EmailProxyOptions
 
-  constructor(apiUrl: string, adminPassword: string, domain: string) {
-    this.apiUrl = TingamefiMailService.normalizeApiUrl(apiUrl || 'https://temp-email-worker.thienp1301.workers.dev')
+  constructor(
+    apiUrl: string,
+    adminPassword: string,
+    domain: string,
+    proxyOpts?: EmailProxyOptions
+  ) {
+    this.apiUrl = TingamefiMailService.normalizeApiUrl(
+      apiUrl || 'https://temp-email-worker.thienp1301.workers.dev'
+    )
     this.adminPassword = (adminPassword || '').trim()
     this.configuredDomain = (domain || 'mail.tingamefi.com').trim().replace(/^@/, '')
+    this.proxyOpts = proxyOpts
     if (!this.adminPassword) throw new Error('Tingamefi mail admin password is empty')
   }
 
@@ -359,6 +462,12 @@ export class TingamefiMailService implements TempEmailService {
         lastError = JSON.stringify(data).slice(0, 300)
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error)
+        // Configuration and authorization errors cannot be repaired by retrying.
+        if (/API (?:400|401|403|404|422):/.test(lastError)) break
+      }
+      if (attempt < 5) {
+        const backoffMs = Math.min(3000, 300 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 150)
+        await abortableSleep(backoffMs)
       }
     }
     throw new Error(`Tingamefi mail address creation failed: ${lastError || 'empty response'}`)
@@ -368,7 +477,11 @@ export class TingamefiMailService implements TempEmailService {
     return this.address
   }
 
-  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
+  async waitForCode(
+    timeoutSec: number,
+    intervalSec: number,
+    signal?: AbortSignal
+  ): Promise<string> {
     if (!this.address) throw new Error('Tingamefi mail address is empty')
     const maxRetries = Math.max(1, Math.floor(timeoutSec / intervalSec))
 
@@ -380,15 +493,16 @@ export class TingamefiMailService implements TempEmailService {
         if (attempt === 1 || attempt % 5 === 0) {
           console.log(`[TingamefiMail] [${attempt}/${maxRetries}] messages: ${messages.length}`)
         }
-        const preferred = messages.filter((message) => /no-reply@signin\.aws/i.test(String(message.source || message.raw || '')))
-        for (const message of [...preferred, ...messages.filter((message) => !preferred.includes(message))]) {
-          const text = [
-            message.subject,
-            message.text,
-            message.html,
-            message.message,
-            message.raw
-          ].map((value) => String(value || '')).join('\n')
+        const preferred = messages.filter((message) =>
+          /no-reply@signin\.aws/i.test(String(message.source || message.raw || ''))
+        )
+        for (const message of [
+          ...preferred,
+          ...messages.filter((message) => !preferred.includes(message))
+        ]) {
+          const text = [message.subject, message.text, message.html, message.message, message.raw]
+            .map((value) => String(value || ''))
+            .join('\n')
           const code = extractCode(text)
           if (code) {
             console.log(`[TingamefiMail] verification code: ${code}`)
@@ -397,9 +511,11 @@ export class TingamefiMailService implements TempEmailService {
           }
         }
       } catch (error) {
-        if (attempt % 5 === 0) console.log(`[TingamefiMail] [${attempt}/${maxRetries}] query failed:`, error)
+        if (attempt % 5 === 0)
+          console.log(`[TingamefiMail] [${attempt}/${maxRetries}] query failed:`, error)
       }
-      if (attempt % 5 === 0) console.log(`[TingamefiMail] [${attempt}/${maxRetries}] no verification code yet...`)
+      if (attempt % 5 === 0)
+        console.log(`[TingamefiMail] [${attempt}/${maxRetries}] no verification code yet...`)
     }
 
     throw new Error(`Timed out waiting for verification code (${timeoutSec}s)`)
@@ -411,7 +527,9 @@ export class TingamefiMailService implements TempEmailService {
       headers: { 'x-lang': 'en', 'x-fingerprint': 'kiro-account-manager-web' },
       signal: AbortSignal.timeout(15000)
     })
-    const domains = Array.isArray(settings.defaultDomains) ? settings.defaultDomains : settings.domains
+    const domains = Array.isArray(settings.defaultDomains)
+      ? settings.defaultDomains
+      : settings.domains
     const first = Array.isArray(domains) ? String(domains[0] || '') : ''
     if (!first) throw new Error('Tingamefi mail domain is empty')
     return first.replace(/^@/, '')
@@ -423,7 +541,7 @@ export class TingamefiMailService implements TempEmailService {
       headers: this.headers,
       signal: AbortSignal.timeout(15000)
     })
-    return Array.isArray(data.results) ? data.results as Array<Record<string, unknown>> : []
+    return Array.isArray(data.results) ? (data.results as Array<Record<string, unknown>>) : []
   }
 
   private async deleteMail(id: unknown): Promise<void> {
@@ -436,12 +554,17 @@ export class TingamefiMailService implements TempEmailService {
   }
 
   private async fetchJson<T>(pathname: string, init: RequestInit): Promise<T> {
-    const response = await proxyFetch(`${this.apiUrl}${pathname}`, init)
+    const response = await proxyFetch(`${this.apiUrl}${pathname}`, init, this.proxyOpts)
     const text = await response.text()
     if (!response.ok) {
       throw new Error(`Tingamefi mail API ${response.status}: ${text.slice(0, 300)}`)
     }
-    return (text ? JSON.parse(text) : {}) as T
+    if (!text) return {} as T
+    try {
+      return JSON.parse(text) as T
+    } catch {
+      throw new Error(`Tingamefi mail API returned invalid JSON: ${text.slice(0, 160)}`)
+    }
   }
 }
 
@@ -496,7 +619,10 @@ export function parseOutlookLines(data: string): OutlookAccount[] {
   return accounts
 }
 
-export async function refreshOutlookToken(acc: OutlookAccount): Promise<string> {
+export async function refreshOutlookToken(
+  acc: OutlookAccount,
+  proxyOpts?: EmailProxyOptions
+): Promise<string> {
   const form = new URLSearchParams({
     client_id: acc.clientId,
     refresh_token: acc.refreshToken,
@@ -506,10 +632,16 @@ export async function refreshOutlookToken(acc: OutlookAccount): Promise<string> 
 
   const resp = await proxyFetch(
     'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
-    { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form.toString() }
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString()
+    },
+    proxyOpts
   )
   const data = (await resp.json()) as Record<string, unknown>
-  if (resp.status !== 200) throw new Error(`Làm mới thất bại ${resp.status}: ${JSON.stringify(data).slice(0, 300)}`)
+  if (resp.status !== 200)
+    throw new Error(`Làm mới thất bại ${resp.status}: ${JSON.stringify(data).slice(0, 300)}`)
   const token = data.access_token as string
   if (!token) throw new Error('Phản hồi không có access_token')
   return token
@@ -526,18 +658,25 @@ class IMAPClient {
   private tag = 0
 
   async connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const socket = tls.connect(993, 'outlook.office365.com', { servername: 'outlook.office365.com' })
+    return await new Promise((resolve, reject) => {
+      const socket = tls.connect(993, 'outlook.office365.com', {
+        servername: 'outlook.office365.com'
+      })
       const timer = setTimeout(() => {
         socket.destroy()
         reject(new Error('Kết nối hết thời gian chờ'))
       }, 15000)
 
-      socket.once('error', (err) => { clearTimeout(timer); reject(err) })
+      socket.once('error', (err) => {
+        clearTimeout(timer)
+        reject(err)
+      })
       socket.once('secureConnect', () => {
         clearTimeout(timer)
         this.socket = socket
-        this.readLine().then(() => resolve()).catch(reject)
+        this.readLine()
+          .then(() => resolve())
+          .catch(reject)
       })
     })
   }
@@ -647,7 +786,10 @@ class IMAPClient {
     const rawLines: string[] = []
     let inBody = false
     for (const line of lines) {
-      if (line.includes('FETCH')) { inBody = true; continue }
+      if (line.includes('FETCH')) {
+        inBody = true
+        continue
+      }
       if (line === ')') continue
       if (inBody) rawLines.push(line)
     }
@@ -663,7 +805,9 @@ class IMAPClient {
         const b64 = content.replace(/[\s]/g, '')
         try {
           decoded += Buffer.from(b64, 'base64').toString() + ' '
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
     }
     if (decoded) return decoded
@@ -679,15 +823,24 @@ class IMAPClient {
 
   close(): void {
     if (this.socket) {
-      try { this.socket.write('A999 LOGOUT\r\n') } catch { /* ignore */ }
+      try {
+        this.socket.write('A999 LOGOUT\r\n')
+      } catch {
+        /* ignore */
+      }
       this.socket.destroy()
       this.socket = null
     }
   }
 }
 
-export async function getInboxCount(acc: OutlookAccount): Promise<number> {
-  const accessToken = await refreshOutlookToken(acc)
+export async function getInboxCount(
+  acc: OutlookAccount,
+  proxyOpts?: EmailProxyOptions
+): Promise<number> {
+  // Lưu ý: chỉ lượt làm mới token OAuth đi qua proxy; kết nối IMAP bên dưới là TLS thô
+  // tới outlook.office.com nên vẫn đi đường trực tiếp (không nằm trong phạm vi bản sửa này).
+  const accessToken = await refreshOutlookToken(acc, proxyOpts)
   const client = new IMAPClient()
   try {
     await client.connect()
@@ -703,10 +856,13 @@ export async function waitForOTP(
   beforeCount: number,
   timeout: number,
   interval: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  proxyOpts?: EmailProxyOptions
 ): Promise<string> {
-  console.log(`[Outlook IMAP] Đang chờ mã xác minh, email=${acc.email}, số email trước khi gửi=${beforeCount}`)
-  let accessToken = await refreshOutlookToken(acc)
+  console.log(
+    `[Outlook IMAP] Đang chờ mã xác minh, email=${acc.email}, số email trước khi gửi=${beforeCount}`
+  )
+  let accessToken = await refreshOutlookToken(acc, proxyOpts)
   const maxRetries = Math.floor(timeout / interval)
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -719,7 +875,10 @@ export async function waitForOTP(
       const total = await client.selectInbox()
 
       if (total <= beforeCount) {
-        if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] Chưa có email mới (hiện có ${total})...`)
+        if (attempt % 5 === 0)
+          console.log(
+            `[Outlook IMAP] [${attempt}/${maxRetries}] Chưa có email mới (hiện có ${total})...`
+          )
         await abortableSleep(interval * 1000, signal)
         continue
       }
@@ -732,13 +891,22 @@ export async function waitForOTP(
             console.log(`[Outlook IMAP] Đã lấy mã xác minh: ${code}`)
             return code
           }
-        } catch { /* continue */ }
+        } catch {
+          /* continue */
+        }
       }
 
-      if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] Không tìm thấy mã xác minh trong email mới...`)
+      if (attempt % 5 === 0)
+        console.log(
+          `[Outlook IMAP] [${attempt}/${maxRetries}] Không tìm thấy mã xác minh trong email mới...`
+        )
     } catch (err) {
       if (attempt % 5 === 0) console.log(`[Outlook IMAP] Kết nối thất bại:`, err)
-      try { accessToken = await refreshOutlookToken(acc) } catch { /* ignore */ }
+      try {
+        accessToken = await refreshOutlookToken(acc, proxyOpts)
+      } catch {
+        /* ignore */
+      }
     } finally {
       client?.close()
     }
@@ -778,12 +946,16 @@ export class ProtonWebviewService implements TempEmailService {
     return this.address
   }
 
-  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
+  async waitForCode(
+    timeoutSec: number,
+    intervalSec: number,
+    signal?: AbortSignal
+  ): Promise<string> {
     const runtime = process.versions.electron
       ? await import('./proton-mail-window')
       : await import('../../server/services/protonBrowserRuntime')
     const { waitProtonOtp } = runtime
-    return waitProtonOtp(this.address, {
+    return await waitProtonOtp(this.address, {
       timeoutSec,
       intervalSec,
       signal,

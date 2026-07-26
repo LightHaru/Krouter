@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import fc from 'fast-check'
 import {
   AccountPool,
@@ -14,7 +14,10 @@ const FC_RUNS = 200
 // DEFAULT_CONFIG values mirrored from accountPool.ts (the module does not export
 // them). These tests rely on the AccountPool default configuration.
 const THROTTLE_COOLDOWN_MS = 5000
-const MAX_THROTTLE_COOLDOWN_MS = 10000
+// Phải khớp DEFAULT_CONFIG.maxThrottleCooldownMs trong accountPool.ts (15 phút).
+// Giá trị cũ ở đây là 10_000 — đã lạc hậu so với implementation nên Property 6 fail
+// deterministic với mọi errorCount >= 3 (20_000 > 10_000).
+const MAX_THROTTLE_COOLDOWN_MS = 15 * 60_000
 const MAX_BACKOFF_MULTIPLIER = 1440
 const QUOTA_RESET_MS = 3600000
 
@@ -82,6 +85,17 @@ describe('AccountPool round-robin distribution', () => {
 })
 
 describe('AccountPool — 429 throttle cooldown bounds & backoff cap (Property 6)', () => {
+  // Đóng băng đồng hồ: property này so cooldownUntil với một Date.now() bắt bên ngoài,
+  // nên dưới tải CPU (chạy cùng cả suite) độ trôi vượt TIMING_TOLERANCE_MS và test fail
+  // ngẫu nhiên. Với thời gian tĩnh, phép so trở thành đẳng thức chính xác.
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'))
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   // Feature: smart-proxy-account-rotation, Property 6: For any errorCount >= 1, the cooldown after a Throttle_Error (status 429) equals min(throttleCooldownMs * 2^(min(errorCount-1, log2(maxBackoffMultiplier))), maxThrottleCooldownMs), always within [throttleCooldownMs, maxThrottleCooldownMs], and does NOT set quotaExhaustedAt.
   // Validates: Requirements 3.3, 3.6
   it('Property 6: N consecutive 429 errors produce a bounded, backoff-capped cooldown and never set quotaExhaustedAt', () => {

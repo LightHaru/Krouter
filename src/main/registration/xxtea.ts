@@ -1,5 +1,7 @@
 const DELTA = 0x9e3779b9 >>> 0
-const FALLBACK_KEY: [number, number, number, number] = [1888420705, 2576816180, 2347232058, 874813317]
+const FALLBACK_KEY: [number, number, number, number] = [
+  1888420705, 2576816180, 2347232058, 874813317
+]
 const FALLBACK_VER = '4.0.0'
 const FALLBACK_IDENTIFIER = 'ECdITeCs'
 
@@ -7,6 +9,13 @@ let cachedKey: [number, number, number, number] | null = null
 let cachedVersion = ''
 let cachedIdentifier = ''
 let refreshPromise: Promise<void> | null = null
+/**
+ * Đánh dấu cachedKey hiện đang là khóa fallback.
+ * Nếu không có cờ này, một lỗi mạng thoáng qua sẽ ghim khóa fallback đến hết vòng đời tiến trình:
+ * mọi lần đăng ký sau đó mã hóa fingerprint bằng khóa cũ, AWS từ chối, detectRiskControl kích hoạt
+ * AWS-RISK-CONTROL và adaptiveDelayMs leo lên 120s — chỉ khởi động lại ứng dụng mới thoát ra được.
+ */
+let usingFallbackKey = false
 
 function extractFromAppJS(js: string): {
   key: [number, number, number, number] | null
@@ -37,11 +46,13 @@ function extractFromAppJS(js: string): {
 export async function refreshAppJSConfig(
   fetchFn: (url: string, init?: RequestInit) => Promise<Response>
 ): Promise<void> {
-  if (cachedKey) return
-  if (refreshPromise) return refreshPromise
+  // Chỉ dừng làm mới khi đã có khóa THẬT; đang dùng fallback thì lần gọi sau vẫn phải thử tải lại.
+  if (cachedKey && !usingFallbackKey) return
+  if (refreshPromise) return await refreshPromise
 
-  refreshPromise = (async () => {
-    if (cachedKey) return
+  const pending = (async (): Promise<void> => {
+    if (cachedKey && !usingFallbackKey) return
+    let fetched = false
     try {
       const resp = await fetchFn('https://us-east-1.signin.aws/assets/js/app.js', {
         headers: {
@@ -54,7 +65,11 @@ export async function refreshAppJSConfig(
       const js = await resp.text()
       if (js) {
         const result = extractFromAppJS(js)
-        if (result.key) cachedKey = result.key
+        if (result.key) {
+          cachedKey = result.key
+          usingFallbackKey = false
+          fetched = true
+        }
         if (result.identifier) cachedIdentifier = result.identifier
         if (result.version) cachedVersion = result.version
       }
@@ -62,15 +77,23 @@ export async function refreshAppJSConfig(
       console.log('[xxtea] 下载 app.js 失败:', err)
     }
 
-    if (!cachedKey) {
+    if (!fetched) {
       console.log('[xxtea] 使用 fallback 密钥')
       cachedKey = [...FALLBACK_KEY] as [number, number, number, number]
+      usingFallbackKey = true
     }
     if (!cachedVersion) cachedVersion = FALLBACK_VER
     if (!cachedIdentifier) cachedIdentifier = FALLBACK_IDENTIFIER
   })()
 
-  return refreshPromise
+  refreshPromise = pending
+  // Xóa refreshPromise ở nhánh fallback để lần gọi sau còn khởi động được một lượt tải mới,
+  // thay vì trả về promise cũ đã hoàn tất và mắc kẹt với khóa fallback mãi mãi.
+  const clearIfFallback = (): void => {
+    if (usingFallbackKey && refreshPromise === pending) refreshPromise = null
+  }
+  void pending.then(clearIfFallback, clearIfFallback)
+  return await pending
 }
 
 export function getTESVersion(): string {
@@ -93,7 +116,10 @@ function xxteaEncryptCore(plaintext: string, key: [number, number, number, numbe
   const n = Math.ceil(plaintext.length / 4)
   const v = new Uint32Array(n)
   for (let i = 0; i < n; i++) {
-    let b0 = 0, b1 = 0, b2 = 0, b3 = 0
+    let b0 = 0,
+      b1 = 0,
+      b2 = 0,
+      b3 = 0
     if (4 * i < plaintext.length) b0 = plaintext.charCodeAt(4 * i)
     if (4 * i + 1 < plaintext.length) b1 = plaintext.charCodeAt(4 * i + 1)
     if (4 * i + 2 < plaintext.length) b2 = plaintext.charCodeAt(4 * i + 2)

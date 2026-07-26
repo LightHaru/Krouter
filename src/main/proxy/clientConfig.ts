@@ -1,11 +1,22 @@
 import { constants, existsSync } from 'fs'
-import { access, copyFile, mkdir, readFile, writeFile } from 'fs/promises'
+import { access, copyFile, cp, mkdir, readFile, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import { homedir } from 'os'
-import { KIRO_PROXY_PREFERRED_MODEL_IDS, isAutoKiroModelId, normalizeKiroModelIdForCompare } from './modelCatalog'
+import {
+  KIRO_PROXY_PREFERRED_MODEL_IDS,
+  isAutoKiroModelId,
+  normalizeKiroModelIdForCompare
+} from './modelCatalog'
 
-export type ProxyClientTarget = 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'
+export type ProxyClientTarget =
+  | 'claudeCode'
+  | 'opencode'
+  | 'codex'
+  | 'gemini'
+  | 'hermes'
+  | 'openclaw'
 type OpenCodeInputModality = 'text' | 'image' | 'pdf'
+const OPENCLAW_LONG_TASK_TIMEOUT_SECONDS = 30 * 60
 
 export interface ProxyClientModel {
   id: string
@@ -13,6 +24,9 @@ export interface ProxyClientModel {
   inputTypes?: string[]
   maxInputTokens?: number | null
   maxOutputTokens?: number | null
+  supportsThinking?: boolean
+  thinkingEfforts?: string[]
+  modelProvider?: string
 }
 
 export interface ConfigureProxyClientsInput {
@@ -24,6 +38,7 @@ export interface ConfigureProxyClientsInput {
   modelId: string
   modelName?: string
   models?: ProxyClientModel[]
+  reasoningEffort?: string
 }
 
 export interface ProxyClientConfigResult {
@@ -46,6 +61,7 @@ interface ProxyClientContext {
   apiKey: string
   modelId: string
   models: ProxyClientModel[]
+  reasoningEffort: string
 }
 
 function dedupeClientModels(models: ProxyClientModel[]): ProxyClientModel[] {
@@ -66,14 +82,19 @@ function dedupeClientModels(models: ProxyClientModel[]): ProxyClientModel[] {
       name: existing.name || model.name,
       inputTypes: existing.inputTypes?.length ? existing.inputTypes : model.inputTypes,
       maxInputTokens: existing.maxInputTokens || model.maxInputTokens,
-      maxOutputTokens: existing.maxOutputTokens || model.maxOutputTokens
+      maxOutputTokens: existing.maxOutputTokens || model.maxOutputTokens,
+      supportsThinking: existing.supportsThinking ?? model.supportsThinking,
+      thinkingEfforts: existing.thinkingEfforts?.length
+        ? existing.thinkingEfforts
+        : model.thinkingEfforts,
+      modelProvider: existing.modelProvider || model.modelProvider
     })
   }
   return Array.from(modelMap.values())
 }
 
 function buildOpenClawModels(context: ProxyClientContext): ProxyClientModel[] {
-  return dedupeClientModels(context.models).filter(model => !isAutoKiroModelId(model.id))
+  return dedupeClientModels(context.models).filter((model) => !isAutoKiroModelId(model.id))
 }
 
 function openClawModelsToClientModels(value: unknown): ProxyClientModel[] {
@@ -84,35 +105,58 @@ function openClawModelsToClientModels(value: unknown): ProxyClientModel[] {
       const id = typeof item.id === 'string' ? item.id.trim() : ''
       if (!id) return null
       const input = Array.isArray(item.input)
-        ? item.input.filter((entry): entry is string => typeof entry === 'string').map(entry => entry.toUpperCase())
+        ? item.input
+            .filter((entry): entry is string => typeof entry === 'string')
+            .map((entry) => entry.toUpperCase())
         : undefined
       return {
         id,
         name: typeof item.name === 'string' ? item.name : id,
         inputTypes: input,
-        maxInputTokens: typeof item.contextWindow === 'number'
-          ? item.contextWindow
-          : typeof item.contextTokens === 'number' ? item.contextTokens : undefined,
-        maxOutputTokens: typeof item.maxTokens === 'number' ? item.maxTokens : undefined
+        maxInputTokens:
+          typeof item.contextWindow === 'number'
+            ? item.contextWindow
+            : typeof item.contextTokens === 'number'
+              ? item.contextTokens
+              : undefined,
+        maxOutputTokens: typeof item.maxTokens === 'number' ? item.maxTokens : undefined,
+        supportsThinking: item.reasoning === true
       }
     })
     .filter((item): item is ProxyClientModel => Boolean(item))
 }
 
+function openClawLongTaskTimeout(value: unknown): number {
+  const current = typeof value === 'number' && Number.isFinite(value) ? value : 0
+  return Math.max(current, OPENCLAW_LONG_TASK_TIMEOUT_SECONDS)
+}
+
 function pickOpenClawPrimaryModel(context: ProxyClientContext, models: ProxyClientModel[]): string {
   const selected = context.modelId.trim()
   if (selected && !isAutoKiroModelId(selected)) {
-    const match = models.find(model => normalizeKiroModelIdForCompare(model.id) === normalizeKiroModelIdForCompare(selected))
+    const match = models.find(
+      (model) =>
+        normalizeKiroModelIdForCompare(model.id) === normalizeKiroModelIdForCompare(selected)
+    )
     if (match) return match.id
   }
   for (const preferredId of KIRO_PROXY_PREFERRED_MODEL_IDS) {
-    const match = models.find(model => normalizeKiroModelIdForCompare(model.id) === normalizeKiroModelIdForCompare(preferredId))
+    const match = models.find(
+      (model) =>
+        normalizeKiroModelIdForCompare(model.id) === normalizeKiroModelIdForCompare(preferredId)
+    )
     if (match) return match.id
   }
-  return models[0]?.id || (selected && !isAutoKiroModelId(selected) ? selected : 'claude-sonnet-4.5')
+  return (
+    models[0]?.id || (selected && !isAutoKiroModelId(selected) ? selected : 'claude-sonnet-4.5')
+  )
 }
 
-function buildOpenClawFallbackRefs(providerId: string, primaryModelId: string, models: ProxyClientModel[]): string[] {
+function buildOpenClawFallbackRefs(
+  providerId: string,
+  primaryModelId: string,
+  models: ProxyClientModel[]
+): string[] {
   const byNormalizedId = new Map<string, string>()
   for (const model of models) {
     const id = model.id?.trim()
@@ -199,7 +243,8 @@ function stripJsonc(content: string): string {
 
     if (current === '/' && next === '*') {
       index += 2
-      while (index < content.length && !(content[index] === '*' && content[index + 1] === '/')) index++
+      while (index < content.length && !(content[index] === '*' && content[index + 1] === '/'))
+        index++
       index++
       continue
     }
@@ -255,13 +300,15 @@ function escapeTomlString(value: string): string {
 }
 
 function outputLimit(model: ProxyClientModel): number {
-  if (typeof model.maxOutputTokens === 'number' && model.maxOutputTokens > 0) return model.maxOutputTokens
+  if (typeof model.maxOutputTokens === 'number' && model.maxOutputTokens > 0)
+    return model.maxOutputTokens
   if (model.id.toLowerCase().includes('haiku')) return 8192
   return 32000
 }
 
 function contextLimit(model: ProxyClientModel): number {
-  if (typeof model.maxInputTokens === 'number' && model.maxInputTokens > 0) return model.maxInputTokens
+  if (typeof model.maxInputTokens === 'number' && model.maxInputTokens > 0)
+    return model.maxInputTokens
   return 200000
 }
 
@@ -270,7 +317,8 @@ function inputModalities(model: ProxyClientModel): OpenCodeInputModality[] {
   for (const item of model.inputTypes ?? []) {
     const lower = item.toLowerCase()
     if (lower.includes('image')) values.add('image')
-    if (lower.includes('pdf') || lower.includes('document') || lower.includes('file')) values.add('pdf')
+    if (lower.includes('pdf') || lower.includes('document') || lower.includes('file'))
+      values.add('pdf')
   }
   return Array.from(values)
 }
@@ -282,7 +330,10 @@ function buildProxyOrigin(input: ConfigureProxyClientsInput): string {
 }
 
 async function exists(path: string): Promise<boolean> {
-  return access(path, constants.F_OK).then(() => true, () => false)
+  return await access(path, constants.F_OK).then(
+    () => true,
+    () => false
+  )
 }
 
 async function backupIfExists(path: string): Promise<string[]> {
@@ -319,8 +370,12 @@ function getClaudeSettingsPath(): string {
 
 function getOpenCodeConfigPath(): string {
   const dir = join(homedir(), '.config', 'opencode')
-  const candidates = [join(dir, 'opencode.jsonc'), join(dir, 'opencode.json'), join(dir, 'config.json')]
-  return candidates.find(path => existsSync(path)) || candidates[1]
+  const candidates = [
+    join(dir, 'opencode.jsonc'),
+    join(dir, 'opencode.json'),
+    join(dir, 'config.json')
+  ]
+  return candidates.find((path) => existsSync(path)) || candidates[1]
 }
 
 function getCodexAuthPath(): string {
@@ -336,7 +391,9 @@ function ensureObjectField(target: Record<string, unknown>, key: string): Record
   return target[key] as Record<string, unknown>
 }
 
-async function configureClaudeCode(context: ProxyClientContext): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
+async function configureClaudeCode(
+  context: ProxyClientContext
+): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
   const path = getClaudeSettingsPath()
   const config = await readJsonObject(path)
   const env = ensureObjectField(config, 'env')
@@ -345,8 +402,10 @@ async function configureClaudeCode(context: ProxyClientContext): Promise<Omit<Pr
   env.ANTHROPIC_API_KEY = context.apiKey
   env.ANTHROPIC_MODEL = context.modelId
   // 默认模型映射：让 Claude Code 的 haiku/opus/sonnet 快捷调用都走代理支持的模型
-  const haikuModel = context.models.find(m => m.id.toLowerCase().includes('haiku'))?.id || 'claude-haiku-4.5'
-  const opusModel = context.models.find(m => m.id.toLowerCase().includes('opus'))?.id || context.modelId
+  const haikuModel =
+    context.models.find((m) => m.id.toLowerCase().includes('haiku'))?.id || 'claude-haiku-4.5'
+  const opusModel =
+    context.models.find((m) => m.id.toLowerCase().includes('opus'))?.id || context.modelId
   env.ANTHROPIC_DEFAULT_HAIKU_MODEL = haikuModel
   env.ANTHROPIC_DEFAULT_OPUS_MODEL = opusModel
   env.ANTHROPIC_DEFAULT_SONNET_MODEL = context.modelId
@@ -357,8 +416,8 @@ function openCodeModelConfig(model: ProxyClientModel): Record<string, unknown> {
   const modalities = inputModalities(model)
   return {
     name: model.name || model.id,
-    attachment: modalities.some(item => item !== 'text'),
-    reasoning: false,
+    attachment: modalities.some((item) => item !== 'text'),
+    reasoning: model.supportsThinking === true,
     temperature: true,
     tool_call: true,
     limit: {
@@ -377,7 +436,7 @@ function openClawModelConfig(model: ProxyClientModel): Record<string, unknown> {
   return {
     id: model.id,
     name: model.name || model.id,
-    reasoning: false,
+    reasoning: model.supportsThinking === true,
     input,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: contextLimit(model),
@@ -386,7 +445,9 @@ function openClawModelConfig(model: ProxyClientModel): Record<string, unknown> {
   }
 }
 
-async function configureOpenCode(context: ProxyClientContext): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
+async function configureOpenCode(
+  context: ProxyClientContext
+): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
   const path = getOpenCodeConfigPath()
   const config = await readJsonObject(path)
   const provider = ensureObjectField(config, 'provider')
@@ -397,9 +458,12 @@ async function configureOpenCode(context: ProxyClientContext): Promise<Omit<Prox
       baseURL: context.openaiBaseUrl,
       apiKey: context.apiKey
     },
-    models: Object.fromEntries(context.models.map(model => [model.id, openCodeModelConfig(model)]))
+    models: Object.fromEntries(
+      context.models.map((model) => [model.id, openCodeModelConfig(model)])
+    )
   }
-  config.$schema = typeof config.$schema === 'string' ? config.$schema : 'https://opencode.ai/config.json'
+  config.$schema =
+    typeof config.$schema === 'string' ? config.$schema : 'https://opencode.ai/config.json'
   config.model = `kiro/${context.modelId}`
   if (typeof config.small_model !== 'string' || config.small_model.startsWith('kiro/')) {
     config.small_model = `kiro/${context.modelId}`
@@ -413,7 +477,7 @@ async function configureOpenCode(context: ProxyClientContext): Promise<Omit<Prox
 function upsertRootTomlString(content: string, key: string, value: string): string {
   const newline = content.includes('\r\n') ? '\r\n' : '\n'
   const lines = content.length === 0 ? [] : content.split(/\r?\n/)
-  const sectionIndex = lines.findIndex(line => /^\s*\[/.test(line))
+  const sectionIndex = lines.findIndex((line) => /^\s*\[/.test(line))
   const rootEnd = sectionIndex === -1 ? lines.length : sectionIndex
   const nextLines: string[] = []
   let written = false
@@ -458,13 +522,32 @@ function removeTomlSection(content: string, section: string): string {
 
 function upsertCodexConfig(content: string, context: ProxyClientContext): string {
   const newline = content.includes('\r\n') ? '\r\n' : '\n'
-  const withProvider = upsertRootTomlString(upsertRootTomlString(content, 'model_provider', 'kiro'), 'model', context.modelId)
-  const withoutKiro = removeTomlSection(removeTomlSection(withProvider, 'model_providers.kiro'), 'model_providers."kiro"')
-  const separator = withoutKiro.trim() ? `${newline}${newline}` : ''
-  return `${withoutKiro.trimEnd()}${separator}[model_providers.kiro]${newline}name = "Kiro Proxy"${newline}base_url = "${escapeTomlString(context.openaiBaseUrl)}"${newline}wire_api = "responses"${newline}`
+  let root = upsertRootTomlString(
+    upsertRootTomlString(content, 'model_provider', 'krouter'),
+    'model',
+    context.modelId
+  )
+  const effort = context.reasoningEffort === 'max' ? 'xhigh' : context.reasoningEffort
+  if (effort && effort !== 'auto') {
+    root = upsertRootTomlString(root, 'model_reasoning_effort', effort)
+  } else {
+    root = root.replace(/^\s*model_reasoning_effort\s*=.*(?:\r?\n|$)/m, '')
+  }
+  let withoutProvider = removeTomlSection(
+    removeTomlSection(root, 'model_providers.kiro'),
+    'model_providers."kiro"'
+  )
+  withoutProvider = removeTomlSection(
+    removeTomlSection(withoutProvider, 'model_providers.krouter'),
+    'model_providers."krouter"'
+  )
+  const separator = withoutProvider.trim() ? `${newline}${newline}` : ''
+  return `${withoutProvider.trimEnd()}${separator}[model_providers.krouter]${newline}name = "Krouter"${newline}base_url = "${escapeTomlString(context.openaiBaseUrl)}"${newline}env_key = "OPENAI_API_KEY"${newline}wire_api = "responses"${newline}`
 }
 
-async function configureCodex(context: ProxyClientContext): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
+async function configureCodex(
+  context: ProxyClientContext
+): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
   const authPath = getCodexAuthPath()
   const configPath = getCodexConfigPath()
   const auth = await readJsonObject(authPath)
@@ -485,7 +568,11 @@ function getGeminiSettingsPath(): string {
 }
 
 function buildEnvContent(entries: Record<string, string>): string {
-  return Object.entries(entries).map(([k, v]) => `${k}=${v}`).join('\n') + '\n'
+  return (
+    Object.entries(entries)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('\n') + '\n'
+  )
 }
 
 function parseEnvFile(content: string): Record<string, string> {
@@ -499,7 +586,9 @@ function parseEnvFile(content: string): Record<string, string> {
   return result
 }
 
-async function configureGemini(context: ProxyClientContext): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
+async function configureGemini(
+  context: ProxyClientContext
+): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
   const envPath = getGeminiEnvPath()
   const settingsPath = getGeminiSettingsPath()
   const allPaths = [envPath, settingsPath]
@@ -510,14 +599,14 @@ async function configureGemini(context: ProxyClientContext): Promise<Omit<ProxyC
   existingEnv.GEMINI_API_KEY = context.apiKey
   existingEnv.GOOGLE_GEMINI_BASE_URL = `${context.proxyOrigin}/v1beta`
   existingEnv.GEMINI_MODEL = context.modelId
-  allBackups.push(...await writeText(envPath, buildEnvContent(existingEnv)))
+  allBackups.push(...(await writeText(envPath, buildEnvContent(existingEnv))))
 
   // settings.json
   const settings = await readJsonObject(settingsPath)
   const security = ensureObjectField(settings, 'security')
   const auth = ensureObjectField(security, 'auth')
   auth.selectedType = 'gemini-api-key'
-  allBackups.push(...await writeJsonObject(settingsPath, settings))
+  allBackups.push(...(await writeJsonObject(settingsPath, settings)))
 
   return { paths: allPaths, backupPaths: allBackups }
 }
@@ -527,29 +616,48 @@ function getHermesConfigPath(): string {
   return join(homedir(), '.hermes', 'config.yaml')
 }
 
-async function configureHermes(context: ProxyClientContext): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
+function getHermesEnvPath(): string {
+  return join(homedir(), '.hermes', '.env')
+}
+
+async function configureHermes(
+  context: ProxyClientContext
+): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
   const configPath = getHermesConfigPath()
+  const envPath = getHermesEnvPath()
   const existing = (await exists(configPath)) ? await readFile(configPath, 'utf-8') : ''
   const newline = existing.includes('\r\n') ? '\r\n' : '\n'
 
-  // 构建 models dict
-  const modelsYaml = context.models.map(m => {
-    const ctx = typeof m.maxInputTokens === 'number' && m.maxInputTokens > 0 ? m.maxInputTokens : 200000
-    return `      ${m.id}:${newline}        context_length: ${ctx}`
-  }).join(newline)
+  const modelsYaml = context.models
+    .map((m) => {
+      const lines = [
+        `      "${m.id.replace(/"/g, '\\"')}":`,
+        `        context_length: ${contextLimit(m)}`
+      ]
+      if (inputModalities(m).includes('image')) lines.push('        supports_vision: true')
+      return lines.join(newline)
+    })
+    .join(newline)
 
   const providerBlock = [
-    `  - name: kiro`,
+    `  - name: krouter`,
     `    base_url: ${context.openaiBaseUrl}`,
-    `    api_key: ${context.apiKey}`,
-    `    model: ${context.modelId}`,
+    `    key_env: KROUTER_API_KEY`,
+    `    api_mode: chat_completions`,
+    `    request_timeout_seconds: ${OPENCLAW_LONG_TASK_TIMEOUT_SECONDS}`,
+    ...(context.reasoningEffort !== 'auto'
+      ? [
+          `    extra_body:`,
+          `      reasoning_effort: ${context.reasoningEffort === 'max' ? 'xhigh' : context.reasoningEffort}`
+        ]
+      : []),
     `    models:`,
     modelsYaml
   ].join(newline)
 
-  // 简单追加/替换 custom_providers 中的 kiro 条目
   let content = existing
-  const kiroProviderRegex = /^\s*- name:\s*kiro\b[\s\S]*?(?=^\s*- name:|^[a-z]|$)/gm
+  const kiroProviderRegex =
+    /^\s{2}- name:\s*["']?(?:kiro|krouter)["']?\s*$[\s\S]*?(?=^\s{2}- name:|^[a-zA-Z_][\w-]*:\s*$|\s*$)/gm
   if (kiroProviderRegex.test(content)) {
     content = content.replace(kiroProviderRegex, providerBlock + newline)
   } else if (content.includes('custom_providers:')) {
@@ -558,16 +666,31 @@ async function configureHermes(context: ProxyClientContext): Promise<Omit<ProxyC
     content = `${content.trimEnd()}${newline}${newline}custom_providers:${newline}${providerBlock}${newline}`
   }
 
-  // 更新 model section
-  const modelSection = `model:${newline}  default: "kiro/${context.modelId}"${newline}  provider: "kiro"${newline}`
+  const selected = context.models.find(
+    (model) =>
+      normalizeKiroModelIdForCompare(model.id) === normalizeKiroModelIdForCompare(context.modelId)
+  )
+  const modelSection =
+    [
+      `model:`,
+      `  default: "${context.modelId.replace(/"/g, '\\"')}"`,
+      `  provider: "custom:krouter"`,
+      `  context_length: ${selected ? contextLimit(selected) : 200000}`,
+      ...(selected && inputModalities(selected).includes('image')
+        ? ['  supports_vision: true']
+        : [])
+    ].join(newline) + newline
   if (/^model:/m.test(content)) {
     content = content.replace(/^model:.*(?:\n(?=\s).*)*$/m, modelSection.trimEnd())
   } else {
     content = `${content.trimEnd()}${newline}${newline}${modelSection}`
   }
 
-  const backups = await writeText(configPath, content)
-  return { paths: [configPath], backupPaths: backups }
+  const existingEnv = (await exists(envPath)) ? parseEnvFile(await readFile(envPath, 'utf-8')) : {}
+  existingEnv.KROUTER_API_KEY = context.apiKey
+  const envBackups = await writeText(envPath, buildEnvContent(existingEnv))
+  const configBackups = await writeText(configPath, content)
+  return { paths: [configPath, envPath], backupPaths: [...configBackups, ...envBackups] }
 }
 
 // OpenClaw: ~/.openclaw/openclaw.json
@@ -575,7 +698,9 @@ function getOpenClawConfigPath(): string {
   return join(homedir(), '.openclaw', 'openclaw.json')
 }
 
-async function configureOpenClaw(context: ProxyClientContext): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
+async function configureOpenClaw(
+  context: ProxyClientContext
+): Promise<Omit<ProxyClientConfigResult, 'client' | 'success' | 'error'>> {
   const configPath = getOpenClawConfigPath()
   const config = await readJsonObject(configPath)
   const providerId = 'krouter'
@@ -586,20 +711,23 @@ async function configureOpenClaw(context: ProxyClientContext): Promise<Omit<Prox
   if (typeof models.mode !== 'string') models.mode = 'merge'
   const providers = ensureObjectField(models, 'providers')
 
-  if (isRecord(providers.kiro) && (providers.kiro.base_url || providers.kiro.api_key || providers.kiro.api === 'openai-chat')) {
+  if (
+    isRecord(providers.kiro) &&
+    (providers.kiro.base_url || providers.kiro.api_key || providers.kiro.api === 'openai-chat')
+  ) {
     delete providers.kiro
   }
 
   const existingProvider = isRecord(providers[providerId])
-    ? providers[providerId] as Record<string, unknown>
+    ? (providers[providerId] as Record<string, unknown>)
     : isRecord(providers[legacyProviderId])
-      ? providers[legacyProviderId] as Record<string, unknown>
+      ? (providers[legacyProviderId] as Record<string, unknown>)
       : {}
   const existingModels = openClawModelsToClientModels(existingProvider.models)
   const openClawModels = dedupeClientModels([
     ...existingModels,
     ...buildOpenClawModels(context)
-  ]).filter(model => !isAutoKiroModelId(model.id))
+  ]).filter((model) => !isAutoKiroModelId(model.id))
   const primaryModelId = pickOpenClawPrimaryModel(context, openClawModels)
 
   providers[providerId] = {
@@ -607,6 +735,7 @@ async function configureOpenClaw(context: ProxyClientContext): Promise<Omit<Prox
     apiKey: context.apiKey,
     auth: 'api-key',
     api: 'openai-completions',
+    timeoutSeconds: openClawLongTaskTimeout(existingProvider.timeoutSeconds),
     models: openClawModels.map(openClawModelConfig)
   }
   delete providers[legacyProviderId]
@@ -614,6 +743,7 @@ async function configureOpenClaw(context: ProxyClientContext): Promise<Omit<Prox
   // agents.defaults.model
   const agents = ensureObjectField(config, 'agents')
   const defaults = ensureObjectField(agents, 'defaults')
+  defaults.timeoutSeconds = openClawLongTaskTimeout(defaults.timeoutSeconds)
   defaults.model = {
     primary: `${providerId}/${primaryModelId}`,
     fallbacks: buildOpenClawFallbackRefs(providerId, primaryModelId, openClawModels)
@@ -621,30 +751,82 @@ async function configureOpenClaw(context: ProxyClientContext): Promise<Omit<Prox
   const defaultsModels = ensureObjectField(defaults, 'models')
   for (const model of openClawModels) {
     const ref = `${providerId}/${model.id}`
-    defaultsModels[ref] = isRecord(defaultsModels[ref]) ? defaultsModels[ref] : {}
+    const entry = isRecord(defaultsModels[ref])
+      ? (defaultsModels[ref] as Record<string, unknown>)
+      : {}
+    if (model.supportsThinking && context.reasoningEffort !== 'auto') {
+      const params = isRecord(entry.params) ? (entry.params as Record<string, unknown>) : {}
+      const extraBody = isRecord(params.extra_body)
+        ? (params.extra_body as Record<string, unknown>)
+        : {}
+      entry.params = {
+        ...params,
+        extra_body: {
+          ...extraBody,
+          reasoning_effort: context.reasoningEffort === 'max' ? 'xhigh' : context.reasoningEffort
+        }
+      }
+    }
+    defaultsModels[ref] = entry
   }
 
   const backups = await writeJsonObject(configPath, config)
-  return { paths: [configPath], backupPaths: backups }
+  const paths = [configPath]
+  const skillSource = join(__dirname, '../../../docs/skills/krouter-image')
+  if (existsSync(skillSource)) {
+    const skillTarget = join(homedir(), '.openclaw', 'skills', 'krouter-image')
+    await mkdir(dirname(skillTarget), { recursive: true })
+    await cp(skillSource, skillTarget, { recursive: true, force: true })
+    paths.push(join(skillTarget, 'SKILL.md'), join(skillTarget, 'scripts', 'generate-image.cjs'))
+  }
+  return { paths, backupPaths: backups }
 }
 
-const ALL_CLIENT_TARGETS: ProxyClientTarget[] = ['claudeCode', 'opencode', 'codex', 'gemini', 'hermes', 'openclaw']
+const ALL_CLIENT_TARGETS: ProxyClientTarget[] = [
+  'claudeCode',
+  'opencode',
+  'codex',
+  'gemini',
+  'hermes',
+  'openclaw'
+]
 
-async function configureClient(client: ProxyClientTarget, context: ProxyClientContext): Promise<ProxyClientConfigResult> {
+async function configureClient(
+  client: ProxyClientTarget,
+  context: ProxyClientContext
+): Promise<ProxyClientConfigResult> {
   try {
-    const result = client === 'claudeCode' ? await configureClaudeCode(context)
-      : client === 'opencode' ? await configureOpenCode(context)
-      : client === 'codex' ? await configureCodex(context)
-      : client === 'gemini' ? await configureGemini(context)
-      : client === 'hermes' ? await configureHermes(context)
-      : await configureOpenClaw(context)
+    const result =
+      client === 'claudeCode'
+        ? await configureClaudeCode(context)
+        : client === 'opencode'
+          ? await configureOpenCode(context)
+          : client === 'codex'
+            ? await configureCodex(context)
+            : client === 'gemini'
+              ? await configureGemini(context)
+              : client === 'hermes'
+                ? await configureHermes(context)
+                : await configureOpenClaw(context)
     return { client, success: true, ...result }
   } catch (error) {
-    return { client, success: false, paths: [], backupPaths: [], error: error instanceof Error ? error.message : 'Unknown error' }
+    return {
+      client,
+      success: false,
+      paths: [],
+      backupPaths: [],
+      error: error instanceof Error ? error.message : 'Unknown error'
+    }
   }
 }
 
-export async function configureProxyClients(input: ConfigureProxyClientsInput): Promise<{ success: boolean; proxyOrigin: string; openaiBaseUrl: string; apiKey: ConfigureProxyClientsApiKey; results: ProxyClientConfigResult[] }> {
+export async function configureProxyClients(input: ConfigureProxyClientsInput): Promise<{
+  success: boolean
+  proxyOrigin: string
+  openaiBaseUrl: string
+  apiKey: ConfigureProxyClientsApiKey
+  results: ProxyClientConfigResult[]
+}> {
   const modelId = input.modelId.trim()
   const apiKey = input.apiKey?.trim()
   if (!Array.isArray(input.clients)) throw new Error('Client targets are required')
@@ -652,24 +834,37 @@ export async function configureProxyClients(input: ConfigureProxyClientsInput): 
   if (!modelId) throw new Error('Model is required')
   if (!apiKey) throw new Error('API Key is required')
   if (clients.length === 0) throw new Error('At least one client is required')
-  if (clients.some(client => !ALL_CLIENT_TARGETS.includes(client))) throw new Error('Unsupported client target')
+  if (clients.some((client) => !ALL_CLIENT_TARGETS.includes(client)))
+    throw new Error('Unsupported client target')
 
   const proxyOrigin = buildProxyOrigin(input)
-  const modelMap = new Map((input.models?.length ? input.models : [{ id: modelId, name: input.modelName || modelId }]).map(model => [model.id, model]))
-  if (!modelMap.has(modelId)) modelMap.set(modelId, { id: modelId, name: input.modelName || modelId })
+  const requestedEffort = input.reasoningEffort?.trim().toLowerCase() || 'auto'
+  const reasoningEffort = new Set(['auto', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']).has(
+    requestedEffort
+  )
+    ? requestedEffort
+    : 'auto'
+  const modelMap = new Map(
+    (input.models?.length ? input.models : [{ id: modelId, name: input.modelName || modelId }]).map(
+      (model) => [model.id, model]
+    )
+  )
+  if (!modelMap.has(modelId))
+    modelMap.set(modelId, { id: modelId, name: input.modelName || modelId })
   const context: ProxyClientContext = {
     proxyOrigin,
     openaiBaseUrl: `${proxyOrigin.replace(/\/$/, '')}/v1`,
     apiKey,
     modelId,
-    models: Array.from(modelMap.values())
+    models: Array.from(modelMap.values()),
+    reasoningEffort
   }
   const results: ProxyClientConfigResult[] = []
   for (const client of clients) {
     results.push(await configureClient(client, context))
   }
   return {
-    success: results.every(result => result.success),
+    success: results.every((result) => result.success),
     proxyOrigin,
     openaiBaseUrl: context.openaiBaseUrl,
     apiKey: { key: apiKey },

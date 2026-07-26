@@ -2,6 +2,7 @@
 import { describe, it, expect } from 'vitest'
 import { HostsManager } from '../../src/main/kproxy/hostsManager'
 import { ModelMapper } from '../../src/main/kproxy/modelMapper'
+import { extractModel, getToolForHost, isKiroChatRequest } from '../../src/main/kproxy/mitmHttpsServer'
 
 describe('Phase 12: MITM Integration', () => {
   describe('HostsManager', () => {
@@ -35,8 +36,12 @@ describe('Phase 12: MITM Integration', () => {
   describe('ModelMapper', () => {
     it('maps Kiro IDE models', () => {
       const mapper = new ModelMapper()
+      expect(mapper.mapModel('claude-opus-4.8', 'kiro')).toBe('claude-opus-4.8')
+      expect(mapper.mapModel('claude-opus-4-8', 'kiro')).toBe('claude-opus-4.8')
+      expect(mapper.mapModel('claude-sonnet-4.5', 'kiro')).toBe('claude-sonnet-4.5')
       expect(mapper.mapModel('anthropic.claude-sonnet-4-6-v1', 'kiro')).toBe('claude-sonnet-4-6')
       expect(mapper.mapModel('anthropic.claude-opus-4-6-v1', 'kiro')).toBe('claude-opus-4-6')
+      expect(mapper.mapModel('future-opus-variant', 'kiro')).toBe('claude-opus-4.8')
     })
 
     it('maps Copilot models', () => {
@@ -74,6 +79,26 @@ describe('Phase 12: MITM Integration', () => {
       expect(mappings[0]).toHaveProperty('ideModel')
       expect(mappings[0]).toHaveProperty('krouterModel')
       expect(mappings[0]).toHaveProperty('ideType')
+    })
+  })
+
+  describe('Kiro traffic classification', () => {
+    it('recognizes regional Kiro and CodeWhisperer hosts', () => {
+      expect(getToolForHost('runtime.eu-west-1.kiro.dev')).toBe('kiro')
+      expect(getToolForHost('q.ap-southeast-1.amazonaws.com:443')).toBe('kiro')
+      expect(getToolForHost('codewhisperer.us-west-2.amazonaws.com')).toBe('kiro')
+    })
+
+    it('extracts model ids from current and nested payload variants', () => {
+      expect(extractModel('/generateAssistantResponse', Buffer.from('{"modelId":"claude-opus-4.8"}'))).toBe('claude-opus-4.8')
+      expect(extractModel('/generateAssistantResponse', Buffer.from('{"request":{"model":"claude-sonnet-4.5"}}'))).toBe('claude-sonnet-4.5')
+    })
+
+    it('recognizes the POST / RPC variant used by current Kiro builds', () => {
+      const body = Buffer.from('{"conversationState":{"currentMessage":{"userInputMessage":{"content":"hello"}}}}')
+      expect(isKiroChatRequest('POST', '/', {}, body)).toBe(true)
+      expect(isKiroChatRequest('POST', '/', { 'x-amz-target': 'KiroRuntimeService.GenerateAssistantResponse' }, Buffer.from('{}'))).toBe(true)
+      expect(isKiroChatRequest('POST', '/agents/activity', {}, Buffer.from('{"event":"opened"}'))).toBe(false)
     })
   })
 })

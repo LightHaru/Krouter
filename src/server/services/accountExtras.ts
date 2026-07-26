@@ -4,7 +4,6 @@ import {
   fetchSubscriptionToken,
   setUserPreference
 } from '../../main/proxy/kiroApi'
-import { KIRO_PROXY_MODEL_PRESETS } from '../../main/proxy/modelCatalog'
 import type { ProxyAccount } from '../../main/proxy/types'
 
 function accountFromArgs(args: unknown[], fallbackId: string): ProxyAccount | null {
@@ -49,22 +48,6 @@ export async function accountGetModels(args: unknown[]): Promise<{
       rateMultiplier: model.rateMultiplier,
       rateUnit: model.rateUnit
     }))
-    const seen = new Set(output.map((model) => String(model.id)))
-    for (const preset of KIRO_PROXY_MODEL_PRESETS) {
-      if (!seen.has(preset.id)) {
-        seen.add(preset.id)
-        output.push({
-          id: preset.id,
-          name: preset.name,
-          description: preset.description,
-          inputTypes: preset.inputTypes,
-          maxInputTokens: preset.maxInputTokens,
-          maxOutputTokens: preset.maxOutputTokens,
-          rateMultiplier: undefined,
-          rateUnit: undefined
-        })
-      }
-    }
     return {
       success: true,
       models: output
