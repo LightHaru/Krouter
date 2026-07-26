@@ -1024,10 +1024,21 @@ export class ProxyServer {
       }
 
       // 先停止接受新连接
+      //
+      // ĐỪNG gộp hai lời gọi close() của fallback thành một. Trông như thừa nhưng không phải:
+      // http.Server.prototype.close() chạy httpServerPreClose() -> closeIdleConnections() ở
+      // MỌI lần gọi, nên lần close() thứ hai là một lượt thu hồi kết nối keep-alive đang rảnh
+      // nữa. Gộp lại thành `fallback?.close(oneClosed)` là bỏ mất lượt thu hồi đó.
+      //
+      // Về thứ tự: close(cb) không bao giờ gọi cb đồng bộ và không bao giờ đánh rơi cb — kể cả
+      // khi _handle đã null nó vẫn đăng ký once('close') rồi mới gọi _emitCloseIfDrained().
+      // Đã kiểm chứng bằng Node 22 thật ở cả hai nhánh: fallback còn kết nối (cb chờ tới lúc
+      // thoát hết) và fallback đã đóng xong (cb chạy ở tick kế tiếp). Vì vậy finish() chỉ chạy
+      // sau khi CẢ HAI listener đã thoát, hoặc do forceTimer, không có đường treo.
       main.close(() => {
-        // Viết bằng if/else thay cho `a?.close(cb) || cb()`: biểu thức đó dựa vào việc
-        // optional-chaining trả undefined để rẽ nhánh, đọc rất khó và bị no-unused-expressions
-        // bắt. Hành vi giữ nguyên hoàn toàn.
+        // if/else thay cho `a?.close(cb) || cb()`: biểu thức cũ rẽ nhánh dựa vào việc
+        // optional-chaining trả undefined, rất khó đọc và bị no-unused-expressions bắt.
+        // Hành vi giữ nguyên hoàn toàn.
         if (fallback) fallback.close(() => finish())
         else finish()
       })
