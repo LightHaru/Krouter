@@ -346,23 +346,9 @@ function openBrowser(url) {
   }
 }
 
-async function login() {
-  const fileEnv = readEnvFile()
-  const session = await request('/api/auth/session').catch(() => null)
-  if (session?.authenticated) return
-  if (session?.setupRequired) {
-    throw new Error(`Krouter chua duoc setup. Chay: ${COMMAND_NAME} setup`)
-  }
-  const email = process.env.KROUTER_ADMIN_EMAIL || process.env.KAM_ADMIN_EMAIL || process.env.ADMIN_EMAIL || fileEnv.KROUTER_ADMIN_EMAIL || fileEnv.KAM_ADMIN_EMAIL || fileEnv.ADMIN_EMAIL || 'admin@krouter.local'
-  const password = process.env.KROUTER_ADMIN_PASSWORD || process.env.KAM_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || fileEnv.KROUTER_ADMIN_PASSWORD || fileEnv.KAM_ADMIN_PASSWORD || fileEnv.ADMIN_PASSWORD
-  if (!password) {
-    throw new Error(`Thieu mat khau admin. Mo dashboard ${DASHBOARD_URL} hoac dat KROUTER_ADMIN_PASSWORD.`)
-  }
-  await request('/api/auth/login', {
-    method: 'POST',
-    body: JSON.stringify({ email, password })
-  })
-}
+// Truoc day co login() dang nhap bang KROUTER_ADMIN_PASSWORD tu env/.env. Backend hien cap
+// quyen cho request tu localhost nen CLI khong con can mat khau; ham do da thanh code chet va
+// duoc go bo. Neu backend tu choi, thong bao trong getTunnelStatus() se huong dan khoi dong lai.
 
 async function getSetupStatus() {
   return request('/api/auth/setup/status')

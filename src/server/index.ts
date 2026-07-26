@@ -2714,7 +2714,9 @@ async function main(): Promise<void> {
         // tự thêm không bao giờ bị đụng tới.
         await restoreHostsOnShutdown()
 
-        await store.save()
+        // flush() chứ không phải save(): save() gom các lần ghi trong một cửa sổ ngắn, mà lúc
+        // này tiến trình sắp thoát nên không còn thời gian để cửa sổ đó đóng.
+        await store.flush()
       } catch (error) {
         console.error('[Server] Lỗi khi tắt an toàn:', error)
       } finally {

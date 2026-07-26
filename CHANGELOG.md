@@ -2,6 +2,53 @@
 
 All notable Krouter changes are tracked here.
 
+## Unreleased
+
+### Added
+
+- **CI on GitHub Actions.** Three jobs on every push and pull request to `main`: typecheck +
+  lint, unit tests on both Ubuntu and Windows, and a full `build:fullstack` that asserts the
+  dashboard and backend artifacts were actually produced. Krouter has platform-specific paths
+  for the hosts file, certificate store, and data directory, so both operating systems are
+  tested rather than just the development machine.
+- **MitmProxy request tests** (10 tests, previously zero). The MITM path rewrites a 64-hex
+  device ID and must forward everything else byte-for-byte, since request bodies carry
+  user-typed text and a `Content-Length` the IDE already computed. The tests pin byte integrity
+  across chunk boundaries, non-UTF-8 payloads, `\r\n\r\n` appearing inside a body, and the
+  buffering of body fragments that arrive during the upstream TLS handshake. Each one was
+  checked against a deliberately reintroduced bug to confirm it fails when the behaviour breaks.
+- **Store write-path tests** covering coalescing, immediate-write semantics, and `flush()`.
+
+### Changed
+
+- **Store writes are coalesced on the hot path.** `onConfigChanged` fires at the end of
+  `recordApiKeyUsage()` — that is, on every proxied request — and nothing awaits it. Each event
+  previously triggered a full serialize + file write + backup copy of the entire store: measured
+  at ~17 ms for a 593 KB store, all of it serialized through a single queue, or roughly a 17%
+  duty cycle at 10 req/s and growing linearly with store size. Fire-and-forget writes now pass
+  through `scheduleSave()`, which collapses a burst into one disk write per 250 ms window, and
+  the `.bak` copy is taken at most once a minute instead of once per write. Callers that await
+  `save()` still get the old guarantee: when the promise resolves, the data is on disk.
+- **Shutdown flushes instead of saving**, so a write pending inside the coalescing window is
+  written out rather than lost.
+- **ESLint no longer scans runtime data directories.** `.web-data` and friends are in
+  `.gitignore`, but ESLint 9's flat config does not read `.gitignore`; the vendored Chromium
+  bundles inside them accounted for 437 of 450 reported errors and buried the real ones. CommonJS
+  scripts are also exempt from `no-require-imports`, which does not apply to them.
+
+### Removed
+
+- **Dead `login()` in the CLI**, left over from before the backend granted access to localhost
+  requests. It read an admin password from the environment or `.env` and was never called.
+
+### Known limitations
+
+- In MITM mode, a device ID appearing in the request *body* is rewritten only within the portion
+  that arrives in the same chunk as the request headers; anything past that is forwarded
+  untouched. A TLS record holds up to ~16 KB, so ordinary Kiro requests are unaffected, but a
+  request larger than one record can reach upstream with its original ID in the body. Headers are
+  always rewritten. This is pinned by a test so the behaviour cannot change silently.
+
 ## 2.0.0 - 2026-07-26
 
 Krouter is no longer a Kiro-only router. This release adds three more upstream families

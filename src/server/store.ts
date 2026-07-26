@@ -38,6 +38,13 @@ const INSTANCE_SECRETS_FILE = 'instance-secrets.json'
 const MAX_SESSIONS_PER_USER = 20
 /** Trần cho mọi danh sách tombstone (account và proxy) để chúng không phình theo vòng đời app. */
 const MAX_TOMBSTONES = 5000
+/**
+ * Cửa sổ gom các lần ghi store. Đủ ngắn để thao tác trên UI vẫn thấy tức thì, đủ dài để một
+ * chuỗi request proxy liên tiếp chỉ tốn một lần ghi thay vì một lần cho mỗi request.
+ */
+const SAVE_COALESCE_MS = 250
+/** Nhịp tối thiểu giữa hai lần tạo file .bak (xem chú thích trong doSave). */
+const BACKUP_MIN_INTERVAL_MS = 60_000
 const PBKDF2_ITERATIONS = 120000
 
 interface InstanceSecrets {
@@ -252,6 +259,9 @@ export class WebStore {
   private data: WebStoreData = defaultStore()
   private loaded = false
   private saveQueue: Promise<void> = Promise.resolve()
+  /** Hẹn giờ của lần ghi gom đang chờ; null nghĩa là không có lần nào đang xếp lịch. */
+  private coalesceTimer: ReturnType<typeof setTimeout> | null = null
+  private lastBackupAt = 0
   private accountDataQueue: Promise<void> = Promise.resolve()
 
   async load(): Promise<void> {
@@ -293,23 +303,71 @@ export class WebStore {
     return this.data
   }
 
-  // Mọi lần ghi đều xếp hàng qua một chuỗi promise duy nhất: hai lần ghi
-  // không bao giờ chồng lên nhau và làm store.json thành JSON hỏng.
+  /**
+   * Ghi store ngay. Người gọi `await` xong là dữ liệu đã nằm trên đĩa.
+   *
+   * Mọi lần ghi xếp hàng qua một chuỗi promise duy nhất: hai lần ghi không bao giờ chồng lên
+   * nhau và làm store.json thành JSON hỏng.
+   */
   async save(): Promise<void> {
     this.saveQueue = this.saveQueue.then(() => this.doSave(), () => this.doSave())
     return this.saveQueue
   }
 
+  /**
+   * Lên lịch ghi, GOM các lời gọi liên tiếp trong một cửa sổ ngắn. Không trả promise chờ ghi
+   * xong — đây là đường dành cho ghi "cứ để đó" (fire-and-forget).
+   *
+   * Vì sao cần: `recordApiKeyUsage()` bắn onConfigChanged ở cuối MỖI request được proxy, và
+   * consumer của nó là `void this.persistConfig()` — không ai chờ kết quả. Mà mỗi lần ghi là
+   * stringify toàn bộ tài liệu + ghi cả file; đo trên store 593 KB là ~17 ms, nối tiếp qua một
+   * hàng đợi duy nhất. Ở 10 req/s đó là 17% thời gian chỉ để ghi store, và chi phí tăng tuyến
+   * tính theo kích thước store.
+   *
+   * CHỦ Ý không dùng cách này cho `save()`: ai đang `await save()` là đang cần đảm bảo bền
+   * vững, bắt họ chờ thêm một cửa sổ gom chỉ làm chuỗi ghi tuần tự chậm đi.
+   */
+  scheduleSave(): void {
+    if (this.coalesceTimer) return
+    this.coalesceTimer = setTimeout(() => {
+      this.coalesceTimer = null
+      void this.save().catch((error) => {
+        console.warn('[Store] Ghi theo lịch thất bại:', error)
+      })
+    }, SAVE_COALESCE_MS)
+    this.coalesceTimer.unref?.()
+  }
+
+  /** Ghi ngay, đồng thời huỷ lần ghi đang chờ theo lịch. Dùng ở đường tắt máy. */
+  async flush(): Promise<void> {
+    if (this.coalesceTimer) {
+      clearTimeout(this.coalesceTimer)
+      this.coalesceTimer = null
+    }
+    return await this.save()
+  }
+
   private async doSave(): Promise<void> {
     await fs.mkdir(dataDir(), { recursive: true })
     const payload = JSON.stringify(this.data, null, 2)
-    try {
-      await fs.copyFile(storePath(), backupPath())
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.warn(`[Store] Không tạo được bản sao lưu ${backupPath()}:`, error)
+
+    // Bản sao lưu có nhịp riêng, không đi kèm mọi lần ghi.
+    //
+    // store.json đã an toàn trước lỗi ghi dở nhờ cặp write-temp + rename (rename là nguyên tử
+    // trên cùng ổ đĩa). File .bak chỉ để lùi về BẢN TRƯỚC khi dữ liệu bị hỏng về mặt logic,
+    // nên không cần cập nhật theo từng lần ghi — làm vậy chỉ nhân đôi I/O.
+    const now = Date.now()
+    if (now - this.lastBackupAt >= BACKUP_MIN_INTERVAL_MS) {
+      this.lastBackupAt = now
+      try {
+        await fs.copyFile(storePath(), backupPath())
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          console.warn(`[Store] Không tạo được bản sao lưu ${backupPath()}:`, error)
+        }
       }
     }
+
     // Ghi ra file tạm rồi rename: rename là thao tác nguyên tử trên cùng ổ đĩa
     // nên store.json không bao giờ ở trạng thái bị cắt dở.
     const tempPath = `${storePath()}.tmp`
@@ -512,6 +570,16 @@ export class WebStore {
     const settings = this.getUserSettings(userId)
     settings[key] = protect(value)
     await this.save()
+  }
+
+  /**
+   * Như setUserSetting nhưng ghi theo lịch có gom và KHÔNG chờ ghi xong.
+   * Dành cho đường nóng ghi liên tục mà không ai await kết quả — xem scheduleSave().
+   */
+  setUserSettingDeferred(userId: string, key: string, value: unknown): void {
+    const settings = this.getUserSettings(userId)
+    settings[key] = protect(value)
+    this.scheduleSave()
   }
 
   getUserSetting<T>(userId: string, key: string, fallback: T): T {

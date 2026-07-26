@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Push liên tiếp lên cùng một nhánh: chỉ giữ lần chạy mới nhất.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Không cần Chromium của Playwright cho typecheck/lint/unit test.
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+
+jobs:
+  # Việc chạy nhanh và không phụ thuộc nền tảng — tách riêng để phản hồi sớm.
+  static:
+    name: Typecheck + Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck (dashboard)
+        run: npm run typecheck:web
+
+      - name: Typecheck (backend)
+        run: npm run typecheck:server
+
+      # eslint thoát khác 0 khi có error. Cảnh báo (chủ yếu react-hooks/exhaustive-deps) không
+      # chặn merge — chúng cần người đọc quyết định chứ không phải luật máy áp được.
+      - name: Lint
+        run: npx eslint .
+
+  test:
+    name: Unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux là môi trường chạy thật (VPS), Windows là môi trường phát triển. Krouter có
+        # đường mã riêng cho từng nền tảng — hosts file, thư mục chứng chỉ, đường dẫn dữ liệu —
+        # nên cả hai đều phải xanh.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Unit tests
+        run: npm run test:unit
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # build:fullstack = clean + typecheck + vite build + tsc build. Chạy tách khỏi job static
+      # vì nó bắt được lớp lỗi khác: cấu hình vite, import không giải được lúc bundle, asset thiếu.
+      - name: Build dashboard + backend
+        run: npm run build:fullstack
+
+      - name: Kiểm tra artifact tồn tại
+        shell: bash
+        run: |
+          test -f dist-web/index.html || { echo "::error::dist-web/index.html không được tạo"; exit 1; }
+          test -f out-server/server/index.js || { echo "::error::out-server/server/index.js không được tạo"; exit 1; }

@@ -295,9 +295,26 @@ export class ProxyRuntime {
     return defaultProxyConfig(this.store.getUserSetting<Partial<ProxyConfig>>(this.userId, 'proxyConfig', {}))
   }
 
+  /** Ghi config ngay. Dùng cho thao tác người dùng vừa thực hiện và đang chờ kết quả. */
   private async persistConfig(): Promise<void> {
     if (this.server) {
       await this.store.setUserSetting(this.userId, 'proxyConfig', this.server.getConfig())
+    }
+  }
+
+  /**
+   * Ghi config theo lịch có gom, KHÔNG chờ ghi xong.
+   *
+   * Chỉ dùng cho onConfigChanged — sự kiện này bắn ở cuối recordApiKeyUsage(), tức MỖI request
+   * được proxy, và không ai chờ kết quả. Nếu lần nào cũng ghi ngay thì mỗi request tốn một lần
+   * stringify toàn bộ store + ghi cả file (~17 ms ở store 593 KB), nối tiếp qua một hàng đợi
+   * duy nhất và bão hoà I/O khi tải cao.
+   *
+   * Mọi chỗ khác vẫn dùng persistConfig() để giữ nguyên đảm bảo "ghi xong mới trả lời".
+   */
+  private persistConfigDeferred(): void {
+    if (this.server) {
+      this.store.setUserSettingDeferred(this.userId, 'proxyConfig', this.server.getConfig())
     }
   }
 
@@ -382,7 +399,7 @@ export class ProxyRuntime {
       },
       onError: (error) => this.emit('proxy-error', error.message),
       onStatusChange: (running, port) => this.emit('proxy-status-change', { running, port }),
-      onConfigChanged: () => { void this.persistConfig() },
+      onConfigChanged: () => this.persistConfigDeferred(),
       onTokenRefresh: async (account) => {
         const result = await refreshTokenByMethod({
           refreshToken: account.refreshToken || '',

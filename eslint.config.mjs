@@ -4,8 +4,30 @@ import eslintPluginReactHooks from 'eslint-plugin-react-hooks'
 import eslintPluginReactRefresh from 'eslint-plugin-react-refresh'
 
 export default tseslint.config(
-  { ignores: ['**/node_modules', '**/dist', '**/dist-web', '**/out', '**/out-server', '**/build'] },
+  {
+    ignores: [
+      '**/node_modules',
+      '**/dist',
+      '**/dist-web',
+      '**/out',
+      '**/out-server',
+      '**/build',
+      // Thư mục dữ liệu lúc chạy: hồ sơ trình duyệt Proton, store, log. Đã nằm trong
+      // .gitignore nhưng flat config của ESLint 9 không đọc .gitignore, nên phải lặp lại ở đây
+      // — nếu không, JS bundle của Chromium sẽ lấn át kết quả lint (437/450 lỗi trước đó).
+      '.web-data',
+      '.web-data-*',
+      '.krouter',
+      '.krouter-data'
+    ]
+  },
   ...tseslint.configs.recommended,
+  // Script CommonJS (CLI, helper chạy một lần). require() là cách nạp module đúng của chúng,
+  // không phải lỗi cần sửa.
+  {
+    files: ['**/*.cjs'],
+    rules: { '@typescript-eslint/no-require-imports': 'off' }
+  },
   {
     files: ['**/*.{ts,tsx}'],
     plugins: {
